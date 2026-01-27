@@ -1,0 +1,2144 @@
+pub mod types;
+
+use std::collections::{HashMap, HashSet};
+
+use crate::frontend::ast::*;
+use crate::frontend::diagnostic::Diagnostics;
+use crate::sema::types::{
+    builtin_from_name, BuiltinType, EnumDef, StructDef, Type, TypeClass, TypeDefKind, TypeDefs,
+};
+
+#[derive(Clone, Debug)]
+pub struct FunctionSig {
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub file: FileAst,
+    pub types: TypeDefs,
+    pub functions: HashMap<String, FunctionSig>,
+    pub expr_types: HashMap<ExprId, Type>,
+}
+
+pub fn analyze(
+    file: &FileAst,
+    std_funcs: &HashSet<String>,
+) -> Result<Program, Diagnostics> {
+    let mut diags = Diagnostics::default();
+    let mut types = TypeDefs::default();
+    let mut type_order = Vec::new();
+    let mut expr_types: HashMap<ExprId, Type> = HashMap::new();
+    for item in &file.items {
+        match item {
+            Item::Struct(def) => {
+                types.insert(
+                    def.name.clone(),
+                    TypeDefKind::Struct(StructDef {
+                        fields: Vec::new(),
+                        is_copy: def.is_copy,
+                    }),
+                );
+                type_order.push(def.name.clone());
+            }
+            Item::Enum(def) => {
+                types.insert(
+                    def.name.clone(),
+                    TypeDefKind::Enum(EnumDef {
+                        variants: Vec::new(),
+                        is_copy: def.is_copy,
+                    }),
+                );
+                type_order.push(def.name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for item in &file.items {
+        match item {
+            Item::Struct(def) => {
+                let mut fields = Vec::new();
+                for field in &def.fields {
+                    let ty = resolve_type(&field.ty, &types, &mut diags);
+                    if let Some(ty) = ty {
+                        if contains_view(&types, &ty) {
+                            diags.push(
+                                "view types cannot appear in struct fields",
+                                Some(field.span.clone()),
+                            );
+                        }
+                        if let Type::Map(_, ref value) = ty {
+                            if !is_copy_type(&types, value) {
+                                diags.push(
+                                    "map value type must be Copy",
+                                    Some(field.span.clone()),
+                                );
+                            }
+                        }
+                        fields.push((field.name.clone(), ty));
+                    }
+                }
+                types.insert(
+                    def.name.clone(),
+                    TypeDefKind::Struct(StructDef {
+                        fields,
+                        is_copy: def.is_copy,
+                    }),
+                );
+            }
+            Item::Enum(def) => {
+                let mut variants = Vec::new();
+                for var in &def.variants {
+                    let mut field_tys = Vec::new();
+                    for ty in &var.fields {
+                        let resolved = resolve_type(ty, &types, &mut diags);
+                        if let Some(resolved) = resolved {
+                            if contains_view(&types, &resolved) {
+                                diags.push(
+                                    "view types cannot appear in enum variants",
+                                    Some(var.span.clone()),
+                                );
+                            }
+                            if let Type::Map(_, ref value) = resolved {
+                                if !is_copy_type(&types, value) {
+                                    diags.push(
+                                        "map value type must be Copy",
+                                        Some(var.span.clone()),
+                                    );
+                                }
+                            }
+                            field_tys.push(resolved);
+                        }
+                    }
+                    variants.push((var.name.clone(), field_tys));
+                }
+                types.insert(
+                    def.name.clone(),
+                    TypeDefKind::Enum(EnumDef {
+                        variants,
+                        is_copy: def.is_copy,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    for name in &type_order {
+        if let Some(def) = types.get(name) {
+            match def {
+                TypeDefKind::Struct(def) => {
+                    if def.is_copy {
+                        for (_, ty) in &def.fields {
+                            if !is_copy_type(&types, ty) {
+                                diags.push(
+                                    "copy struct fields must be Copy",
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+                TypeDefKind::Enum(def) => {
+                    if def.is_copy {
+                        for (_, fields) in &def.variants {
+                            for ty in fields {
+                                if !is_copy_type(&types, ty) {
+                                    diags.push(
+                                        "copy enum variants must be Copy",
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    check_recursive_types(&types, &mut diags);
+
+    let mut functions = HashMap::new();
+    for item in &file.items {
+        if let Item::Function(func) = item {
+            let mut params = Vec::new();
+            for param in &func.params {
+                if let Some(ty) = resolve_type(&param.ty, &types, &mut diags) {
+                    params.push(ty);
+                }
+            }
+            let ret = if let Some(ret_ty) = &func.ret_type {
+                let ty = resolve_type(ret_ty, &types, &mut diags);
+                match ty {
+                    Some(ty) => {
+                        if contains_view(&types, &ty) {
+                            diags.push(
+                                "view types cannot be function return types",
+                                Some(ret_ty.span.clone()),
+                            );
+                        }
+                        ty
+                    }
+                    None => Type::Builtin(BuiltinType::Unit),
+                }
+            } else {
+                Type::Builtin(BuiltinType::Unit)
+            };
+            if func.name.starts_with("__gost_") && !std_funcs.contains(&func.name) {
+                diags.push(
+                    "reserved internal name",
+                    Some(func.span.clone()),
+                );
+            }
+            functions.insert(
+                func.name.clone(),
+                FunctionSig {
+                    params,
+                    ret,
+                },
+            );
+        }
+    }
+
+    for item in &file.items {
+        if let Item::Function(func) = item {
+            let sig = functions.get(&func.name).cloned();
+            if let Some(sig) = sig {
+                let mut checker = FunctionChecker::new(
+                    &types,
+                    &functions,
+                    &sig,
+                    std_funcs.contains(&func.name),
+                    &mut diags,
+                    &mut expr_types,
+                );
+                checker.check_function(func);
+            }
+        }
+    }
+
+    if diags.is_empty() {
+        Ok(Program {
+            file: file.clone(),
+            types,
+            functions,
+            expr_types,
+        })
+    } else {
+        Err(diags)
+    }
+}
+
+fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Option<Type> {
+    match &ast.kind {
+        TypeAstKind::Named(name) => {
+            if let Some(ty) = builtin_from_name(name) {
+                Some(ty)
+            } else {
+                if defs.get(name).is_none() {
+                    diags.push(format!("unknown type `{}`", name), Some(ast.span.clone()));
+                }
+                Some(Type::Named(name.clone()))
+            }
+        }
+        TypeAstKind::Ref(inner) => {
+            let ty = resolve_type(inner, defs, diags)?;
+            Some(Type::Ref(Box::new(ty)))
+        }
+        TypeAstKind::MutRef(inner) => {
+            let ty = resolve_type(inner, defs, diags)?;
+            Some(Type::MutRef(Box::new(ty)))
+        }
+        TypeAstKind::Slice(inner) => {
+            let ty = resolve_type(inner, defs, diags)?;
+            if contains_view(defs, &ty) {
+                diags.push("view types cannot be stored in slices", Some(ast.span.clone()));
+            }
+            Some(Type::Slice(Box::new(ty)))
+        }
+        TypeAstKind::Map(key, value) => {
+            let key_ty = resolve_type(key, defs, diags)?;
+            let value_ty = resolve_type(value, defs, diags)?;
+            if !is_map_key_type(&key_ty) {
+                diags.push(
+                    "map key type must be i64, u64, or string",
+                    Some(ast.span.clone()),
+                );
+            }
+            if contains_view(defs, &value_ty) {
+                diags.push("view types cannot be stored in maps", Some(ast.span.clone()));
+            }
+            if !is_copy_type(defs, &value_ty) {
+                diags.push("map value type must be Copy", Some(ast.span.clone()));
+            }
+            Some(Type::Map(Box::new(key_ty), Box::new(value_ty)))
+        }
+        TypeAstKind::Chan(inner) => {
+            let ty = resolve_type(inner, defs, diags)?;
+            if contains_view(defs, &ty) {
+                diags.push("view types cannot be stored in channels", Some(ast.span.clone()));
+            }
+            Some(Type::Chan(Box::new(ty)))
+        }
+        TypeAstKind::Shared(inner) => {
+            let ty = resolve_type(inner, defs, diags)?;
+            if contains_view(defs, &ty) {
+                diags.push("view types cannot be stored in shared", Some(ast.span.clone()));
+            }
+            Some(Type::Shared(Box::new(ty)))
+        }
+        TypeAstKind::Interface => Some(Type::Interface),
+        TypeAstKind::Tuple(items) => {
+            let mut tys = Vec::new();
+            for item in items {
+                let ty = resolve_type(item, defs, diags)?;
+                tys.push(ty);
+            }
+            Some(Type::Tuple(tys))
+        }
+    }
+}
+
+fn contains_view(defs: &TypeDefs, ty: &Type) -> bool {
+    match ty {
+        Type::Ref(_) | Type::MutRef(_) => true,
+        Type::Slice(inner)
+        | Type::Chan(inner)
+        | Type::Shared(inner) => contains_view(defs, inner),
+        Type::Map(_, value) => contains_view(defs, value),
+        Type::Tuple(items) => items.iter().any(|t| contains_view(defs, t)),
+        Type::Named(name) => match defs.get(name) {
+            Some(TypeDefKind::Struct(def)) => def.fields.iter().any(|(_, ty)| contains_view(defs, ty)),
+            Some(TypeDefKind::Enum(def)) => def.variants.iter().any(|(_, tys)| tys.iter().any(|ty| contains_view(defs, ty))),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn slice_elem_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Slice(inner) => Some(*inner.clone()),
+        Type::Builtin(BuiltinType::Bytes) => Some(Type::Builtin(BuiltinType::U32)),
+        _ => None,
+    }
+}
+
+fn slice_like_elem_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Ref(inner) | Type::MutRef(inner) => slice_elem_type(inner),
+        _ => slice_elem_type(ty),
+    }
+}
+
+fn is_copy_type(defs: &TypeDefs, ty: &Type) -> bool {
+    matches!(defs.classify(ty), Some(TypeClass::Copy))
+}
+
+fn is_map_key_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Builtin(BuiltinType::I64)
+            | Type::Builtin(BuiltinType::U64)
+            | Type::Builtin(BuiltinType::String)
+    )
+}
+
+fn check_recursive_types(defs: &TypeDefs, diags: &mut Diagnostics) {
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in defs.names() {
+        if visited.contains(&name) {
+            continue;
+        }
+        if dfs_check_cycle(defs, &name, &mut visiting, &mut visited) {
+            diags.push("recursive types are not supported yet", None);
+        }
+    }
+}
+
+fn dfs_check_cycle(
+    defs: &TypeDefs,
+    name: &str,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if visiting.contains(name) {
+        return true;
+    }
+    if visited.contains(name) {
+        return false;
+    }
+    visiting.insert(name.to_string());
+    let deps = type_deps(defs, name);
+    for dep in deps {
+        if dfs_check_cycle(defs, &dep, visiting, visited) {
+            return true;
+        }
+    }
+    visiting.remove(name);
+    visited.insert(name.to_string());
+    false
+}
+
+fn type_deps(defs: &TypeDefs, name: &str) -> Vec<String> {
+    let mut deps = Vec::new();
+    match defs.get(name) {
+        Some(TypeDefKind::Struct(def)) => {
+            for (_, ty) in &def.fields {
+                collect_named_types(ty, &mut deps);
+            }
+        }
+        Some(TypeDefKind::Enum(def)) => {
+            for (_, fields) in &def.variants {
+                for ty in fields {
+                    collect_named_types(ty, &mut deps);
+                }
+            }
+        }
+        None => {}
+    }
+    deps
+}
+
+fn collect_named_types(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Named(name) => out.push(name.clone()),
+        Type::Ref(inner)
+        | Type::MutRef(inner)
+        | Type::Slice(inner)
+        | Type::Chan(inner)
+        | Type::Shared(inner) => collect_named_types(inner, out),
+        Type::Map(key, value) => {
+            collect_named_types(key, out);
+            collect_named_types(value, out);
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                collect_named_types(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinearState {
+    Uninit,
+    Alive,
+    Moved,
+    Dropped,
+}
+
+#[derive(Clone, Debug)]
+struct VarInfo {
+    ty: Type,
+    class: TypeClass,
+    state: LinearState,
+    borrowed_shared: usize,
+    borrowed_mut: usize,
+    view_of: Option<String>,
+    view_is_mut: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Env {
+    vars: HashMap<String, VarInfo>,
+    scopes: Vec<Vec<String>>,
+}
+
+impl Env {
+    fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            scopes: vec![Vec::new()],
+        }
+    }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn exit_scope(&mut self) -> Vec<String> {
+        self.scopes.pop().unwrap_or_default()
+    }
+
+    fn declare(&mut self, name: String, info: VarInfo) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.push(name.clone());
+        }
+        self.vars.insert(name, info);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BorrowInfo {
+    base: String,
+    is_mut: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ExprResult {
+    ty: Type,
+    borrow: Option<BorrowInfo>,
+}
+
+struct FunctionChecker<'a> {
+    defs: &'a TypeDefs,
+    funcs: &'a HashMap<String, FunctionSig>,
+    sig: &'a FunctionSig,
+    is_std: bool,
+    diags: &'a mut Diagnostics,
+    expr_types: &'a mut HashMap<ExprId, Type>,
+    env: Env,
+}
+
+impl<'a> FunctionChecker<'a> {
+    fn new(
+        defs: &'a TypeDefs,
+        funcs: &'a HashMap<String, FunctionSig>,
+        sig: &'a FunctionSig,
+        is_std: bool,
+        diags: &'a mut Diagnostics,
+        expr_types: &'a mut HashMap<ExprId, Type>,
+    ) -> Self {
+        Self {
+            defs,
+            funcs,
+            sig,
+            is_std,
+            diags,
+            expr_types,
+            env: Env::new(),
+        }
+    }
+
+    fn check_function(&mut self, func: &Function) {
+        self.env.enter_scope();
+        for (idx, param) in func.params.iter().enumerate() {
+            let ty = self.sig.params.get(idx).cloned().unwrap_or(Type::Builtin(BuiltinType::Unit));
+            let class = self.defs.classify(&ty).unwrap_or(TypeClass::Copy);
+            let info = VarInfo {
+                ty,
+                class,
+                state: if class == TypeClass::Linear {
+                    LinearState::Alive
+                } else {
+                    LinearState::Alive
+                },
+                borrowed_shared: 0,
+                borrowed_mut: 0,
+                view_of: None,
+                view_is_mut: false,
+            };
+            self.env.declare(param.name.clone(), info);
+        }
+        let block_ty = self.check_block(&func.body);
+        if let Some(ty) = block_ty {
+            if ty != Type::Builtin(BuiltinType::Unit) && !type_eq(&ty, &self.sig.ret) {
+                self.diags.push(
+                    "function body type does not match return type",
+                    Some(func.span.clone()),
+                );
+            }
+            if contains_view(self.defs, &ty) {
+                self.diags.push(
+                    "view types cannot be returned",
+                    Some(func.span.clone()),
+                );
+            }
+        }
+        self.drop_scope();
+    }
+
+    fn check_block(&mut self, block: &Block) -> Option<Type> {
+        self.env.enter_scope();
+        for stmt in &block.stmts {
+            self.check_stmt(stmt);
+        }
+        let result = if let Some(expr) = &block.tail {
+            self.check_expr(expr).map(|r| r.ty)
+        } else {
+            Some(Type::Builtin(BuiltinType::Unit))
+        };
+        self.drop_scope();
+        result
+    }
+
+    fn check_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { name, ty, init, span } => {
+                let init_res = self.check_expr(init);
+                let init_ty = match init_res {
+                    Some(res) => res,
+                    None => return,
+                };
+                let final_ty = if let Some(annot) = ty {
+                    let resolved = resolve_type(annot, self.defs, self.diags);
+                    if let Some(resolved) = resolved {
+                        if !type_eq(&resolved, &init_ty.ty) {
+                            self.diags.push(
+                                "let initializer type mismatch",
+                                Some(span.clone()),
+                            );
+                        }
+                        resolved
+                    } else {
+                        init_ty.ty.clone()
+                    }
+                } else {
+                    init_ty.ty.clone()
+                };
+                let class = self.defs.classify(&final_ty).unwrap_or(TypeClass::Copy);
+                let mut info = VarInfo {
+                    ty: final_ty,
+                    class,
+                    state: if class == TypeClass::Linear {
+                        LinearState::Alive
+                    } else {
+                        LinearState::Alive
+                    },
+                    borrowed_shared: 0,
+                    borrowed_mut: 0,
+                    view_of: None,
+                    view_is_mut: false,
+                };
+                if class == TypeClass::View {
+                    if let Some(borrow) = init_ty.borrow {
+                        if let Some(base) = self.env.vars.get_mut(&borrow.base) {
+                            if borrow.is_mut {
+                                if base.borrowed_shared > 0 || base.borrowed_mut > 0 {
+                                    self.diags.push(
+                                        "mutable borrow conflicts with existing borrows",
+                                        Some(span.clone()),
+                                    );
+                                } else {
+                                    base.borrowed_mut += 1;
+                                }
+                            } else {
+                                if base.borrowed_mut > 0 {
+                                    self.diags.push(
+                                        "shared borrow conflicts with mutable borrow",
+                                        Some(span.clone()),
+                                    );
+                                } else {
+                                    base.borrowed_shared += 1;
+                                }
+                            }
+                        }
+                        info.view_of = Some(borrow.base);
+                        info.view_is_mut = borrow.is_mut;
+                    } else {
+                        self.diags.push(
+                            "view values must originate from a borrow",
+                            Some(span.clone()),
+                        );
+                    }
+                }
+                self.env.declare(name.clone(), info);
+            }
+            Stmt::Assign { target, value, span } => {
+                let target_name = match &target.kind {
+                    ExprKind::Ident(name) => Some(name.clone()),
+                    _ => None,
+                };
+                let target_ty = match self.check_assign_target(target) {
+                    Some(ty) => ty,
+                    None => return,
+                };
+                let value_ty = match self.check_expr(value) {
+                    Some(res) => res.ty,
+                    None => return,
+                };
+                if contains_view(self.defs, &value_ty) {
+                    self.diags.push(
+                        "view values cannot be assigned",
+                        Some(span.clone()),
+                    );
+                }
+                if !type_eq(&target_ty, &value_ty) {
+                    self.diags.push(
+                        "assignment type mismatch",
+                        Some(span.clone()),
+                    );
+                }
+                if let Some(name) = target_name {
+                    if let Some(var) = self.env.vars.get_mut(&name) {
+                        if var.class == TypeClass::Linear {
+                            var.state = LinearState::Alive;
+                        }
+                    }
+                }
+            }
+            Stmt::Expr { expr, .. } => {
+                self.check_expr(expr);
+            }
+            Stmt::Return { expr, span } => {
+                let ret_ty = if let Some(expr) = expr {
+                    match self.check_expr(expr) {
+                        Some(res) => res.ty,
+                        None => return,
+                    }
+                } else {
+                    Type::Builtin(BuiltinType::Unit)
+                };
+                if contains_view(self.defs, &ret_ty) {
+                    self.diags.push("view types cannot be returned", Some(span.clone()));
+                }
+                if !type_eq(&ret_ty, &self.sig.ret) {
+                    self.diags.push("return type mismatch", Some(span.clone()));
+                }
+                self.drop_all_alive();
+            }
+            Stmt::Break { .. } => {}
+            Stmt::Continue { .. } => {}
+            Stmt::ForIn { name, iter, body, span } => {
+                let iter_ty = match self.check_expr(iter) {
+                    Some(res) => res.ty,
+                    None => return,
+                };
+                let (_elem_ty, view_ty, view_is_mut) = match iter_ty {
+                    Type::Slice(inner) => {
+                        let elem = *inner;
+                        if !is_copy_type(self.defs, &elem) {
+                            self.diags.push(
+                                "for-in by value requires Copy element; use &xs or &mut xs",
+                                Some(span.clone()),
+                            );
+                        }
+                        (elem.clone(), elem, false)
+                    }
+                    Type::Builtin(BuiltinType::Bytes) => {
+                        let elem = Type::Builtin(BuiltinType::U32);
+                        (elem.clone(), elem, false)
+                    }
+                    Type::Ref(inner) => match *inner {
+                        Type::Slice(elem) => {
+                            let elem = *elem;
+                            (
+                                elem.clone(),
+                                Type::Ref(Box::new(elem)),
+                                false,
+                            )
+                        }
+                        Type::Builtin(BuiltinType::Bytes) => {
+                            let elem = Type::Builtin(BuiltinType::U32);
+                            (
+                                elem.clone(),
+                                Type::Ref(Box::new(elem)),
+                                false,
+                            )
+                        }
+                        _ => {
+                            self.diags.push("for-in expects a slice", Some(span.clone()));
+                            return;
+                        }
+                    },
+                    Type::MutRef(inner) => match *inner {
+                        Type::Slice(elem) => {
+                            let elem = *elem;
+                            (
+                                elem.clone(),
+                                Type::MutRef(Box::new(elem)),
+                                true,
+                            )
+                        }
+                        Type::Builtin(BuiltinType::Bytes) => {
+                            let elem = Type::Builtin(BuiltinType::U32);
+                            (
+                                elem.clone(),
+                                Type::MutRef(Box::new(elem)),
+                                true,
+                            )
+                        }
+                        _ => {
+                            self.diags.push("for-in expects a slice", Some(span.clone()));
+                            return;
+                        }
+                    },
+                    _ => {
+                        self.diags.push("for-in expects a slice", Some(span.clone()));
+                        return;
+                    }
+                };
+                self.env.enter_scope();
+                let class = self.defs.classify(&view_ty).unwrap_or(TypeClass::Copy);
+                self.env.declare(
+                    name.clone(),
+                    VarInfo {
+                        ty: view_ty,
+                        class,
+                        state: LinearState::Alive,
+                        borrowed_shared: 0,
+                        borrowed_mut: 0,
+                        view_of: None,
+                        view_is_mut,
+                    },
+                );
+                self.check_block(body);
+                self.drop_scope();
+            }
+            Stmt::Select { arms, span } => {
+                let base_env = self.env.clone();
+                let mut joined_env = base_env.clone();
+                for arm in arms {
+                    self.env = base_env.clone();
+                    self.env.enter_scope();
+                    match &arm.kind {
+                        SelectArmKind::Send { chan, value } => {
+                            let _ = self.check_expr_no_move(chan);
+                            let _ = self.check_expr(value);
+                        }
+                        SelectArmKind::Recv { chan, bind } => {
+                            let chan_res = match self.check_expr_no_move(chan) {
+                                Some(res) => res.ty,
+                                None => continue,
+                            };
+                            let elem_ty = match chan_res {
+                                Type::Chan(inner) => *inner,
+                                _ => {
+                                    self.diags.push("recv expects chan[T]", Some(arm.span.clone()));
+                                    continue;
+                                }
+                            };
+                            if let Some((name, ok_name)) = bind {
+                                let class = self.defs.classify(&elem_ty).unwrap_or(TypeClass::Copy);
+                                self.env.declare(
+                                    name.clone(),
+                                    VarInfo {
+                                        ty: elem_ty,
+                                        class,
+                                        state: LinearState::Alive,
+                                        borrowed_shared: 0,
+                                        borrowed_mut: 0,
+                                        view_of: None,
+                                        view_is_mut: false,
+                                    },
+                                );
+                                self.env.declare(
+                                    ok_name.clone(),
+                                    VarInfo {
+                                        ty: Type::Builtin(BuiltinType::Bool),
+                                        class: TypeClass::Copy,
+                                        state: LinearState::Alive,
+                                        borrowed_shared: 0,
+                                        borrowed_mut: 0,
+                                        view_of: None,
+                                        view_is_mut: false,
+                                    },
+                                );
+                            }
+                        }
+                        SelectArmKind::After { ms } => {
+                            let _ = self.check_expr(ms);
+                        }
+                        SelectArmKind::Default => {}
+                    }
+                    match &arm.body {
+                        BlockOrExpr::Block(block) => {
+                            let _ = self.check_block(block);
+                        }
+                        BlockOrExpr::Expr(expr) => {
+                            let _ = self.check_expr(expr);
+                        }
+                    }
+                    self.drop_scope();
+                    let arm_env = self.env.clone();
+                    joined_env = self.join_env(&joined_env, &arm_env, span);
+                    self.env = base_env.clone();
+                }
+                self.env = joined_env;
+            }
+            Stmt::Go { expr, span } => {
+                match &expr.kind {
+                    ExprKind::Call { callee, type_args, .. } => {
+                        if !type_args.is_empty() {
+                            self.diags.push(
+                                "go does not accept type arguments",
+                                Some(span.clone()),
+                            );
+                        }
+                        if let ExprKind::Ident(name) = &callee.kind {
+                            if name == "make_chan" {
+                                self.diags.push(
+                                    "go does not support intrinsic calls",
+                                    Some(span.clone()),
+                                );
+                            }
+                        } else {
+                            self.diags
+                                .push("go expects a direct call", Some(span.clone()));
+                        }
+                    }
+                    _ => {
+                        self.diags
+                            .push("go expects a call expression", Some(span.clone()));
+                    }
+                }
+                let _ = self.check_expr(expr);
+            }
+            Stmt::Defer { expr, span } => {
+                let is_call = matches!(expr.kind, ExprKind::Call { .. });
+                if !is_call {
+                    self.diags
+                        .push("defer expects a call expression", Some(span.clone()));
+                    return;
+                }
+                let _ = self.check_expr(expr);
+            }
+        }
+    }
+
+    fn check_expr(&mut self, expr: &Expr) -> Option<ExprResult> {
+        self.check_expr_with_mode(expr, true)
+    }
+
+    fn check_expr_no_move(&mut self, expr: &Expr) -> Option<ExprResult> {
+        self.check_expr_with_mode(expr, false)
+    }
+
+    fn record_expr(&mut self, expr: &Expr, res: ExprResult) -> Option<ExprResult> {
+        self.expr_types.insert(expr.id, res.ty.clone());
+        Some(res)
+    }
+
+    fn declare_pattern_binding(&mut self, name: &str, ty: Type) {
+        let class = self.defs.classify(&ty).unwrap_or(TypeClass::Copy);
+        let info = VarInfo {
+            ty,
+            class,
+            state: LinearState::Alive,
+            borrowed_shared: 0,
+            borrowed_mut: 0,
+            view_of: None,
+            view_is_mut: false,
+        };
+        self.env.declare(name.to_string(), info);
+    }
+
+    fn check_match_pattern(&mut self, pattern: &Pattern, scrut_ty: &Type, span: &Span) {
+        match pattern {
+            Pattern::Wildcard => {}
+            Pattern::Bool(_) => {
+                if !type_eq(scrut_ty, &Type::Builtin(BuiltinType::Bool)) {
+                    self.diags.push("match pattern expects bool", Some(span.clone()));
+                }
+            }
+            Pattern::Int(_) => {
+                let ok = matches!(
+                    scrut_ty,
+                    Type::Builtin(
+                        BuiltinType::I32
+                            | BuiltinType::I64
+                            | BuiltinType::U32
+                            | BuiltinType::U64
+                            | BuiltinType::Char
+                    )
+                );
+                if !ok {
+                    self.diags.push("match pattern expects integer", Some(span.clone()));
+                }
+            }
+            Pattern::Ident(name) => {
+                self.declare_pattern_binding(name, scrut_ty.clone());
+            }
+            Pattern::Variant {
+                enum_name,
+                variant,
+                binds,
+            } => {
+                let scrut_name = match scrut_ty {
+                    Type::Named(name) => name.clone(),
+                    _ => {
+                        self.diags.push("enum pattern expects enum type", Some(span.clone()));
+                        return;
+                    }
+                };
+                if scrut_name != *enum_name {
+                    self.diags
+                        .push("enum pattern does not match scrutinee type", Some(span.clone()));
+                    return;
+                }
+                let def = match self.defs.get(&scrut_name) {
+                    Some(TypeDefKind::Enum(def)) => def,
+                    _ => {
+                        self.diags.push("enum pattern expects enum type", Some(span.clone()));
+                        return;
+                    }
+                };
+                let fields = match def.variants.iter().find(|(name, _)| name == variant) {
+                    Some((_, fields)) => fields,
+                    None => {
+                        self.diags.push("unknown enum variant", Some(span.clone()));
+                        return;
+                    }
+                };
+                if binds.len() != fields.len() {
+                    self.diags.push("enum pattern arity mismatch", Some(span.clone()));
+                }
+                for (idx, field_ty) in fields.iter().enumerate() {
+                    if let Some(bind) = binds.get(idx) {
+                        if bind != "_" {
+                            self.declare_pattern_binding(bind, field_ty.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_intrinsic_call(
+        &mut self,
+        callee_name: &str,
+        type_args: &[TypeAst],
+        args: &[Expr],
+        span: &Span,
+    ) -> Option<ExprResult> {
+        match callee_name {
+            "__gost_println" => {
+                if !self.is_std {
+                    self.diags.push(
+                        "__gost_println is internal to the standard library",
+                        Some(span.clone()),
+                    );
+                }
+                if !type_args.is_empty() {
+                    self.diags
+                        .push("__gost_println does not take type arguments", Some(span.clone()));
+                }
+                for arg in args {
+                    let res = self.check_expr(arg)?;
+                    if !type_eq(&res.ty, &Type::Builtin(BuiltinType::String)) {
+                        self.diags
+                            .push("__gost_println expects string", Some(arg.span.clone()));
+                    }
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Unit),
+                    borrow: None,
+                });
+            }
+            "make_chan" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("make_chan expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("make_chan expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let cap_ty = self.check_expr(&args[0])?.ty;
+                if !type_eq(&cap_ty, &Type::Builtin(BuiltinType::I64))
+                    && !type_eq(&cap_ty, &Type::Builtin(BuiltinType::I32))
+                {
+                    self.diags
+                        .push("make_chan expects i64 cap", Some(args[0].span.clone()));
+                }
+                if contains_view(self.defs, &elem_ty) {
+                    self.diags
+                        .push("view types cannot be stored in channels", Some(span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Chan(Box::new(elem_ty)),
+                    borrow: None,
+                });
+            }
+            "make_slice" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("make_slice expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("make_slice expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let len_ty = self.check_expr(&args[0])?.ty;
+                let cap_ty = self.check_expr(&args[1])?.ty;
+                if !matches!(
+                    len_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("make_slice expects i64 len", Some(args[0].span.clone()));
+                }
+                if !matches!(
+                    cap_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("make_slice expects i64 cap", Some(args[1].span.clone()));
+                }
+                if contains_view(self.defs, &elem_ty) {
+                    self.diags
+                        .push("view types cannot be stored in slices", Some(span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Slice(Box::new(elem_ty)),
+                    borrow: None,
+                });
+            }
+            "slice_len" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_len expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("slice_len expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    arg_ty,
+                    Type::Ref(inner) | Type::MutRef(inner) if *inner == Type::Slice(Box::new(elem_ty.clone()))
+                ) {
+                    self.diags
+                        .push("slice_len expects ref []T", Some(args[0].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::I64),
+                    borrow: None,
+                });
+            }
+            "slice_get_copy" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_get_copy expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("slice_get_copy expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    arg_ty,
+                    Type::Ref(inner) | Type::MutRef(inner) if *inner == Type::Slice(Box::new(elem_ty.clone()))
+                ) {
+                    self.diags
+                        .push("slice_get_copy expects ref []T", Some(args[0].span.clone()));
+                }
+                let idx_ty = self.check_expr(&args[1])?.ty;
+                if !matches!(
+                    idx_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("slice_get_copy expects i64 index", Some(args[1].span.clone()));
+                }
+                if !is_copy_type(self.defs, &elem_ty) {
+                    self.diags
+                        .push("slice_get_copy requires Copy element", Some(span.clone()));
+                }
+                return Some(ExprResult { ty: elem_ty, borrow: None });
+            }
+            "slice_set" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_set expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 3 {
+                    self.diags
+                        .push("slice_set expects three arguments", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    arg_ty,
+                    Type::MutRef(inner) if *inner == Type::Slice(Box::new(elem_ty.clone()))
+                ) {
+                    self.diags
+                        .push("slice_set expects mutref []T", Some(args[0].span.clone()));
+                }
+                let idx_ty = self.check_expr(&args[1])?.ty;
+                if !matches!(
+                    idx_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("slice_set expects i64 index", Some(args[1].span.clone()));
+                }
+                let val_ty = self.check_expr(&args[2])?.ty;
+                if !type_eq(&val_ty, &elem_ty) {
+                    self.diags
+                        .push("slice_set expects element type", Some(args[2].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Unit),
+                    borrow: None,
+                });
+            }
+            "slice_ref" | "slice_mutref" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_ref expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("slice_ref expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_res = self.check_expr(&args[0])?;
+                match arg_res.ty {
+                    Type::Ref(inner) | Type::MutRef(inner)
+                        if *inner == Type::Slice(Box::new(elem_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("slice_ref expects ref []T", Some(args[0].span.clone()));
+                    }
+                }
+                let idx_ty = self.check_expr(&args[1])?.ty;
+                if !matches!(
+                    idx_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("slice_ref expects i64 index", Some(args[1].span.clone()));
+                }
+                let borrow = arg_res.borrow.map(|b| BorrowInfo {
+                    base: b.base,
+                    is_mut: callee_name == "slice_mutref",
+                });
+                let ret_ty = if callee_name == "slice_mutref" {
+                    Type::MutRef(Box::new(elem_ty))
+                } else {
+                    Type::Ref(Box::new(elem_ty))
+                };
+                return Some(ExprResult { ty: ret_ty, borrow });
+            }
+            "slice_push" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_push expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("slice_push expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    arg_ty,
+                    Type::MutRef(inner) if *inner == Type::Slice(Box::new(elem_ty.clone()))
+                ) {
+                    self.diags
+                        .push("slice_push expects mutref []T", Some(args[0].span.clone()));
+                }
+                let val_ty = self.check_expr(&args[1])?.ty;
+                if !type_eq(&val_ty, &elem_ty) {
+                    self.diags
+                        .push("slice_push expects element type", Some(args[1].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Unit),
+                    borrow: None,
+                });
+            }
+            "slice_pop" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("slice_pop expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("slice_pop expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    arg_ty,
+                    Type::MutRef(inner) if *inner == Type::Slice(Box::new(elem_ty.clone()))
+                ) {
+                    self.diags
+                        .push("slice_pop expects mutref []T", Some(args[0].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Tuple(vec![elem_ty, Type::Builtin(BuiltinType::Bool)]),
+                    borrow: None,
+                });
+            }
+            "shared_new" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("shared_new expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("shared_new expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = self.check_expr(&args[0])?.ty;
+                if !type_eq(&val_ty, &elem_ty) {
+                    self.diags
+                        .push("shared_new expects element type", Some(args[0].span.clone()));
+                }
+                if contains_view(self.defs, &elem_ty) {
+                    self.diags
+                        .push("view types cannot be stored in shared", Some(span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Shared(Box::new(elem_ty)),
+                    borrow: None,
+                });
+            }
+            "shared_get" | "shared_get_mut" => {
+                if type_args.len() != 1 {
+                    self.diags
+                        .push("shared_get expects one type argument", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("shared_get expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let arg_res = self.check_expr(&args[0])?;
+                match arg_res.ty {
+                    Type::Ref(inner) | Type::MutRef(inner)
+                        if *inner == Type::Shared(Box::new(elem_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("shared_get expects ref shared[T]", Some(args[0].span.clone()));
+                    }
+                }
+                let borrow = arg_res.borrow.map(|b| BorrowInfo {
+                    base: b.base,
+                    is_mut: callee_name == "shared_get_mut",
+                });
+                let ret_ty = if callee_name == "shared_get_mut" {
+                    Type::MutRef(Box::new(elem_ty))
+                } else {
+                    Type::Ref(Box::new(elem_ty))
+                };
+                return Some(ExprResult { ty: ret_ty, borrow });
+            }
+            "make_map" => {
+                if type_args.len() != 2 {
+                    self.diags
+                        .push("make_map expects two type arguments", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("make_map expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+                if !is_map_key_type(&key_ty) {
+                    self.diags
+                        .push("map key type must be i64, u64, or string", Some(span.clone()));
+                }
+                if !is_copy_type(self.defs, &val_ty) {
+                    self.diags
+                        .push("map value type must be Copy", Some(span.clone()));
+                }
+                let cap_ty = self.check_expr(&args[0])?.ty;
+                if !matches!(
+                    cap_ty,
+                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
+                ) {
+                    self.diags
+                        .push("make_map expects i64 cap", Some(args[0].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Map(Box::new(key_ty), Box::new(val_ty)),
+                    borrow: None,
+                });
+            }
+            "map_get" => {
+                if type_args.len() != 2 {
+                    self.diags
+                        .push("map_get expects two type arguments", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("map_get expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+                let map_ty = self.check_expr(&args[0])?.ty;
+                match map_ty {
+                    Type::Ref(inner) | Type::MutRef(inner)
+                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("map_get expects ref map[K,V]", Some(args[0].span.clone()));
+                    }
+                }
+                let arg_ty = self.check_expr(&args[1])?.ty;
+                if !type_eq(&arg_ty, &key_ty) {
+                    self.diags
+                        .push("map_get expects key type", Some(args[1].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Tuple(vec![val_ty, Type::Builtin(BuiltinType::Bool)]),
+                    borrow: None,
+                });
+            }
+            "map_set" => {
+                if type_args.len() != 2 {
+                    self.diags
+                        .push("map_set expects two type arguments", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 3 {
+                    self.diags
+                        .push("map_set expects three arguments", Some(span.clone()));
+                    return None;
+                }
+                let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+                let map_ty = self.check_expr(&args[0])?.ty;
+                match map_ty {
+                    Type::MutRef(inner)
+                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("map_set expects mutref map[K,V]", Some(args[0].span.clone()));
+                    }
+                }
+                let arg_ty = self.check_expr(&args[1])?.ty;
+                if !type_eq(&arg_ty, &key_ty) {
+                    self.diags
+                        .push("map_set expects key type", Some(args[1].span.clone()));
+                }
+                let val_arg_ty = self.check_expr(&args[2])?.ty;
+                if !type_eq(&val_arg_ty, &val_ty) {
+                    self.diags
+                        .push("map_set expects value type", Some(args[2].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Unit),
+                    borrow: None,
+                });
+            }
+            "map_del" => {
+                if type_args.len() != 2 {
+                    self.diags
+                        .push("map_del expects two type arguments", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 2 {
+                    self.diags
+                        .push("map_del expects two arguments", Some(span.clone()));
+                    return None;
+                }
+                let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+                let map_ty = self.check_expr(&args[0])?.ty;
+                match map_ty {
+                    Type::MutRef(inner)
+                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("map_del expects mutref map[K,V]", Some(args[0].span.clone()));
+                    }
+                }
+                let arg_ty = self.check_expr(&args[1])?.ty;
+                if !type_eq(&arg_ty, &key_ty) {
+                    self.diags
+                        .push("map_del expects key type", Some(args[1].span.clone()));
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Bool),
+                    borrow: None,
+                });
+            }
+            "map_len" => {
+                if type_args.len() != 2 {
+                    self.diags
+                        .push("map_len expects two type arguments", Some(span.clone()));
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("map_len expects one argument", Some(span.clone()));
+                    return None;
+                }
+                let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+                let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+                let map_ty = self.check_expr(&args[0])?.ty;
+                match map_ty {
+                    Type::Ref(inner) | Type::MutRef(inner)
+                        if *inner
+                            == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                    _ => {
+                        self.diags
+                            .push("map_len expects ref map[K,V]", Some(args[0].span.clone()));
+                    }
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::I64),
+                    borrow: None,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn borrow_base_ident(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.clone()),
+            ExprKind::Index { base, .. } => self.borrow_base_ident(base),
+            ExprKind::Field { base, .. } => self.borrow_base_ident(base),
+            _ => None,
+        }
+    }
+
+    fn check_borrow_target(&mut self, expr: &Expr) -> Option<(Type, Option<String>)> {
+        match &expr.kind {
+            ExprKind::Ident(_) => {
+                let res = self.check_expr_no_move(expr)?;
+                let base = self.borrow_base_ident(expr);
+                Some((res.ty, base))
+            }
+            ExprKind::Field { base, name } => {
+                let base_res = self.check_expr_no_move(base)?;
+                if let Type::Named(type_name) = base_res.ty {
+                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
+                        if let Some((_, ty)) =
+                            def.fields.iter().find(|(field, _)| field == name)
+                        {
+                            let base_name = self.borrow_base_ident(base);
+                            return Some((ty.clone(), base_name));
+                        }
+                    }
+                }
+                self.diags
+                    .push("unknown field access", Some(expr.span.clone()));
+                None
+            }
+            ExprKind::Index { base, index } => {
+                let base_res = self.check_expr_no_move(base)?;
+                let _ = self.check_expr(index)?;
+                match slice_like_elem_type(&base_res.ty) {
+                    Some(elem) => {
+                        let base_name = self.borrow_base_ident(base);
+                        Some((elem, base_name))
+                    }
+                    None => {
+                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Deref { expr: inner } => {
+                let inner_res = self.check_expr_no_move(inner)?;
+                let base_name = self.borrow_base_ident(inner);
+                match inner_res.ty {
+                    Type::Ref(inner_ty) | Type::MutRef(inner_ty) => {
+                        Some((*inner_ty, base_name))
+                    }
+                    _ => {
+                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.diags.push(
+                    "borrow target must be an addressable expression",
+                    Some(expr.span.clone()),
+                );
+                None
+            }
+        }
+    }
+
+    fn check_assign_target(&mut self, expr: &Expr) -> Option<Type> {
+        match &expr.kind {
+            ExprKind::Ident(_) => self.check_expr_no_move(expr).map(|r| r.ty),
+            ExprKind::Field { base, name } => {
+                let base_res = self.check_expr_no_move(base)?;
+                if let Type::Named(type_name) = base_res.ty {
+                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
+                        if let Some((_, ty)) =
+                            def.fields.iter().find(|(field, _)| field == name)
+                        {
+                            return Some(ty.clone());
+                        }
+                    }
+                }
+                self.diags
+                    .push("unknown field access", Some(expr.span.clone()));
+                None
+            }
+            ExprKind::Index { base, index } => {
+                let base_res = self.check_expr_no_move(base)?;
+                let _ = self.check_expr(index)?;
+                match slice_like_elem_type(&base_res.ty) {
+                    Some(elem) => Some(elem),
+                    None => {
+                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Deref { expr: inner } => {
+                let inner_res = self.check_expr_no_move(inner)?;
+                match inner_res.ty {
+                    Type::Ref(inner) | Type::MutRef(inner) => Some(*inner),
+                    _ => {
+                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.diags
+                    .push("assignment target must be addressable", Some(expr.span.clone()));
+                None
+            }
+        }
+    }
+
+    fn check_expr_with_mode(&mut self, expr: &Expr, consume: bool) -> Option<ExprResult> {
+        let result = match &expr.kind {
+            ExprKind::Bool(_) => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::Bool),
+                borrow: None,
+            }),
+            ExprKind::Int(_) => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::I32),
+                borrow: None,
+            }),
+            ExprKind::Float(_) => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::F64),
+                borrow: None,
+            }),
+            ExprKind::Char(_) => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::Char),
+                borrow: None,
+            }),
+            ExprKind::String(_) => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::String),
+                borrow: None,
+            }),
+            ExprKind::Nil => Some(ExprResult {
+                ty: Type::Builtin(BuiltinType::Error),
+                borrow: None,
+            }),
+            ExprKind::Ident(name) => {
+                if let Some(var) = self.env.vars.get_mut(name) {
+                    if var.borrowed_mut > 0 {
+                        self.diags.push(
+                            "cannot access value while mutable borrow is active",
+                            Some(expr.span.clone()),
+                        );
+                    }
+                    if var.class == TypeClass::Linear {
+                        if consume {
+                            match var.state {
+                                LinearState::Alive => {
+                                    var.state = LinearState::Moved;
+                                }
+                                _ => {
+                                    self.diags.push(
+                                        "use after move",
+                                        Some(expr.span.clone()),
+                                    );
+                                }
+                            }
+                        } else if var.state != LinearState::Alive {
+                            self.diags
+                                .push("use after move", Some(expr.span.clone()));
+                        }
+                    }
+                    Some(ExprResult {
+                        ty: var.ty.clone(),
+                        borrow: None,
+                    })
+                } else {
+                    self.diags.push("unknown identifier", Some(expr.span.clone()));
+                    None
+                }
+            }
+            ExprKind::Tuple(items) => {
+                let mut tys = Vec::new();
+                for item in items {
+                    let res = self.check_expr(item)?;
+                    tys.push(res.ty);
+                }
+                Some(ExprResult {
+                    ty: Type::Tuple(tys),
+                    borrow: None,
+                })
+            }
+            ExprKind::Block(block) => {
+                let ty = self.check_block(block)?;
+                Some(ExprResult { ty, borrow: None })
+            }
+            ExprKind::If { cond, then_block, else_block } => {
+                let cond_ty = self.check_expr(cond)?;
+                if !type_eq(&cond_ty.ty, &Type::Builtin(BuiltinType::Bool)) {
+                    self.diags.push("if condition must be bool", Some(cond.span.clone()));
+                }
+                let base_env = self.env.clone();
+                self.env = base_env.clone();
+                let then_ty = self.check_block(then_block)?;
+                let then_env = self.env.clone();
+                self.env = base_env.clone();
+                let else_ty = if let Some(block) = else_block {
+                    self.check_block(block)?
+                } else {
+                    Type::Builtin(BuiltinType::Unit)
+                };
+                let else_env = self.env.clone();
+                self.env = self.join_env(&then_env, &else_env, &expr.span);
+                if !type_eq(&then_ty, &else_ty) {
+                    self.diags.push("if branches must have same type", Some(expr.span.clone()));
+                }
+                Some(ExprResult { ty: then_ty, borrow: None })
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let scrut = self.check_expr(scrutinee)?;
+                let scrut_ty = scrut.ty;
+                let base_env = self.env.clone();
+                let mut arm_ty: Option<Type> = None;
+                let mut joined_env = base_env.clone();
+                for arm in arms {
+                    self.env = base_env.clone();
+                    self.env.enter_scope();
+                    self.check_match_pattern(&arm.pattern, &scrut_ty, &arm.span);
+                    let ty = match &arm.body {
+                        BlockOrExpr::Block(block) => self.check_block(block),
+                        BlockOrExpr::Expr(expr) => self.check_expr(expr).map(|r| r.ty),
+                    };
+                    self.drop_scope();
+                    let arm_env = self.env.clone();
+                    joined_env = self.join_env(&joined_env, &arm_env, &arm.span);
+                    if let Some(ty) = ty {
+                        if let Some(existing) = &arm_ty {
+                            if !type_eq(existing, &ty) {
+                                self.diags
+                                    .push("match arms must have same type", Some(arm.span.clone()));
+                            }
+                        } else {
+                            arm_ty = Some(ty);
+                        }
+                    }
+                }
+                self.env = joined_env;
+                Some(ExprResult {
+                    ty: arm_ty.unwrap_or(Type::Builtin(BuiltinType::Unit)),
+                    borrow: None,
+                })
+            }
+            ExprKind::Call { callee, type_args, args } => {
+                if let ExprKind::Field { base, name: variant } = &callee.kind {
+                    if let ExprKind::Ident(enum_name) = &base.kind {
+                        if self.env.vars.contains_key(enum_name) {
+                            self.diags.push("only direct calls are supported", Some(expr.span.clone()));
+                            return None;
+                        }
+                        if !type_args.is_empty() {
+                            self.diags.push(
+                                "type arguments not supported for enum constructors",
+                                Some(expr.span.clone()),
+                            );
+                        }
+                        if let Some(TypeDefKind::Enum(def)) = self.defs.get(enum_name) {
+                            let fields = match def.variants.iter().find(|(name, _)| name == variant)
+                            {
+                                Some((_, fields)) => fields,
+                                None => {
+                                    self.diags
+                                        .push("unknown enum variant", Some(expr.span.clone()));
+                                    return None;
+                                }
+                            };
+                            if fields.len() != args.len() {
+                                self.diags
+                                    .push("enum constructor arity mismatch", Some(expr.span.clone()));
+                            }
+                            for (idx, arg) in args.iter().enumerate() {
+                                let res = self.check_expr(arg)?;
+                                let param_ty = fields.get(idx).unwrap_or(&Type::Builtin(BuiltinType::Unit));
+                                if contains_view(self.defs, &res.ty) {
+                                    self.diags.push(
+                                        "view arguments can only be passed to intrinsics",
+                                        Some(arg.span.clone()),
+                                    );
+                                }
+                                if !type_eq(&res.ty, param_ty) {
+                                    self.diags.push("argument type mismatch", Some(arg.span.clone()));
+                                }
+                            }
+                            return self.record_expr(
+                                expr,
+                                ExprResult {
+                                    ty: Type::Named(enum_name.clone()),
+                                    borrow: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                let callee_name = match &callee.kind {
+                    ExprKind::Ident(name) => name.clone(),
+                    _ => {
+                        self.diags.push("only direct calls are supported", Some(expr.span.clone()));
+                        return None;
+                    }
+                };
+                if let Some(res) =
+                    self.check_intrinsic_call(&callee_name, type_args, args, &expr.span)
+                {
+                    return self.record_expr(expr, res);
+                }
+                if !type_args.is_empty() {
+                    self.diags.push("type arguments not supported for this call", Some(expr.span.clone()));
+                }
+                let sig = match self.funcs.get(&callee_name) {
+                    Some(sig) => sig,
+                    None => {
+                        self.diags.push("unknown function", Some(expr.span.clone()));
+                        return None;
+                    }
+                };
+                if sig.params.len() != args.len() {
+                    self.diags.push("argument count mismatch", Some(expr.span.clone()));
+                }
+                for (idx, arg) in args.iter().enumerate() {
+                    let res = self.check_expr(arg)?;
+                    let param_ty = sig.params.get(idx).unwrap_or(&Type::Builtin(BuiltinType::Unit));
+                    if contains_view(self.defs, &res.ty) {
+                        self.diags.push("view arguments can only be passed to intrinsics", Some(arg.span.clone()));
+                    }
+                    if !type_eq(&res.ty, param_ty) {
+                        self.diags.push("argument type mismatch", Some(arg.span.clone()));
+                    }
+                }
+                Some(ExprResult {
+                    ty: sig.ret.clone(),
+                    borrow: None,
+                })
+            }
+            ExprKind::Field { base, name: field_name } => {
+                if let ExprKind::Ident(enum_name) = &base.kind {
+                    if !self.env.vars.contains_key(enum_name) {
+                        if let Some(TypeDefKind::Enum(def)) = self.defs.get(enum_name) {
+                            let fields = match def.variants.iter().find(|(name, _)| name == field_name) {
+                                Some((_, fields)) => fields,
+                                None => {
+                                    self.diags.push("unknown enum variant", Some(expr.span.clone()));
+                                    return None;
+                                }
+                            };
+                            if !fields.is_empty() {
+                                self.diags.push(
+                                    "enum variant requires arguments",
+                                    Some(expr.span.clone()),
+                                );
+                                return None;
+                            }
+                            return self.record_expr(
+                                expr,
+                                ExprResult {
+                                    ty: Type::Named(enum_name.clone()),
+                                    borrow: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                let base_res = self.check_expr_no_move(base)?;
+                if let Type::Named(type_name) = base_res.ty {
+                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
+                        if let Some((_, ty)) =
+                            def.fields.iter().find(|(field, _)| field == field_name)
+                        {
+                            if !is_copy_type(self.defs, ty) {
+                                self.diags.push(
+                                    "moving linear fields is not supported",
+                                    Some(expr.span.clone()),
+                                );
+                            }
+                            return self.record_expr(
+                                expr,
+                                ExprResult {
+                                    ty: ty.clone(),
+                                    borrow: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                self.diags.push("unknown field access", Some(expr.span.clone()));
+                None
+            }
+            ExprKind::Index { base, index } => {
+                let base_res = self.check_expr_no_move(base)?;
+                let _ = self.check_expr(index)?;
+                match slice_like_elem_type(&base_res.ty) {
+                    Some(elem) => {
+                        if !is_copy_type(self.defs, &elem) {
+                            self.diags.push(
+                                "cannot index linear element by value; use & or &mut",
+                                Some(expr.span.clone()),
+                            );
+                        }
+                        Some(ExprResult { ty: elem, borrow: None })
+                    }
+                    None => {
+                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Unary { op, expr: inner } => {
+                let inner_res = self.check_expr(inner)?;
+                match op {
+                    UnaryOp::Neg => Some(ExprResult { ty: inner_res.ty, borrow: None }),
+                    UnaryOp::Not => Some(ExprResult { ty: Type::Builtin(BuiltinType::Bool), borrow: None }),
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                let left_res = self.check_expr(left)?;
+                let right_res = self.check_expr(right)?;
+                if !type_eq(&left_res.ty, &right_res.ty) {
+                    self.diags.push("binary operand type mismatch", Some(expr.span.clone()));
+                }
+                let result_ty = match op {
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Lte
+                    | BinaryOp::Gt
+                    | BinaryOp::Gte
+                    | BinaryOp::And
+                    | BinaryOp::Or => Type::Builtin(BuiltinType::Bool),
+                    _ => left_res.ty,
+                };
+                Some(ExprResult { ty: result_ty, borrow: None })
+            }
+            ExprKind::Borrow { is_mut, expr: inner } => {
+                let (target_ty, base_name) = self.check_borrow_target(inner)?;
+                let ty = if *is_mut {
+                    Type::MutRef(Box::new(target_ty))
+                } else {
+                    Type::Ref(Box::new(target_ty))
+                };
+                if let Some(base) = base_name {
+                    if let Some(base_info) = self.env.vars.get(&base) {
+                        if *is_mut {
+                            if base_info.borrowed_shared > 0 || base_info.borrowed_mut > 0 {
+                                self.diags.push(
+                                    "mutable borrow conflicts with existing borrows",
+                                    Some(expr.span.clone()),
+                                );
+                            }
+                        } else if base_info.borrowed_mut > 0 {
+                            self.diags.push(
+                                "shared borrow conflicts with mutable borrow",
+                                Some(expr.span.clone()),
+                            );
+                        }
+                    }
+                    Some(ExprResult {
+                        ty,
+                        borrow: Some(BorrowInfo { base, is_mut: *is_mut }),
+                    })
+                } else {
+                    self.diags.push(
+                        "borrow target must be an identifier or index expression",
+                        Some(expr.span.clone()),
+                    );
+                    Some(ExprResult { ty, borrow: None })
+                }
+            }
+            ExprKind::Deref { expr: inner } => {
+                let inner_res = self.check_expr(inner)?;
+                match inner_res.ty {
+                    Type::Ref(inner) | Type::MutRef(inner) => {
+                        if !is_copy_type(self.defs, &inner) {
+                            self.diags.push(
+                                "cannot deref linear values by value",
+                                Some(expr.span.clone()),
+                            );
+                        }
+                        Some(ExprResult { ty: *inner, borrow: None })
+                    }
+                    _ => {
+                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Try { expr: inner } => {
+                let inner_res = self.check_expr(inner)?;
+                let ret_ok = matches!(self.sig.ret, Type::Builtin(BuiltinType::Error))
+                    || matches!(&self.sig.ret, Type::Tuple(items) if items.len() == 2 && items[1] == Type::Builtin(BuiltinType::Error));
+                if !ret_ok {
+                    self.diags.push(
+                        "`?` can only be used in functions returning error or (T, error)",
+                        Some(expr.span.clone()),
+                    );
+                }
+                match inner_res.ty {
+                    Type::Builtin(BuiltinType::Error) => Some(ExprResult {
+                        ty: Type::Builtin(BuiltinType::Unit),
+                        borrow: None,
+                    }),
+                    Type::Tuple(items) if items.len() == 2 => {
+                        let err_ty = &items[1];
+                        if !type_eq(err_ty, &Type::Builtin(BuiltinType::Error)) {
+                            self.diags.push("second value must be error for ?", Some(expr.span.clone()));
+                        }
+                        Some(ExprResult { ty: items[0].clone(), borrow: None })
+                    }
+                    _ => {
+                        self.diags.push("`?` expects error or (T, error)", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Send { chan, value } => {
+                let chan_res = self.check_expr_no_move(chan)?;
+                let value_res = self.check_expr(value)?;
+                match chan_res.ty {
+                    Type::Chan(inner) => {
+                        if contains_view(self.defs, &value_res.ty) {
+                            self.diags.push("cannot send view types", Some(expr.span.clone()));
+                        }
+                        if !type_eq(&value_res.ty, &inner) {
+                            self.diags.push("send type mismatch", Some(expr.span.clone()));
+                        }
+                        Some(ExprResult { ty: Type::Builtin(BuiltinType::Unit), borrow: None })
+                    }
+                    _ => {
+                        self.diags.push("send expects chan[T]", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Recv { chan } => {
+                let chan_res = self.check_expr_no_move(chan)?;
+                match chan_res.ty {
+                    Type::Chan(inner) => Some(ExprResult {
+                        ty: Type::Tuple(vec![*inner, Type::Builtin(BuiltinType::Bool)]),
+                        borrow: None,
+                    }),
+                    _ => {
+                        self.diags.push("recv expects chan[T]", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Close { chan } => {
+                let chan_res = self.check_expr_no_move(chan)?;
+                match chan_res.ty {
+                    Type::Chan(_) => Some(ExprResult { ty: Type::Builtin(BuiltinType::Error), borrow: None }),
+                    _ => {
+                        self.diags.push("close expects chan[T]", Some(expr.span.clone()));
+                        None
+                    }
+                }
+            }
+            ExprKind::After { ms } => {
+                let _ = self.check_expr(ms)?;
+                Some(ExprResult {
+                    ty: Type::Chan(Box::new(Type::Builtin(BuiltinType::Unit))),
+                    borrow: None,
+                })
+            }
+        };
+        if let Some(res) = &result {
+            self.expr_types.insert(expr.id, res.ty.clone());
+        }
+        result
+    }
+
+    fn drop_scope(&mut self) {
+        let locals = self.env.exit_scope();
+        for name in locals {
+            if let Some(info) = self.env.vars.remove(&name) {
+                if let Some(base) = info.view_of {
+                    if let Some(base_info) = self.env.vars.get_mut(&base) {
+                        if info.view_is_mut {
+                            base_info.borrowed_mut = base_info.borrowed_mut.saturating_sub(1);
+                        } else {
+                            base_info.borrowed_shared = base_info.borrowed_shared.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn drop_all_alive(&mut self) {
+        for info in self.env.vars.values_mut() {
+            if info.class == TypeClass::Linear && info.state == LinearState::Alive {
+                info.state = LinearState::Dropped;
+            }
+        }
+    }
+
+    fn join_env(&mut self, left: &Env, right: &Env, span: &Span) -> Env {
+        let mut joined = left.clone();
+        for (name, right_info) in &right.vars {
+            if let Some(left_info) = joined.vars.get_mut(name) {
+                if left_info.class == TypeClass::Linear {
+                    left_info.state = join_state(left_info.state, right_info.state);
+                }
+                if left_info.borrowed_mut != right_info.borrowed_mut
+                    || left_info.borrowed_shared != right_info.borrowed_shared
+                {
+                    self.diags.push(
+                        "borrow state mismatch across branches",
+                        Some(span.clone()),
+                    );
+                    left_info.borrowed_mut =
+                        left_info.borrowed_mut.max(right_info.borrowed_mut);
+                    left_info.borrowed_shared =
+                        left_info.borrowed_shared.max(right_info.borrowed_shared);
+                }
+            }
+        }
+        joined
+    }
+}
+
+fn type_eq(a: &Type, b: &Type) -> bool {
+    a == b
+}
+
+fn join_state(a: LinearState, b: LinearState) -> LinearState {
+    if a == LinearState::Moved || b == LinearState::Moved {
+        LinearState::Moved
+    } else if a == LinearState::Dropped || b == LinearState::Dropped {
+        LinearState::Dropped
+    } else if a == LinearState::Uninit || b == LinearState::Uninit {
+        LinearState::Uninit
+    } else {
+        LinearState::Alive
+    }
+}
