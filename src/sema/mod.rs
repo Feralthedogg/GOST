@@ -276,6 +276,14 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
             }
             Some(Type::Map(Box::new(key_ty), Box::new(value_ty)))
         }
+        TypeAstKind::Result(ok, err) => {
+            let ok_ty = resolve_type(ok, defs, diags)?;
+            let err_ty = resolve_type(err, defs, diags)?;
+            if contains_view(defs, &ok_ty) || contains_view(defs, &err_ty) {
+                diags.push("view types cannot be stored in Result", Some(ast.span.clone()));
+            }
+            Some(Type::Result(Box::new(ok_ty), Box::new(err_ty)))
+        }
         TypeAstKind::Chan(inner) => {
             let ty = resolve_type(inner, defs, diags)?;
             if contains_view(defs, &ty) {
@@ -297,7 +305,14 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
                 let ty = resolve_type(item, defs, diags)?;
                 tys.push(ty);
             }
-            Some(Type::Tuple(tys))
+            if tys.len() == 2 && tys[1] == Type::Builtin(BuiltinType::Error) {
+                if contains_view(defs, &tys[0]) {
+                    diags.push("view types cannot be stored in Result", Some(ast.span.clone()));
+                }
+                Some(Type::Result(Box::new(tys[0].clone()), Box::new(tys[1].clone())))
+            } else {
+                Some(Type::Tuple(tys))
+            }
         }
     }
 }
@@ -310,6 +325,7 @@ fn contains_view(defs: &TypeDefs, ty: &Type) -> bool {
         | Type::Shared(inner) => contains_view(defs, inner),
         Type::Map(_, value) => contains_view(defs, value),
         Type::Tuple(items) => items.iter().any(|t| contains_view(defs, t)),
+        Type::Result(ok, err) => contains_view(defs, ok) || contains_view(defs, err),
         Type::Named(name) => match defs.get(name) {
             Some(TypeDefKind::Struct(def)) => def.fields.iter().any(|(_, ty)| contains_view(defs, ty)),
             Some(TypeDefKind::Enum(def)) => def.variants.iter().any(|(_, tys)| tys.iter().any(|ty| contains_view(defs, ty))),
@@ -494,6 +510,7 @@ struct FunctionChecker<'a> {
     diags: &'a mut Diagnostics,
     expr_types: &'a mut HashMap<ExprId, Type>,
     env: Env,
+    allow_iter_chain: bool,
 }
 
 impl<'a> FunctionChecker<'a> {
@@ -513,6 +530,7 @@ impl<'a> FunctionChecker<'a> {
             diags,
             expr_types,
             env: Env::new(),
+            allow_iter_chain: false,
         }
     }
 
@@ -696,11 +714,22 @@ impl<'a> FunctionChecker<'a> {
             Stmt::Break { .. } => {}
             Stmt::Continue { .. } => {}
             Stmt::ForIn { name, iter, body, span } => {
+                let prev_allow = self.allow_iter_chain;
+                self.allow_iter_chain = true;
                 let iter_ty = match self.check_expr(iter) {
                     Some(res) => res.ty,
-                    None => return,
+                    None => {
+                        self.allow_iter_chain = prev_allow;
+                        return;
+                    }
                 };
+                self.allow_iter_chain = prev_allow;
                 let (_elem_ty, view_ty, view_is_mut) = match iter_ty {
+                    Type::Iter(inner) => {
+                        let inner_ty = *inner;
+                        let view_is_mut = matches!(inner_ty, Type::MutRef(_));
+                        (inner_ty.clone(), inner_ty, view_is_mut)
+                    }
                     Type::Slice(inner) => {
                         let elem = *inner;
                         if !is_copy_type(self.defs, &elem) {
@@ -950,6 +979,32 @@ impl<'a> FunctionChecker<'a> {
                 variant,
                 binds,
             } => {
+                if let Type::Result(ok_ty, err_ty) = scrut_ty {
+                    if enum_name != "Result" && enum_name != "result" {
+                        self.diags.push(
+                            "enum pattern does not match scrutinee type",
+                            Some(span.clone()),
+                        );
+                        return;
+                    }
+                    let field_ty = match variant.as_str() {
+                        "Ok" | "ok" => ok_ty.as_ref().clone(),
+                        "Err" | "err" => err_ty.as_ref().clone(),
+                        _ => {
+                            self.diags.push("unknown enum variant", Some(span.clone()));
+                            return;
+                        }
+                    };
+                    if binds.len() != 1 {
+                        self.diags.push("enum pattern arity mismatch", Some(span.clone()));
+                    }
+                    if let Some(bind) = binds.get(0) {
+                        if bind != "_" {
+                            self.declare_pattern_binding(bind, field_ty);
+                        }
+                    }
+                    return;
+                }
                 let scrut_name = match scrut_ty {
                     Type::Named(name) => name.clone(),
                     _ => {
@@ -990,6 +1045,132 @@ impl<'a> FunctionChecker<'a> {
         }
     }
 
+    fn check_result_ctor(
+        &mut self,
+        variant: &str,
+        type_args: &[TypeAst],
+        args: &[Expr],
+        span: &Span,
+    ) -> Option<ExprResult> {
+        if type_args.len() != 2 {
+            self.diags.push(
+                "Result constructors require two type arguments",
+                Some(span.clone()),
+            );
+            return None;
+        }
+        let ok_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
+        let err_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
+        if contains_view(self.defs, &ok_ty) || contains_view(self.defs, &err_ty) {
+            self.diags
+                .push("view types cannot be stored in Result", Some(span.clone()));
+        }
+        let result_ty = Type::Result(Box::new(ok_ty.clone()), Box::new(err_ty.clone()));
+        match variant {
+            "Ok" | "ok" => {
+                if args.len() != 1 {
+                    self.diags
+                        .push("Result.Ok expects 1 argument", Some(span.clone()));
+                }
+                if let Some(arg) = args.get(0) {
+                    let res = self.check_expr(arg)?;
+                    if contains_view(self.defs, &res.ty) {
+                        self.diags.push(
+                            "view arguments can only be passed to intrinsics",
+                            Some(arg.span.clone()),
+                        );
+                    }
+                    if !type_eq(&res.ty, &ok_ty) {
+                        self.diags
+                            .push("argument type mismatch", Some(arg.span.clone()));
+                    }
+                }
+            }
+            "Err" | "err" => {
+                if args.len() != 1 {
+                    self.diags
+                        .push("Result.Err expects 1 argument", Some(span.clone()));
+                }
+                if let Some(arg) = args.get(0) {
+                    let res = self.check_expr(arg)?;
+                    if contains_view(self.defs, &res.ty) {
+                        self.diags.push(
+                            "view arguments can only be passed to intrinsics",
+                            Some(arg.span.clone()),
+                        );
+                    }
+                    if !type_eq(&res.ty, &err_ty) {
+                        self.diags
+                            .push("argument type mismatch", Some(arg.span.clone()));
+                    }
+                }
+            }
+            _ => {
+                self.diags
+                    .push("unknown enum variant", Some(span.clone()));
+                return None;
+            }
+        }
+        Some(ExprResult {
+            ty: result_ty,
+            borrow: None,
+        })
+    }
+
+    fn match_is_exhaustive(&self, scrut_ty: &Type, arms: &[MatchArm]) -> bool {
+        if arms.iter().any(|arm| matches!(arm.pattern, Pattern::Wildcard | Pattern::Ident(_))) {
+            return true;
+        }
+        match scrut_ty {
+            Type::Builtin(BuiltinType::Bool) => {
+                let mut saw_true = false;
+                let mut saw_false = false;
+                for arm in arms {
+                    match arm.pattern {
+                        Pattern::Bool(true) => saw_true = true,
+                        Pattern::Bool(false) => saw_false = true,
+                        _ => {}
+                    }
+                }
+                saw_true && saw_false
+            }
+            Type::Result(_, _) => {
+                let mut saw_ok = false;
+                let mut saw_err = false;
+                for arm in arms {
+                    if let Pattern::Variant { ref enum_name, ref variant, .. } = arm.pattern {
+                        if enum_name != "Result" && enum_name != "result" {
+                            continue;
+                        }
+                        match variant.as_str() {
+                            "Ok" | "ok" => saw_ok = true,
+                            "Err" | "err" => saw_err = true,
+                            _ => {}
+                        }
+                    }
+                }
+                saw_ok && saw_err
+            }
+            Type::Named(name) => match self.defs.get(name) {
+                Some(TypeDefKind::Enum(def)) => {
+                    let mut seen = HashSet::new();
+                    for arm in arms {
+                        if let Pattern::Variant { enum_name, variant, .. } = &arm.pattern {
+                            if enum_name == name {
+                                seen.insert(variant.clone());
+                            }
+                        }
+                    }
+                    def.variants
+                        .iter()
+                        .all(|(variant, _)| seen.contains(variant))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn check_intrinsic_call(
         &mut self,
         callee_name: &str,
@@ -1020,6 +1201,219 @@ impl<'a> FunctionChecker<'a> {
                     ty: Type::Builtin(BuiltinType::Unit),
                     borrow: None,
                 });
+            }
+            "__gost_error_new" => {
+                if !self.is_std {
+                    self.diags.push(
+                        "__gost_error_new is internal to the standard library",
+                        Some(span.clone()),
+                    );
+                }
+                if !type_args.is_empty() {
+                    self.diags
+                        .push("__gost_error_new does not take type arguments", Some(span.clone()));
+                }
+                if args.len() != 1 {
+                    self.diags
+                        .push("__gost_error_new expects 1 argument", Some(span.clone()));
+                }
+                if let Some(arg) = args.get(0) {
+                    let res = self.check_expr(arg)?;
+                    if !type_eq(&res.ty, &Type::Builtin(BuiltinType::String)) {
+                        self.diags
+                            .push("__gost_error_new expects string", Some(arg.span.clone()));
+                    }
+                }
+                return Some(ExprResult {
+                    ty: Type::Builtin(BuiltinType::Error),
+                    borrow: None,
+                });
+            }
+            "iter" | "iter_mut" | "filter" | "map" => {
+                if !self.allow_iter_chain {
+                    self.diags.push(
+                        "iterator value cannot escape for-loop",
+                        Some(span.clone()),
+                    );
+                }
+                if !type_args.is_empty() {
+                    self.diags
+                        .push("iterator helpers do not take type arguments", Some(span.clone()));
+                }
+                match callee_name {
+                    "iter" | "iter_mut" => {
+                        if args.len() != 1 {
+                            self.diags
+                                .push("iter expects one argument", Some(span.clone()));
+                            return None;
+                        }
+                        let arg_ty = self.check_expr_no_move(&args[0])?.ty;
+                        let (elem_ty, is_mut) = match arg_ty {
+                            Type::Ref(inner) => match *inner {
+                                Type::Slice(elem) => (*elem, false),
+                                Type::Builtin(BuiltinType::Bytes) => {
+                                    (Type::Builtin(BuiltinType::U32), false)
+                                }
+                                _ => {
+                                    self.diags.push(
+                                        "iter expects &slice",
+                                        Some(args[0].span.clone()),
+                                    );
+                                    return None;
+                                }
+                            },
+                            Type::MutRef(inner) => match *inner {
+                                Type::Slice(elem) => (*elem, true),
+                                Type::Builtin(BuiltinType::Bytes) => {
+                                    (Type::Builtin(BuiltinType::U32), true)
+                                }
+                                _ => {
+                                    self.diags.push(
+                                        "iter_mut expects &mut slice",
+                                        Some(args[0].span.clone()),
+                                    );
+                                    return None;
+                                }
+                            },
+                            _ => {
+                                self.diags.push(
+                                    "iter expects &slice",
+                                    Some(args[0].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        if callee_name == "iter" && is_mut {
+                            self.diags.push("iter expects &slice", Some(args[0].span.clone()));
+                        }
+                        if callee_name == "iter_mut" && !is_mut {
+                            self.diags
+                                .push("iter_mut expects &mut slice", Some(args[0].span.clone()));
+                        }
+                        let item_ty = if is_mut {
+                            Type::MutRef(Box::new(elem_ty))
+                        } else {
+                            Type::Ref(Box::new(elem_ty))
+                        };
+                        return Some(ExprResult {
+                            ty: Type::Iter(Box::new(item_ty)),
+                            borrow: None,
+                        });
+                    }
+                    "filter" => {
+                        if args.len() != 2 {
+                            self.diags
+                                .push("filter expects two arguments", Some(span.clone()));
+                            return None;
+                        }
+                        let iter_ty = self.check_expr_no_move(&args[0])?.ty;
+                        let item_ty = match iter_ty {
+                            Type::Iter(inner) => *inner,
+                            _ => {
+                                self.diags.push(
+                                    "filter expects iterator",
+                                    Some(args[0].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        let pred_name = match &args[1].kind {
+                            ExprKind::Ident(name) => name.clone(),
+                            _ => {
+                                self.diags.push(
+                                    "filter expects function symbol",
+                                    Some(args[1].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        let sig = match self.funcs.get(&pred_name) {
+                            Some(sig) => sig,
+                            None => {
+                                self.diags.push(
+                                    "unknown function",
+                                    Some(args[1].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        if sig.params.len() != 1 {
+                            self.diags.push(
+                                "filter predicate must take one argument",
+                                Some(args[1].span.clone()),
+                            );
+                        } else if !type_eq(&sig.params[0], &item_ty) {
+                            self.diags.push(
+                                "filter predicate type mismatch",
+                                Some(args[1].span.clone()),
+                            );
+                        }
+                        if !type_eq(&sig.ret, &Type::Builtin(BuiltinType::Bool)) {
+                            self.diags.push(
+                                "filter predicate must return bool",
+                                Some(args[1].span.clone()),
+                            );
+                        }
+                        return Some(ExprResult {
+                            ty: Type::Iter(Box::new(item_ty)),
+                            borrow: None,
+                        });
+                    }
+                    "map" => {
+                        if args.len() != 2 {
+                            self.diags.push("map expects two arguments", Some(span.clone()));
+                            return None;
+                        }
+                        let iter_ty = self.check_expr_no_move(&args[0])?.ty;
+                        let item_ty = match iter_ty {
+                            Type::Iter(inner) => *inner,
+                            _ => {
+                                self.diags.push(
+                                    "map expects iterator",
+                                    Some(args[0].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        let map_name = match &args[1].kind {
+                            ExprKind::Ident(name) => name.clone(),
+                            _ => {
+                                self.diags.push(
+                                    "map expects function symbol",
+                                    Some(args[1].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        let sig = match self.funcs.get(&map_name) {
+                            Some(sig) => sig,
+                            None => {
+                                self.diags.push(
+                                    "unknown function",
+                                    Some(args[1].span.clone()),
+                                );
+                                return None;
+                            }
+                        };
+                        if sig.params.len() != 1 {
+                            self.diags.push(
+                                "map function must take one argument",
+                                Some(args[1].span.clone()),
+                            );
+                        } else if !type_eq(&sig.params[0], &item_ty) {
+                            self.diags.push(
+                                "map function type mismatch",
+                                Some(args[1].span.clone()),
+                            );
+                        }
+                        return Some(ExprResult {
+                            ty: Type::Iter(Box::new(sig.ret.clone())),
+                            borrow: None,
+                        });
+                    }
+                    _ => {}
+                }
+                return None;
             }
             "make_chan" => {
                 if type_args.len() != 1 {
@@ -1687,10 +2081,17 @@ impl<'a> FunctionChecker<'a> {
                     let res = self.check_expr(item)?;
                     tys.push(res.ty);
                 }
-                Some(ExprResult {
-                    ty: Type::Tuple(tys),
-                    borrow: None,
-                })
+                if tys.len() == 2 && tys[1] == Type::Builtin(BuiltinType::Error) {
+                    Some(ExprResult {
+                        ty: Type::Result(Box::new(tys[0].clone()), Box::new(tys[1].clone())),
+                        borrow: None,
+                    })
+                } else {
+                    Some(ExprResult {
+                        ty: Type::Tuple(tys),
+                        borrow: None,
+                    })
+                }
             }
             ExprKind::Block(block) => {
                 let ty = self.check_block(block)?;
@@ -1747,14 +2148,31 @@ impl<'a> FunctionChecker<'a> {
                     }
                 }
                 self.env = joined_env;
+                let result_ty = arm_ty.unwrap_or(Type::Builtin(BuiltinType::Unit));
+                if result_ty != Type::Builtin(BuiltinType::Unit)
+                    && !self.match_is_exhaustive(&scrut_ty, arms)
+                {
+                    self.diags.push(
+                        "match expression must be exhaustive",
+                        Some(expr.span.clone()),
+                    );
+                }
                 Some(ExprResult {
-                    ty: arm_ty.unwrap_or(Type::Builtin(BuiltinType::Unit)),
+                    ty: result_ty,
                     borrow: None,
                 })
             }
             ExprKind::Call { callee, type_args, args } => {
                 if let ExprKind::Field { base, name: variant } = &callee.kind {
                     if let ExprKind::Ident(enum_name) = &base.kind {
+                        if enum_name == "Result" || enum_name == "result" {
+                            if let Some(res) =
+                                self.check_result_ctor(variant, type_args, args, &expr.span)
+                            {
+                                return self.record_expr(expr, res);
+                            }
+                            return None;
+                        }
                         if self.env.vars.contains_key(enum_name) {
                             self.diags.push("only direct calls are supported", Some(expr.span.clone()));
                             return None;
@@ -1996,6 +2414,7 @@ impl<'a> FunctionChecker<'a> {
             ExprKind::Try { expr: inner } => {
                 let inner_res = self.check_expr(inner)?;
                 let ret_ok = matches!(self.sig.ret, Type::Builtin(BuiltinType::Error))
+                    || matches!(&self.sig.ret, Type::Result(_, err) if **err == Type::Builtin(BuiltinType::Error))
                     || matches!(&self.sig.ret, Type::Tuple(items) if items.len() == 2 && items[1] == Type::Builtin(BuiltinType::Error));
                 if !ret_ok {
                     self.diags.push(
@@ -2008,6 +2427,16 @@ impl<'a> FunctionChecker<'a> {
                         ty: Type::Builtin(BuiltinType::Unit),
                         borrow: None,
                     }),
+                    Type::Result(ok_ty, err_ty) => {
+                        if *err_ty != Type::Builtin(BuiltinType::Error) {
+                            self.diags
+                                .push("second value must be error for ?", Some(expr.span.clone()));
+                        }
+                        Some(ExprResult {
+                            ty: *ok_ty,
+                            borrow: None,
+                        })
+                    }
                     Type::Tuple(items) if items.len() == 2 => {
                         let err_ty = &items[1];
                         if !type_eq(err_ty, &Type::Builtin(BuiltinType::Error)) {

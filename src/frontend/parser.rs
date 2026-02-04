@@ -554,6 +554,16 @@ impl Parser {
     fn parse_binary_expr(&mut self, min_prec: u8) -> Option<Expr> {
         let mut left = self.parse_unary_expr()?;
         loop {
+            if self.at_symbol(Symbol::PipeGt) {
+                let prec = 5u8;
+                if prec < min_prec {
+                    break;
+                }
+                let span = self.bump().span;
+                let right = self.parse_binary_expr(prec + 1)?;
+                left = self.build_pipe_expr(left, right, span)?;
+                continue;
+            }
             let (prec, op) = match self.peek_binary_op() {
                 Some(pair) => pair,
                 None => break,
@@ -574,6 +584,36 @@ impl Parser {
             );
         }
         Some(left)
+    }
+
+    fn build_pipe_expr(&mut self, lhs: Expr, rhs: Expr, span: Span) -> Option<Expr> {
+        match rhs.kind {
+            ExprKind::Call {
+                callee,
+                type_args,
+                mut args,
+            } => {
+                let mut new_args = Vec::with_capacity(args.len() + 1);
+                new_args.push(lhs);
+                new_args.append(&mut args);
+                Some(self.new_expr(
+                    ExprKind::Call {
+                        callee,
+                        type_args,
+                        args: new_args,
+                    },
+                    span,
+                ))
+            }
+            _ => Some(self.new_expr(
+                ExprKind::Call {
+                    callee: Box::new(rhs),
+                    type_args: Vec::new(),
+                    args: vec![lhs],
+                },
+                span,
+            )),
+        }
     }
 
     fn parse_unary_expr(&mut self) -> Option<Expr> {
@@ -1059,6 +1099,18 @@ impl Parser {
                 span,
             });
         }
+        if self.at_ident("Result") || self.at_ident("result") {
+            self.bump();
+            self.expect_symbol(Symbol::LBracket);
+            let ok = self.parse_type()?;
+            self.expect_symbol(Symbol::Comma);
+            let err = self.parse_type()?;
+            self.expect_symbol(Symbol::RBracket);
+            return Some(TypeAst {
+                kind: TypeAstKind::Result(Box::new(ok), Box::new(err)),
+                span,
+            });
+        }
         if let TokenKind::Ident(name) = self.bump().kind {
             Some(TypeAst {
                 kind: TypeAstKind::Named(name),
@@ -1117,30 +1169,37 @@ impl Parser {
     }
 
     fn is_builtin_generic_callee(&self, expr: &Expr) -> bool {
-        let name = match &expr.kind {
-            ExprKind::Ident(name) => name.as_str(),
-            _ => return false,
-        };
-        matches!(
-            name,
-            "make_chan"
-                | "make_slice"
-                | "slice_len"
-                | "slice_get_copy"
-                | "slice_set"
-                | "slice_ref"
-                | "slice_mutref"
-                | "slice_push"
-                | "slice_pop"
-                | "shared_new"
-                | "shared_get"
-                | "shared_get_mut"
-                | "make_map"
-                | "map_get"
-                | "map_set"
-                | "map_del"
-                | "map_len"
-        )
+        match &expr.kind {
+            ExprKind::Ident(name) => matches!(
+                name.as_str(),
+                "make_chan"
+                    | "make_slice"
+                    | "slice_len"
+                    | "slice_get_copy"
+                    | "slice_set"
+                    | "slice_ref"
+                    | "slice_mutref"
+                    | "slice_push"
+                    | "slice_pop"
+                    | "shared_new"
+                    | "shared_get"
+                    | "shared_get_mut"
+                    | "make_map"
+                    | "map_get"
+                    | "map_set"
+                    | "map_del"
+                    | "map_len"
+            ),
+            ExprKind::Field { base, name } => {
+                if let ExprKind::Ident(base_name) = &base.kind {
+                    (base_name == "Result" || base_name == "result")
+                        && (name == "Ok" || name == "Err" || name == "ok" || name == "err")
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     fn consume_semis(&mut self) {
@@ -1183,11 +1242,11 @@ impl Parser {
             TokenKind::Symbol(Symbol::Lte) => (4, BinaryOp::Lte),
             TokenKind::Symbol(Symbol::Gt) => (4, BinaryOp::Gt),
             TokenKind::Symbol(Symbol::Gte) => (4, BinaryOp::Gte),
-            TokenKind::Symbol(Symbol::Plus) => (5, BinaryOp::Add),
-            TokenKind::Symbol(Symbol::Minus) => (5, BinaryOp::Sub),
-            TokenKind::Symbol(Symbol::Star) => (6, BinaryOp::Mul),
-            TokenKind::Symbol(Symbol::Slash) => (6, BinaryOp::Div),
-            TokenKind::Symbol(Symbol::Percent) => (6, BinaryOp::Rem),
+            TokenKind::Symbol(Symbol::Plus) => (6, BinaryOp::Add),
+            TokenKind::Symbol(Symbol::Minus) => (6, BinaryOp::Sub),
+            TokenKind::Symbol(Symbol::Star) => (7, BinaryOp::Mul),
+            TokenKind::Symbol(Symbol::Slash) => (7, BinaryOp::Div),
+            TokenKind::Symbol(Symbol::Percent) => (7, BinaryOp::Rem),
             _ => return None,
         };
         Some(op)

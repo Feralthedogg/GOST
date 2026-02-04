@@ -24,6 +24,8 @@ pub enum Type {
     MutRef(Box<Type>),
     Slice(Box<Type>),
     Map(Box<Type>, Box<Type>),
+    Result(Box<Type>, Box<Type>),
+    Iter(Box<Type>),
     Chan(Box<Type>),
     Shared(Box<Type>),
     Interface,
@@ -105,6 +107,18 @@ impl TypeDefs {
                 }
                 Some(class)
             }
+            Type::Result(ok, err) => {
+                let mut class = TypeClass::Copy;
+                for item in [ok.as_ref(), err.as_ref()] {
+                    match self.classify(item)? {
+                        TypeClass::View => return Some(TypeClass::View),
+                        TypeClass::Linear => class = TypeClass::Linear,
+                        TypeClass::Copy => {}
+                    }
+                }
+                Some(class)
+            }
+            Type::Iter(_) => Some(TypeClass::Copy),
             Type::Named(name) => match self.defs.get(name) {
                 Some(TypeDefKind::Struct(def)) => Some(if def.is_copy {
                     TypeClass::Copy

@@ -40,6 +40,7 @@ pub fn compile_to_llvm(path: &Path) -> Result<String, String> {
     for func in &mut mir.functions {
         crate::mir::passes::build_cleanup_chains(func).map_err(|e| e.to_string())?;
         crate::mir::passes::linear_check(func).map_err(|e| e.to_string())?;
+        crate::mir::passes::verify_mir_strict(func).map_err(|e| e.to_string())?;
     }
     let module =
         crate::codegen::emit_llvm_from_mir(&program, &mir).map_err(|e| e.to_string())?;

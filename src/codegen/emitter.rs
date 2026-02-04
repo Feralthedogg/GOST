@@ -432,6 +432,42 @@ impl<'a> FnEmitter<'a> {
         let ret_type = self.ret_type.clone();
         match &ret_type {
             Type::Builtin(BuiltinType::Error) => self.emit_return_value(Some(err_val)),
+            Type::Result(ok_ty, err_ty) => {
+                if **err_ty != Type::Builtin(BuiltinType::Error) {
+                    return Err("`?` expects function return type error or (T, error)".to_string());
+                }
+                let result_ty = Type::Result(ok_ty.clone(), err_ty.clone());
+                let llvm_result = llvm_type(&result_ty)?;
+                let zero = if **ok_ty == Type::Builtin(BuiltinType::Unit) {
+                    "0".to_string()
+                } else {
+                    zero_value(ok_ty)?
+                };
+                let tag_tmp = self.new_temp();
+                self.emit(format!(
+                    "{} = insertvalue {} undef, i8 1, 0",
+                    tag_tmp, llvm_result
+                ));
+                let ok_tmp = self.new_temp();
+                self.emit(format!(
+                    "{} = insertvalue {} {}, {} {}, 1",
+                    ok_tmp,
+                    llvm_result,
+                    tag_tmp,
+                    llvm_type_for_tuple_elem(ok_ty)?,
+                    zero
+                ));
+                let err_tmp = self.new_temp();
+                self.emit(format!(
+                    "{} = insertvalue {} {}, {} {}, 2",
+                    err_tmp,
+                    llvm_result,
+                    ok_tmp,
+                    llvm_type_for_tuple_elem(err_ty)?,
+                    err_val.ir
+                ));
+                self.emit_return_value(Some(Value { ty: result_ty, ir: err_tmp }))
+            }
             Type::Tuple(items) if items.len() == 2 => {
                 let ok_ty = &items[0];
                 let err_ty = &items[1];
@@ -534,6 +570,76 @@ impl<'a> FnEmitter<'a> {
                     self.emit_shared_inc_value(&val)?;
                     tys.push(val.ty.clone());
                     values.push(val);
+                }
+                let override_ty = self.mir_expr_type_override(expr);
+                let result_ty = match &override_ty {
+                    Some(Type::Result(ok, err)) => Some(Type::Result(ok.clone(), err.clone())),
+                    _ => {
+                        if tys.len() == 2 && tys[1] == Type::Builtin(BuiltinType::Error) {
+                            Some(Type::Result(
+                                Box::new(tys[0].clone()),
+                                Box::new(tys[1].clone()),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(result_ty) = result_ty {
+                    let (ok_ty, err_ty) = match &result_ty {
+                        Type::Result(ok, err) => (ok.as_ref().clone(), err.as_ref().clone()),
+                        _ => unreachable!(),
+                    };
+                    if err_ty != Type::Builtin(BuiltinType::Error) {
+                        return Err("Result tuple literal requires error in second position".to_string());
+                    }
+                    let ok_val = values.get(0).ok_or_else(|| "missing ok value".to_string())?;
+                    let err_val = values.get(1).ok_or_else(|| "missing err value".to_string())?;
+                    let is_ok = self.new_temp();
+                    self.emit(format!(
+                        "{} = icmp eq i32 {}, 0",
+                        is_ok, err_val.ir
+                    ));
+                    let tag_val = self.new_temp();
+                    self.emit(format!(
+                        "{} = select i1 {}, i8 0, i8 1",
+                        tag_val, is_ok
+                    ));
+                    let llvm_result = llvm_type(&result_ty)?;
+                    let tag_tmp = self.new_temp();
+                    self.emit(format!(
+                        "{} = insertvalue {} undef, i8 {}, 0",
+                        tag_tmp, llvm_result, tag_val
+                    ));
+                    let ok_ir = if ok_val.ty == Type::Builtin(BuiltinType::Unit) {
+                        "0".to_string()
+                    } else {
+                        ok_val.ir.clone()
+                    };
+                    let ok_tmp = self.new_temp();
+                    self.emit(format!(
+                        "{} = insertvalue {} {}, {} {}, 1",
+                        ok_tmp,
+                        llvm_result,
+                        tag_tmp,
+                        llvm_type_for_tuple_elem(&ok_ty)?,
+                        ok_ir
+                    ));
+                    let err_ir = if err_val.ty == Type::Builtin(BuiltinType::Unit) {
+                        "0".to_string()
+                    } else {
+                        err_val.ir.clone()
+                    };
+                    let err_tmp = self.new_temp();
+                    self.emit(format!(
+                        "{} = insertvalue {} {}, {} {}, 2",
+                        err_tmp,
+                        llvm_result,
+                        ok_tmp,
+                        llvm_type_for_tuple_elem(&err_ty)?,
+                        err_ir
+                    ));
+                    return Ok(Value { ty: result_ty, ir: err_tmp });
                 }
                 let tuple_ty = Type::Tuple(tys);
                 if values.is_empty() {
@@ -655,6 +761,19 @@ impl<'a> FnEmitter<'a> {
                     },
                     _ => None,
                 };
+                let result_tag = match &scrut.ty {
+                    Type::Result(_, _) => {
+                        let tag = self.new_temp();
+                        self.emit(format!(
+                            "{} = extractvalue {} {}, 0",
+                            tag,
+                            llvm_type(&scrut.ty)?,
+                            scrut.ir
+                        ));
+                        Some(tag)
+                    }
+                    _ => None,
+                };
                 let end_name = self.new_block("match_end");
                 let end_idx = self.add_block(end_name.clone());
                 let mut incoming: Vec<(String, String)> = Vec::new();
@@ -698,20 +817,41 @@ impl<'a> FnEmitter<'a> {
                             variant,
                             ..
                         } => {
-                            let (scrut_enum, tag_ir, _) = enum_info
-                                .as_ref()
-                                .ok_or_else(|| "enum pattern expects enum".to_string())?;
-                            if scrut_enum != enum_name {
-                                return Err("enum pattern does not match scrutinee type".to_string());
+                            if let Some(tag_ir) = &result_tag {
+                                if enum_name != "Result" && enum_name != "result" {
+                                    return Err(
+                                        "enum pattern does not match scrutinee type".to_string(),
+                                    );
+                                }
+                                let variant_idx = match variant.as_str() {
+                                    "Ok" | "ok" => 0,
+                                    "Err" | "err" => 1,
+                                    _ => return Err("unknown enum variant".to_string()),
+                                };
+                                let tmp = self.new_temp();
+                                self.emit(format!(
+                                    "{} = icmp eq i8 {}, {}",
+                                    tmp, tag_ir, variant_idx
+                                ));
+                                tmp
+                            } else {
+                                let (scrut_enum, tag_ir, _) = enum_info
+                                    .as_ref()
+                                    .ok_or_else(|| "enum pattern expects enum".to_string())?;
+                                if scrut_enum != enum_name {
+                                    return Err(
+                                        "enum pattern does not match scrutinee type".to_string(),
+                                    );
+                                }
+                                let (variant_idx, _) =
+                                    self.resolve_enum_variant(enum_name, variant)?;
+                                let tmp = self.new_temp();
+                                self.emit(format!(
+                                    "{} = icmp eq i32 {}, {}",
+                                    tmp, tag_ir, variant_idx
+                                ));
+                                tmp
                             }
-                            let (variant_idx, _) =
-                                self.resolve_enum_variant(enum_name, variant)?;
-                            let tmp = self.new_temp();
-                            self.emit(format!(
-                                "{} = icmp eq i32 {}, {}",
-                                tmp, tag_ir, variant_idx
-                            ));
-                            tmp
                         }
                     };
                     if let Some(next_name) = &next_name {
@@ -755,48 +895,84 @@ impl<'a> FnEmitter<'a> {
                             variant,
                             binds,
                         } => {
-                            let (scrut_enum, _, payload_ir) = enum_info
-                                .as_ref()
-                                .ok_or_else(|| "enum pattern expects enum".to_string())?;
-                            if scrut_enum != enum_name {
-                                return Err("enum pattern does not match scrutinee type".to_string());
-                            }
-                            let (variant_idx, field_tys) =
-                                self.resolve_enum_variant(enum_name, variant)?;
-                            if !field_tys.is_empty() {
-                                let payload_ty = self.enum_payload_type_name(enum_name, variant_idx);
-                                let payload_ptr = self.new_temp();
-                                self.emit(format!(
-                                    "{} = bitcast i8* {} to {}*",
-                                    payload_ptr, payload_ir, payload_ty
-                                ));
-                                for (idx, field_ty) in field_tys.iter().enumerate() {
-                                    let bind = binds.get(idx).cloned().unwrap_or_else(|| "_".to_string());
-                                    if bind == "_" {
-                                        continue;
+                            if let Type::Result(ok_ty, err_ty) = &scrut.ty {
+                                if enum_name != "Result" && enum_name != "result" {
+                                    return Err("enum pattern does not match scrutinee type".to_string());
+                                }
+                                let (field_ty, field_idx) = match variant.as_str() {
+                                    "Ok" | "ok" => (ok_ty.as_ref().clone(), 1usize),
+                                    "Err" | "err" => (err_ty.as_ref().clone(), 2usize),
+                                    _ => return Err("unknown enum variant".to_string()),
+                                };
+                                if let Some(bind) = binds.get(0).cloned() {
+                                    if bind != "_" {
+                                        let storage_ty = llvm_type_for_tuple_elem(&field_ty)?;
+                                        let tmp = self.new_temp();
+                                        self.emit(format!(
+                                            "{} = extractvalue {} {}, {}",
+                                            tmp,
+                                            llvm_type(&scrut.ty)?,
+                                            scrut.ir,
+                                            field_idx
+                                        ));
+                                        let val = Value { ty: field_ty.clone(), ir: tmp.clone() };
+                                        self.emit_shared_inc_value(&val)?;
+                                        let alloca = self.new_temp();
+                                        self.emit(format!("{} = alloca {}", alloca, storage_ty));
+                                        self.emit(format!(
+                                            "store {} {}, {}* {}",
+                                            storage_ty, tmp, storage_ty, alloca
+                                        ));
+                                        self.locals.insert(bind.clone(), (field_ty, alloca));
+                                        if let Some(scope) = self.scopes.last_mut() {
+                                            scope.push(bind);
+                                        }
                                     }
-                                    let field_ptr = self.new_temp();
+                                }
+                            } else {
+                                let (scrut_enum, _, payload_ir) = enum_info
+                                    .as_ref()
+                                    .ok_or_else(|| "enum pattern expects enum".to_string())?;
+                                if scrut_enum != enum_name {
+                                    return Err("enum pattern does not match scrutinee type".to_string());
+                                }
+                                let (variant_idx, field_tys) =
+                                    self.resolve_enum_variant(enum_name, variant)?;
+                                if !field_tys.is_empty() {
+                                    let payload_ty = self.enum_payload_type_name(enum_name, variant_idx);
+                                    let payload_ptr = self.new_temp();
                                     self.emit(format!(
-                                        "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
-                                        field_ptr, payload_ty, payload_ty, payload_ptr, idx
+                                        "{} = bitcast i8* {} to {}*",
+                                        payload_ptr, payload_ir, payload_ty
                                     ));
-                                    let storage_ty = llvm_type_for_tuple_elem(field_ty)?;
-                                    let tmp = self.new_temp();
-                                    self.emit(format!(
-                                        "{} = load {}, {}* {}",
-                                        tmp, storage_ty, storage_ty, field_ptr
-                                    ));
-                                    let val = Value { ty: field_ty.clone(), ir: tmp.clone() };
-                                    self.emit_shared_inc_value(&val)?;
-                                    let alloca = self.new_temp();
-                                    self.emit(format!("{} = alloca {}", alloca, storage_ty));
-                                    self.emit(format!(
-                                        "store {} {}, {}* {}",
-                                        storage_ty, tmp, storage_ty, alloca
-                                    ));
-                                    self.locals.insert(bind.clone(), (field_ty.clone(), alloca));
-                                    if let Some(scope) = self.scopes.last_mut() {
-                                        scope.push(bind);
+                                    for (idx, field_ty) in field_tys.iter().enumerate() {
+                                        let bind = binds.get(idx).cloned().unwrap_or_else(|| "_".to_string());
+                                        if bind == "_" {
+                                            continue;
+                                        }
+                                        let field_ptr = self.new_temp();
+                                        self.emit(format!(
+                                            "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
+                                            field_ptr, payload_ty, payload_ty, payload_ptr, idx
+                                        ));
+                                        let storage_ty = llvm_type_for_tuple_elem(field_ty)?;
+                                        let tmp = self.new_temp();
+                                        self.emit(format!(
+                                            "{} = load {}, {}* {}",
+                                            tmp, storage_ty, storage_ty, field_ptr
+                                        ));
+                                        let val = Value { ty: field_ty.clone(), ir: tmp.clone() };
+                                        self.emit_shared_inc_value(&val)?;
+                                        let alloca = self.new_temp();
+                                        self.emit(format!("{} = alloca {}", alloca, storage_ty));
+                                        self.emit(format!(
+                                            "store {} {}, {}* {}",
+                                            storage_ty, tmp, storage_ty, alloca
+                                        ));
+                                        self.locals.insert(bind.clone(), (field_ty.clone(), alloca));
+                                        if let Some(scope) = self.scopes.last_mut() {
+                                            scope.push(bind);
+                                        }
                                     }
                                 }
                             }
@@ -856,6 +1032,13 @@ impl<'a> FnEmitter<'a> {
                 if let ExprKind::Field { base, name: variant } = &callee.kind {
                     if let ExprKind::Ident(enum_name) = &base.kind {
                         if !self.locals.contains_key(enum_name) {
+                            if enum_name == "Result" || enum_name == "result" {
+                                let mut resolved_types = Vec::new();
+                                for arg in type_args {
+                                    resolved_types.push(self.resolve_type_ast(arg)?);
+                                }
+                                return self.emit_result_ctor(variant, &resolved_types, args);
+                            }
                             if !type_args.is_empty() {
                                 return Err(
                                     "type arguments not supported for enum constructors".to_string(),
@@ -936,6 +1119,56 @@ impl<'a> FnEmitter<'a> {
                             ty: Type::Builtin(BuiltinType::Unit),
                             ir: String::new(),
                         })
+                    }
+                    Type::Result(ok_ty, err_ty) => {
+                        if **err_ty != Type::Builtin(BuiltinType::Error) {
+                            return Err("`?` expects Result[T, error]".to_string());
+                        }
+                        let err_tmp = self.new_temp();
+                        self.emit(format!(
+                            "{} = extractvalue {} {}, 2",
+                            err_tmp,
+                            llvm_type(&value.ty)?,
+                            value.ir
+                        ));
+                        let is_err = self.new_temp();
+                        self.emit(format!(
+                            "{} = icmp ne i32 {}, 0",
+                            is_err, err_tmp
+                        ));
+                        let ok_name = self.new_block("try_ok");
+                        let err_name = self.new_block("try_err");
+                        let cont_name = self.new_block("try_cont");
+                        let ok_idx = self.add_block(ok_name.clone());
+                        let err_idx = self.add_block(err_name.clone());
+                        let cont_idx = self.add_block(cont_name.clone());
+                        self.terminate(format!(
+                            "br i1 {}, label %{}, label %{}",
+                            is_err, err_name, ok_name
+                        ));
+                        self.switch_to(err_idx);
+                        self.emit_error_return(err_tmp)?;
+                        self.switch_to(ok_idx);
+                        let ok_val = self.new_temp();
+                        self.emit(format!(
+                            "{} = extractvalue {} {}, 1",
+                            ok_val,
+                            llvm_type(&value.ty)?,
+                            value.ir
+                        ));
+                        self.terminate(format!("br label %{}", cont_name));
+                        self.switch_to(cont_idx);
+                        if **ok_ty == Type::Builtin(BuiltinType::Unit) {
+                            Ok(Value {
+                                ty: *ok_ty.clone(),
+                                ir: String::new(),
+                            })
+                        } else {
+                            Ok(Value {
+                                ty: *ok_ty.clone(),
+                                ir: ok_val,
+                            })
+                        }
                     }
                     Type::Tuple(items) if items.len() == 2 => {
                         if items[1] != Type::Builtin(BuiltinType::Error) {
@@ -1045,14 +1278,15 @@ impl<'a> FnEmitter<'a> {
                 } else {
                     zero_value(&elem_ty)?
                 };
+                let elem_llvm = llvm_type_for_tuple_elem(&elem_ty)?;
                 let selected_val = self.new_temp();
                 self.emit(format!(
                     "{} = select i1 {}, {} {}, {} {}",
                     selected_val,
                     ok,
-                    llvm_type(&elem_ty)?,
+                    elem_llvm,
                     ready_val,
-                    llvm_type(&elem_ty)?,
+                    elem_llvm,
                     closed_val
                 ));
                 let tuple_ty = Type::Tuple(vec![elem_ty_clone, Type::Builtin(BuiltinType::Bool)]);
@@ -1410,6 +1644,105 @@ impl<'a> FnEmitter<'a> {
             return Ok(Value {
                 ty: Type::Builtin(BuiltinType::Unit),
                 ir: String::new(),
+            });
+        }
+        if name == "__gost_chan_can_send" {
+            if args.len() != 1 {
+                return Err("__gost_chan_can_send expects 1 argument".to_string());
+            }
+            let chan = &args[0];
+            if !matches!(chan.ty, Type::Chan(_)) {
+                return Err("__gost_chan_can_send expects chan[T]".to_string());
+            }
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_chan_can_send(%chan* {})",
+                tmp, chan.ir
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_chan_can_recv" {
+            if args.len() != 1 {
+                return Err("__gost_chan_can_recv expects 1 argument".to_string());
+            }
+            let chan = &args[0];
+            if !matches!(chan.ty, Type::Chan(_)) {
+                return Err("__gost_chan_can_recv expects chan[T]".to_string());
+            }
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_chan_can_recv(%chan* {})",
+                tmp, chan.ir
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_select_wait" {
+            let tmp = self.new_temp();
+            if args.is_empty() {
+                self.emit(format!(
+                    "{} = call i32 @__gost_select_wait(%chan** null, i32 0)",
+                    tmp
+                ));
+            } else {
+                let arr_len = args.len();
+                let arr_ty = format!("[{} x %chan*]", arr_len);
+                let arr_ptr = self.new_temp();
+                self.emit(format!("{} = alloca {}", arr_ptr, arr_ty));
+                for (i, arg) in args.iter().enumerate() {
+                    if !matches!(arg.ty, Type::Chan(_)) {
+                        return Err("__gost_select_wait expects chan[T] arguments".to_string());
+                    }
+                    let slot = self.new_temp();
+                    self.emit(format!(
+                        "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
+                        slot, arr_ty, arr_ty, arr_ptr, i
+                    ));
+                    self.emit(format!("store %chan* {}, %chan** {}", arg.ir, slot));
+                }
+                let cast_ptr = self.new_temp();
+                self.emit(format!(
+                    "{} = bitcast {}* {} to %chan**",
+                    cast_ptr, arr_ty, arr_ptr
+                ));
+                self.emit(format!(
+                    "{} = call i32 @__gost_select_wait(%chan** {}, i32 {})",
+                    tmp, cast_ptr, arr_len
+                ));
+            }
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_error_new" {
+            if !type_args.is_empty() {
+                return Err("__gost_error_new does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_error_new expects 1 argument".to_string());
+            }
+            let arg = &args[0];
+            if arg.ty != Type::Builtin(BuiltinType::String) {
+                return Err("__gost_error_new expects string".to_string());
+            }
+            let ptr = self.new_temp();
+            let len = self.new_temp();
+            self.emit(format!("{} = extractvalue %string {}, 0", ptr, arg.ir));
+            self.emit(format!("{} = extractvalue %string {}, 1", len, arg.ir));
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_error_new(i8* {}, i64 {})",
+                tmp, ptr, len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::Error),
+                ir: tmp,
             });
         }
         if name == "slice_ref" || name == "slice_mutref" {
@@ -1913,7 +2246,7 @@ impl<'a> FnEmitter<'a> {
         let thunk_name = self.next_go_thunk_name();
         self.emit_go_thunk_def(&thunk_name, callee_name, param_tys, &ctx_ty)?;
         self.emit(format!(
-            "call void @__gost_spawn_thread(void (i8*)* @{}, i8* {})",
+            "call void @__gost_go_spawn(void (i8*)* @{}, i8* {})",
             thunk_name, ctx_raw
         ));
         Ok(())
@@ -2433,9 +2766,35 @@ impl<'a> FnEmitter<'a> {
             MirStmt::ForIn { name, iter, body } => {
                 self.emit_for_in_stmt(name, iter, body)
             }
-            MirStmt::Select { arms } => self.emit_select_stmt(arms),
-            MirStmt::Go { expr } => self.emit_go_stmt(expr),
-            MirStmt::Ast(stmt) => self.emit_stmt(stmt),
+            MirStmt::Select { .. } => {
+                Err("select must be lowered to MIR CFG before codegen".to_string())
+            }
+            MirStmt::Go { expr } => {
+                let (callee, type_args, args) = match &expr.kind {
+                    ExprKind::Call { callee, type_args, args } => (callee, type_args, args),
+                    _ => return Err("go expects a call expression".to_string()),
+                };
+                if !type_args.is_empty() {
+                    return Err("go does not accept type arguments".to_string());
+                }
+                let callee_name = match &callee.kind {
+                    ExprKind::Ident(name) => name.clone(),
+                    _ => return Err("go expects a direct call".to_string()),
+                };
+                let sig = self
+                    .fn_sigs
+                    .get(&callee_name)
+                    .ok_or_else(|| format!("unknown function {}", callee_name))?;
+                let mut resolved_args = Vec::new();
+                for arg in args {
+                    resolved_args.push(self.emit_expr(arg)?);
+                }
+                if sig.params.len() != resolved_args.len() {
+                    return Err("argument count mismatch".to_string());
+                }
+                self.emit_go_spawn(&callee_name, &sig.params, &resolved_args)?;
+                Ok(())
+            }
             MirStmt::Expr { expr } => {
                 let _ = self.emit_expr(expr)?;
                 Ok(())
@@ -2484,8 +2843,9 @@ impl<'a> FnEmitter<'a> {
                     }
                     return Ok(());
                 }
-                let tuple_items = match &val.ty {
-                    Type::Tuple(items) => items.clone(),
+                let (tuple_items, index_offset) = match &val.ty {
+                    Type::Tuple(items) => (items.clone(), 0usize),
+                    Type::Result(ok, err) => (vec![ok.as_ref().clone(), err.as_ref().clone()], 1usize),
                     _ => return Err("mir eval expects tuple for multiple outputs".to_string()),
                 };
                 if tuple_items.len() != out.len() {
@@ -2503,7 +2863,7 @@ impl<'a> FnEmitter<'a> {
                         tmp,
                         llvm_type(&val.ty)?,
                         val.ir,
-                        idx
+                        idx + index_offset
                     ));
                     if info.ty != Type::Builtin(BuiltinType::Unit) {
                         self.emit(format!(
@@ -2525,12 +2885,52 @@ impl<'a> FnEmitter<'a> {
                 Ok(())
             }
             MirStmt::Assign { target, value } => {
-                let stmt = Stmt::Assign {
-                    target: target.clone(),
-                    value: value.clone(),
-                    span: target.span.clone(),
+                let (target_ty, target_ptr) = self.emit_place_ptr(target)?;
+                let target_name = match &target.kind {
+                    ExprKind::Ident(name) => Some(name.as_str()),
+                    _ => None,
                 };
-                self.emit_stmt(&stmt)
+                if self.needs_drop(&target_ty) {
+                    let should_drop = if let Some(name) = target_name {
+                        if self.is_linear_type(&target_ty) {
+                            self.linear_states.get(name).copied().unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if should_drop {
+                        self.emit_drop_for_ptr(&target_ty, &target_ptr)?;
+                    }
+                }
+                let val = self.emit_expr(value)?;
+                if let ExprKind::Call { callee, .. } = &value.kind {
+                    if let ExprKind::Ident(callee_name) = &callee.kind {
+                        if callee_name != "shared_new" {
+                            self.emit_shared_inc_value(&val)?;
+                        }
+                    } else {
+                        self.emit_shared_inc_value(&val)?;
+                    }
+                } else {
+                    self.emit_shared_inc_value(&val)?;
+                }
+                if target_ty != Type::Builtin(BuiltinType::Unit) {
+                    self.emit(format!(
+                        "store {} {}, {}* {}",
+                        llvm_type(&target_ty)?,
+                        val.ir,
+                        llvm_storage_type(&target_ty)?,
+                        target_ptr
+                    ));
+                }
+                if let Some(name) = target_name {
+                    if self.is_linear_type(&target_ty) {
+                        self.mark_assigned(name);
+                    }
+                }
+                Ok(())
             }
             MirStmt::Let { .. } => Err("mir let is not supported in codegen yet".to_string()),
             MirStmt::Drop { local } => {
@@ -2635,7 +3035,15 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn next_go_thunk_name(&mut self) -> String {
-        let name = format!("__gost_go_thunk_{}", self.go_counter);
+        let mut prefix = String::with_capacity(self.fn_name.len());
+        for ch in self.fn_name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                prefix.push(ch);
+            } else {
+                prefix.push('_');
+            }
+        }
+        let name = format!("__gost_go_thunk_{}_{}", prefix, self.go_counter);
         self.go_counter += 1;
         name
     }
@@ -2655,6 +3063,7 @@ impl<'a> FnEmitter<'a> {
             ctx_ty
         ));
         let mut arg_ir = Vec::new();
+        let mut field_slots = Vec::new();
         for (idx, ty) in param_tys.iter().enumerate() {
             let storage_ty = llvm_storage_type(ty)?;
             let slot = format!("%slot{}", idx);
@@ -2662,6 +3071,7 @@ impl<'a> FnEmitter<'a> {
                 "  {} = getelementptr {}, {}* %ctx_cast, i32 0, i32 {}",
                 slot, ctx_ty, ctx_ty, idx
             ));
+            field_slots.push((slot.clone(), storage_ty.clone(), ty.clone()));
             if *ty == Type::Builtin(BuiltinType::Unit) {
                 arg_ir.push(String::new());
                 continue;
@@ -2671,6 +3081,17 @@ impl<'a> FnEmitter<'a> {
                 "  {} = load {}, {}* {}",
                 tmp, storage_ty, storage_ty, slot
             ));
+            if matches!(ty, Type::Shared(_)) {
+                let obj = format!("%sh_obj{}", idx);
+                lines.push(format!(
+                    "  {} = extractvalue %shared {}, 0",
+                    obj, tmp
+                ));
+                lines.push(format!(
+                    "  call void @__gost_shared_inc(%shared_obj* {})",
+                    obj
+                ));
+            }
             arg_ir.push(tmp);
         }
         let mut args_rendered = Vec::new();
@@ -2697,6 +3118,18 @@ impl<'a> FnEmitter<'a> {
                 callee_name,
                 args_rendered.join(", ")
             ));
+        }
+        for (idx, (slot, storage_ty, ty)) in field_slots.iter().enumerate().rev() {
+            let drop_fn = self.emit_drop_fn_ptr(ty)?;
+            if drop_fn == "null" {
+                continue;
+            }
+            let cast = format!("%drop_cast{}", idx);
+            lines.push(format!(
+                "  {} = bitcast {}* {} to i8*",
+                cast, storage_ty, slot
+            ));
+            lines.push(format!("  call void {}(i8* {})", drop_fn, cast));
         }
         lines.push(format!(
             "  %size_ptr = getelementptr {}, {}* null, i32 1",
@@ -2908,6 +3341,8 @@ impl<'a> FnEmitter<'a> {
             Type::Builtin(BuiltinType::Bytes) => true,
             Type::Slice(_) | Type::Map(_, _) | Type::Chan(_) | Type::Shared(_) => true,
             Type::Tuple(items) => items.iter().any(|item| self.needs_drop(item)),
+            Type::Result(ok, err) => self.needs_drop(ok) || self.needs_drop(err),
+            Type::Iter(_) => false,
             Type::Named(name) => match self.types.get(name) {
                 Some(TypeDefKind::Struct(def)) => def
                     .fields
@@ -2923,7 +3358,7 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn next_drop_fn_name(&mut self) -> String {
-        let name = format!("__gost_drop_fn_{}", self.drop_counter);
+        let name = format!("__gost_drop_fn_{}_{}", self.fn_name, self.drop_counter);
         self.drop_counter += 1;
         name
     }
@@ -3028,6 +3463,80 @@ impl<'a> FnEmitter<'a> {
                     "  call void @__gost_shared_dec(%shared_obj* {})",
                     obj
                 ));
+            }
+            Type::Result(ok_ty, err_ty) => {
+                let storage_ty = llvm_type(ty)?;
+                let cast = next_tmp();
+                lines.push(format!(
+                    "  {} = bitcast i8* {} to {}*",
+                    cast, ptr, storage_ty
+                ));
+                let val = next_tmp();
+                lines.push(format!(
+                    "  {} = load {}, {}* {}",
+                    val, storage_ty, storage_ty, cast
+                ));
+                let tag = next_tmp();
+                lines.push(format!(
+                    "  {} = extractvalue {} {}, 0",
+                    tag, storage_ty, val
+                ));
+                let id = next_tmp();
+                let id = id.trim_start_matches('%');
+                let ok_label = format!("drop_res_ok_{}", id);
+                let err_label = format!("drop_res_err_{}", id);
+                let end_label = format!("drop_res_end_{}", id);
+                lines.push(format!(
+                    "  switch i8 {}, label %{} [ i8 0, label %{} i8 1, label %{} ]",
+                    tag, end_label, ok_label, err_label
+                ));
+                lines.push(format!("{}:", ok_label));
+                if self.needs_drop(ok_ty) {
+                    let field_ptr = next_tmp();
+                    lines.push(format!(
+                        "  {} = getelementptr {}, {}* {}, i32 0, i32 1",
+                        field_ptr, storage_ty, storage_ty, cast
+                    ));
+                    let drop_fn = self.emit_drop_fn_ptr(ok_ty)?;
+                    if drop_fn != "null" {
+                        let cast_ptr = next_tmp();
+                        lines.push(format!(
+                            "  {} = bitcast {}* {} to i8*",
+                            cast_ptr,
+                            llvm_type_for_tuple_elem(ok_ty)?,
+                            field_ptr
+                        ));
+                        lines.push(format!(
+                            "  call void {}(i8* {})",
+                            drop_fn, cast_ptr
+                        ));
+                    }
+                }
+                lines.push(format!("  br label %{}", end_label));
+                lines.push(format!("{}:", err_label));
+                if self.needs_drop(err_ty) {
+                    let field_ptr = next_tmp();
+                    lines.push(format!(
+                        "  {} = getelementptr {}, {}* {}, i32 0, i32 2",
+                        field_ptr, storage_ty, storage_ty, cast
+                    ));
+                    let drop_fn = self.emit_drop_fn_ptr(err_ty)?;
+                    if drop_fn != "null" {
+                        let cast_ptr = next_tmp();
+                        lines.push(format!(
+                            "  {} = bitcast {}* {} to i8*",
+                            cast_ptr,
+                            llvm_type_for_tuple_elem(err_ty)?,
+                            field_ptr
+                        ));
+                        lines.push(format!(
+                            "  call void {}(i8* {})",
+                            drop_fn, cast_ptr
+                        ));
+                    }
+                }
+                lines.push(format!("  br label %{}", end_label));
+                lines.push(format!("{}:", end_label));
             }
             Type::Tuple(items) => {
                 let storage_ty = llvm_type(ty)?;
@@ -3363,6 +3872,80 @@ impl<'a> FnEmitter<'a> {
         self.emit_enum_value(enum_name, variant_idx, payload_ptr)
     }
 
+    fn emit_result_ctor(
+        &mut self,
+        variant: &str,
+        type_args: &[Type],
+        args: &[Expr],
+    ) -> Result<Value, String> {
+        if type_args.len() != 2 {
+            return Err("Result constructors expect two type arguments".to_string());
+        }
+        if args.len() != 1 {
+            return Err("Result constructors expect one argument".to_string());
+        }
+        let ok_ty = type_args[0].clone();
+        let err_ty = type_args[1].clone();
+        let arg_val = self.emit_expr(&args[0])?;
+        self.emit_shared_inc_value(&arg_val)?;
+        let result_ty = Type::Result(Box::new(ok_ty.clone()), Box::new(err_ty.clone()));
+        let llvm_result = llvm_type(&result_ty)?;
+        let tag_val = match variant {
+            "Ok" | "ok" => "0",
+            "Err" | "err" => "1",
+            _ => return Err("unknown Result variant".to_string()),
+        };
+        let tag_tmp = self.new_temp();
+        self.emit(format!(
+            "{} = insertvalue {} undef, i8 {}, 0",
+            tag_tmp, llvm_result, tag_val
+        ));
+        let ok_ir = if matches!(variant, "Ok" | "ok") {
+            if arg_val.ty == Type::Builtin(BuiltinType::Unit) {
+                "0".to_string()
+            } else {
+                arg_val.ir.clone()
+            }
+        } else if ok_ty == Type::Builtin(BuiltinType::Unit) {
+            "0".to_string()
+        } else {
+            zero_value(&ok_ty)?
+        };
+        let ok_tmp = self.new_temp();
+        self.emit(format!(
+            "{} = insertvalue {} {}, {} {}, 1",
+            ok_tmp,
+            llvm_result,
+            tag_tmp,
+            llvm_type_for_tuple_elem(&ok_ty)?,
+            ok_ir
+        ));
+        let err_ir = if matches!(variant, "Err" | "err") {
+            if arg_val.ty == Type::Builtin(BuiltinType::Unit) {
+                "0".to_string()
+            } else {
+                arg_val.ir.clone()
+            }
+        } else if err_ty == Type::Builtin(BuiltinType::Unit) {
+            "0".to_string()
+        } else {
+            zero_value(&err_ty)?
+        };
+        let err_tmp = self.new_temp();
+        self.emit(format!(
+            "{} = insertvalue {} {}, {} {}, 2",
+            err_tmp,
+            llvm_result,
+            ok_tmp,
+            llvm_type_for_tuple_elem(&err_ty)?,
+            err_ir
+        ));
+        Ok(Value {
+            ty: result_ty,
+            ir: err_tmp,
+        })
+    }
+
     fn resolve_struct_field(
         &self,
         type_name: &str,
@@ -3478,6 +4061,10 @@ impl<'a> FnEmitter<'a> {
                 Box::new(self.resolve_type_ast(key)?),
                 Box::new(self.resolve_type_ast(value)?),
             )),
+            crate::frontend::ast::TypeAstKind::Result(ok, err) => Ok(Type::Result(
+                Box::new(self.resolve_type_ast(ok)?),
+                Box::new(self.resolve_type_ast(err)?),
+            )),
             crate::frontend::ast::TypeAstKind::Chan(inner) => {
                 Ok(Type::Chan(Box::new(self.resolve_type_ast(inner)?)))
             }
@@ -3561,14 +4148,6 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
-    fn emit_drop_all_scopes_no_pop(&mut self) -> Result<(), String> {
-        let deferred = self.deferred.clone();
-        for defers in deferred.iter().rev() {
-            self.emit_deferred_list(defers)?;
-        }
-        Ok(())
-    }
-
     fn emit_deferred_list(&mut self, defers: &[DeferredCall]) -> Result<(), String> {
         for deferred in defers.iter().rev() {
             let mut args = Vec::new();
@@ -3622,9 +4201,11 @@ impl<'a> FnEmitter<'a> {
                     }
                 }
             }
-            for name in names.iter().rev() {
-                self.locals.remove(name);
-                self.linear_states.remove(name);
+            if !self.mir_mode {
+                for name in names.iter().rev() {
+                    self.locals.remove(name);
+                    self.linear_states.remove(name);
+                }
             }
         }
         Ok(())

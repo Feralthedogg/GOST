@@ -1,4 +1,4 @@
-use crate::frontend::ast::{Block, Expr, ExprId, Pattern, SelectArm, Stmt};
+use crate::frontend::ast::{Block, Expr, ExprId, Pattern, SelectArm};
 use crate::sema::types::{Type, TypeClass};
 use std::collections::HashMap;
 
@@ -32,6 +32,7 @@ pub struct MirModule {
 pub struct MirFunction {
     pub name: String,
     pub ret_ty: Type,
+    pub param_count: usize,
     pub locals: Vec<Local>,
     pub expr_types: HashMap<ExprId, Type>,
     pub blocks: Vec<BasicBlock>,
@@ -59,7 +60,6 @@ pub struct BasicBlock {
 pub enum MirStmt {
     EnterScope { scope: ScopeId },
     ExitScope { scope: ScopeId },
-    Ast(Stmt),
     ForIn {
         name: String,
         iter: Expr,

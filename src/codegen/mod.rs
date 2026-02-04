@@ -55,8 +55,21 @@ impl<'a> Codegen<'a> {
 
     fn emit_module_from_mir(&mut self, mir: &MirModule) -> Result<(), String> {
         self.emit_prelude()?;
+        let mut has_main = false;
         for func in &mir.functions {
-            self.emit_mir_function(func)?;
+            if func.name == "main" {
+                has_main = true;
+                self.emit_mir_function_named(func, "__gost_user_main")?;
+            } else {
+                self.emit_mir_function(func)?;
+            }
+        }
+        if has_main {
+            self.output.push_str("define i32 @main() {\n");
+            self.output
+                .push_str("  %ret = call i32 @__gost_rt_start(i32 ()* @__gost_user_main)\n");
+            self.output.push_str("  ret i32 %ret\n");
+            self.output.push_str("}\n\n");
         }
         self.emit_globals();
         Ok(())
@@ -73,6 +86,8 @@ impl<'a> Codegen<'a> {
         self.output.push_str("%chan = type opaque\n");
         self.emit_named_types()?;
         self.output.push_str("declare void @__gost_rt_init()\n");
+        self.output
+            .push_str("declare i32 @__gost_rt_start(i32 ()*)\n");
         self.output
             .push_str("declare void @__gost_println_str(i8*, i64)\n");
         self.output
@@ -134,11 +149,14 @@ impl<'a> Codegen<'a> {
         self.output
             .push_str("declare void @__gost_free(i8*, i64, i64)\n");
         self.output
+            .push_str("declare i32 @__gost_error_new(i8*, i64)\n");
+        self.output
             .push_str("declare void @__gost_spawn_thread(void (i8*)*, i8*)\n");
         self.output
-            .push_str("declare %chan* @__gost_after_ms(i64)\n");
+            .push_str("declare void @__gost_go_spawn(void (i8*)*, i8*)\n");
         self.output
-            .push_str("declare void @__gost_go_spawn(void ()*)\n\n");
+            .push_str("declare %chan* @__gost_after_ms(i64)\n");
+        self.output.push('\n');
         Ok(())
     }
 
@@ -326,6 +344,134 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    fn emit_mir_function_named(
+        &mut self,
+        func: &crate::mir::MirFunction,
+        name_override: &str,
+    ) -> Result<(), String> {
+        let sig = self
+            .program
+            .functions
+            .get(&func.name)
+            .ok_or_else(|| format!("missing signature for {}", func.name))?;
+        let ret_ty = llvm_type(&sig.ret)?;
+        let mut params_ir = Vec::new();
+        for (idx, param) in sig.params.iter().enumerate() {
+            params_ir.push(format!("{} %arg{}", llvm_type(param)?, idx));
+        }
+        self.output.push_str(&format!(
+            "define {} @{}({}) {{\n",
+            ret_ty,
+            name_override,
+            params_ir.join(", ")
+        ));
+        let mut emitter = FnEmitter::new(
+            name_override,
+            &self.program.functions,
+            &self.program.types,
+            sig.ret.clone(),
+        );
+        let mut param_names = Vec::new();
+        if let Some(ast_func) = self.find_function(&func.name) {
+            for param in &ast_func.params {
+                param_names.push(param.name.clone());
+            }
+        } else {
+            for idx in 0..sig.params.len() {
+                param_names.push(format!("arg{}", idx));
+            }
+        }
+        emitter.emit_prologue(&sig.params, &param_names)?;
+        emitter.set_mir_mode(true);
+        emitter.set_mir_locals(&func.locals)?;
+        emitter.set_mir_expr_types(&func.expr_types);
+        let mut block_map = Vec::new();
+        let mut block_names = Vec::new();
+        block_map.push(0);
+        block_names.push("entry".to_string());
+        for idx in 1..func.blocks.len() {
+            let name = format!("mir_bb{}", idx);
+            let block_idx = emitter.add_block(name.clone());
+            block_map.push(block_idx);
+            block_names.push(name);
+        }
+        for (idx, block) in func.blocks.iter().enumerate() {
+            let block_idx = block_map[idx];
+            emitter.switch_to(block_idx);
+            let term_is_return = matches!(
+                block.term,
+                crate::mir::Terminator::Return { .. } | crate::mir::Terminator::ReturnError { .. }
+            );
+            let mut split_idx = block.stmts.len();
+            if term_is_return {
+                while split_idx > 0 {
+                    if matches!(
+                        block.stmts[split_idx - 1],
+                        crate::mir::MirStmt::Drop { .. }
+                            | crate::mir::MirStmt::DropName { .. }
+                            | crate::mir::MirStmt::DeferCall { .. }
+                            | crate::mir::MirStmt::ExitScope { .. }
+                    ) {
+                        split_idx -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let (prefix, cleanup) = block.stmts.split_at(split_idx);
+            for stmt in prefix {
+                emitter.emit_mir_stmt(stmt)?;
+                if emitter.current_block_terminated() {
+                    break;
+                }
+            }
+            if !emitter.current_block_terminated() {
+                if term_is_return {
+                    match &block.term {
+                        crate::mir::Terminator::Return { value } => {
+                            let ret_val = if let Some(expr) = value {
+                                Some(emitter.emit_expr(expr)?)
+                            } else {
+                                None
+                            };
+                            for stmt in cleanup {
+                                emitter.emit_mir_stmt(stmt)?;
+                            }
+                            emitter.emit_return_value(ret_val)?;
+                        }
+                        crate::mir::Terminator::ReturnError { err } => {
+                            let err_val = emitter.emit_expr(err)?;
+                            for stmt in cleanup {
+                                emitter.emit_mir_stmt(stmt)?;
+                            }
+                            emitter.emit_error_return_value(err_val)?;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    emitter.emit_mir_terminator(&block.term, &block_names)?;
+                }
+            }
+        }
+        for block in emitter.blocks {
+            self.output.push_str(&format!("{}:\n", block.name));
+            for instr in block.instrs {
+                self.output.push_str("  ");
+                self.output.push_str(&instr);
+                self.output.push('\n');
+            }
+        }
+        self.output.push_str("}\n\n");
+        for extra in emitter.extra_functions {
+            self.output.push_str(&extra);
+            self.output.push_str("\n\n");
+        }
+        for lit in emitter.string_literals {
+            self.globals.push(lit);
+        }
+        Ok(())
+    }
+
     fn find_function(&self, name: &str) -> Option<&Function> {
         for item in &self.program.file.items {
             if let Item::Function(func) = item {
@@ -417,9 +563,19 @@ pub(crate) fn llvm_type(ty: &Type) -> Result<String, String> {
             }
             format!("{{ {} }}", parts.join(", "))
         }
+        Type::Result(ok, err) => llvm_result_type(ok, err)?,
+        Type::Iter(_) => return Err("iter type must be lowered before codegen".to_string()),
         Type::Named(name) => format!("%{}", name),
     };
     Ok(s)
+}
+
+fn llvm_result_type(ok: &Type, err: &Type) -> Result<String, String> {
+    Ok(format!(
+        "{{ i8, {}, {} }}",
+        llvm_type_for_tuple_elem(ok)?,
+        llvm_type_for_tuple_elem(err)?
+    ))
 }
 
 pub(crate) fn llvm_type_for_tuple_elem(ty: &Type) -> Result<String, String> {
@@ -458,6 +614,8 @@ pub(crate) fn zero_value(ty: &Type) -> Result<String, String> {
         | Type::Builtin(BuiltinType::Bytes)
         | Type::Slice(_)
         | Type::Tuple(_)
+        | Type::Result(_, _)
+        | Type::Iter(_)
         | Type::Shared(_)
         | Type::Map(_, _)
         | Type::Interface

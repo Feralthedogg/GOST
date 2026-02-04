@@ -113,6 +113,23 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
     } else {
         link_args.push("-lpthread".into());
     }
+    if cfg!(windows) {
+        // Rust std on windows-gnu expects these system libs at final link.
+        link_args.push("-lntdll".into());
+        link_args.push("-lws2_32".into());
+        link_args.push("-lwsock32".into());
+        link_args.push("-luserenv".into());
+        link_args.push("-lbcrypt".into());
+        link_args.push("-ladvapi32".into());
+        link_args.push("-luser32".into());
+        link_args.push("-lshell32".into());
+        link_args.push("-lole32".into());
+        link_args.push("-loleaut32".into());
+        link_args.push("-lcomdlg32".into());
+        link_args.push("-lgdi32".into());
+        link_args.push("-lwinmm".into());
+        link_args.push("-lsecur32".into());
+    }
     link_args.push("-o".into());
     link_args.push(exe_path.display().to_string());
     run_cmd(&cc, &link_args)?;
@@ -124,47 +141,56 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
 }
 
 fn build_runtime(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
-    let rt_src = runtime_dir.join("gostrt.c");
-    let rt_obj = runtime_dir.join("gostrt.o");
-    let rt_lib = runtime_dir.join("libgostrt.a");
-    let stamp_path = runtime_dir.join("gostrt.toolchain");
-    let stamp = toolchain_stamp(cc).unwrap_or_else(|_| cc.to_string());
-    let mut needs_rebuild = !rt_lib.exists();
-    if !needs_rebuild {
-        if is_newer(&rt_src, &rt_lib)? {
-            needs_rebuild = true;
-        } else if let Ok(existing) = std::fs::read_to_string(&stamp_path) {
-            if existing != stamp {
-                needs_rebuild = true;
-            }
+    let cargo_toml = runtime_dir.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Err("runtime/Cargo.toml not found; Rust runtime required".to_string());
+    }
+    build_runtime_rust(runtime_dir, cc)
+}
+
+fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
+    let target = if let Ok(t) = std::env::var("GOST_RUST_TARGET") {
+        Some(t)
+    } else if let Some(triple) = compiler_triple(cc) {
+        if triple.contains("msvc") {
+            Some("x86_64-pc-windows-msvc".to_string())
+        } else if triple.contains("mingw") || triple.contains("gnu") {
+            Some("x86_64-pc-windows-gnu".to_string())
         } else {
-            needs_rebuild = true;
+            Some(triple)
         }
+    } else {
+        None
+    };
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--manifest-path")
+        .arg(runtime_dir.join("Cargo.toml"));
+    if let Some(target) = &target {
+        cmd.arg("--target").arg(target);
     }
-    if needs_rebuild {
-        let _ = std::fs::remove_file(&rt_obj);
-        let _ = std::fs::remove_file(&rt_lib);
-        run_cmd(
-            cc,
-            &[
-                "-c".into(),
-                rt_src.display().to_string(),
-                "-o".into(),
-                rt_obj.display().to_string(),
-            ],
-        )?;
-        let ar = find_ar().ok_or_else(|| "llvm-ar or ar not found in PATH".to_string())?;
-        run_cmd(
-            &ar,
-            &[
-                "rcs".into(),
-                rt_lib.display().to_string(),
-                rt_obj.display().to_string(),
-            ],
-        )?;
-        std::fs::write(&stamp_path, stamp).map_err(|e| e.to_string())?;
+    if std::env::var("GOST_STATS").ok().as_deref() == Some("1") {
+        cmd.arg("--features").arg("stats");
     }
-    Ok(rt_lib)
+    cmd.env("CC", cc);
+    let status = cmd.status().map_err(|e| format!("failed to run cargo: {}", e))?;
+    if !status.success() {
+        return Err("failed to build Rust runtime (is target installed?)".to_string());
+    }
+    let lib_name = if target.as_deref().unwrap_or("").contains("msvc") {
+        "gostrt.lib"
+    } else {
+        "libgostrt.a"
+    };
+    let lib_path = if let Some(target) = target {
+        runtime_dir.join("target").join(target).join("debug").join(lib_name)
+    } else {
+        runtime_dir.join("target").join("debug").join(lib_name)
+    };
+    if !lib_path.exists() {
+        return Err(format!("Rust runtime output not found: {}", lib_path.display()));
+    }
+    Ok(lib_path)
 }
 
 fn resolve_cc() -> String {
@@ -200,30 +226,6 @@ fn compiler_target(cc: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn toolchain_stamp(cc: &str) -> Result<String, String> {
-    let version = Command::new(cc)
-        .arg("--version")
-        .output()
-        .map_err(|e| e.to_string())?;
-    let mut stamp = String::new();
-    stamp.push_str("cc=");
-    stamp.push_str(cc);
-    stamp.push('\n');
-    if let Ok(text) = String::from_utf8(version.stdout) {
-        if let Some(line) = text.lines().next() {
-            stamp.push_str("version=");
-            stamp.push_str(line.trim());
-            stamp.push('\n');
-        }
-    }
-    if let Some(triple) = compiler_triple(cc) {
-        stamp.push_str("triple=");
-        stamp.push_str(triple.trim());
-        stamp.push('\n');
-    }
-    Ok(stamp)
 }
 
 fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), String> {
@@ -292,43 +294,6 @@ fn command_exists(cmd: &str) -> bool {
     Command::new(cmd).arg("--version").output().is_ok()
 }
 
-fn is_newer(src: &Path, out: &Path) -> Result<bool, String> {
-    let src_meta = std::fs::metadata(src).map_err(|e| e.to_string())?;
-    let out_meta = std::fs::metadata(out).map_err(|e| e.to_string())?;
-    let src_time = src_meta.modified().map_err(|e| e.to_string())?;
-    let out_time = out_meta.modified().map_err(|e| e.to_string())?;
-    Ok(src_time > out_time)
-}
-
-fn find_ar() -> Option<String> {
-    if let Ok(ar) = std::env::var("GOST_AR") {
-        if command_exists(&ar) {
-            return Some(ar);
-        }
-    }
-    if let Ok(cc) = std::env::var("GOST_CC") {
-        if let Some(path) = tool_in_cc_dir(&cc, "llvm-ar") {
-            if command_exists(&path) {
-                return Some(path);
-            }
-        }
-        if let Some(path) = tool_in_cc_dir(&cc, "ar") {
-            if command_exists(&path) {
-                return Some(path);
-            }
-        }
-    }
-    for name in ["llvm-ar", "ar"] {
-        let ok = Command::new(name)
-            .arg("--version")
-            .output()
-            .is_ok();
-        if ok {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
 
 fn run_cmd(cmd: &str, args: &[String]) -> Result<(), String> {
     let status = Command::new(cmd)

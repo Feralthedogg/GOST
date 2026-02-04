@@ -285,8 +285,9 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
     let mut worklist = VecDeque::new();
     if !func.blocks.is_empty() {
         let entry = func.entry;
-        for (idx, is_linear) in linear_mask.iter().enumerate() {
-            if *is_linear {
+        let param_limit = std::cmp::min(func.param_count, linear_mask.len());
+        for idx in 0..param_limit {
+            if linear_mask[idx] {
                 in_state[entry][idx] = LinState::Alive;
             }
         }
@@ -313,7 +314,8 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
             &name_to_local,
             &linear_mask,
             &local_names,
-        )?;
+        )
+        .map_err(|e| format!("{}: {}", func.name, e))?;
         if state != out_state[bb] {
             out_state[bb] = state;
             for succ in successors(&func.blocks[bb].term) {
@@ -356,10 +358,141 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
                 &name_to_local,
                 &linear_mask,
                 &local_names,
-            )?;
+            )
+            .map_err(|e| format!("{}: {}", func.name, e))?;
             new_stmts.push(stmt.clone());
         }
         block.stmts = new_stmts;
+    }
+    Ok(())
+}
+
+pub fn verify_mir_strict(func: &MirFunction) -> Result<(), String> {
+    let block_count = func.blocks.len();
+    if block_count == 0 {
+        return Err(format!(
+            "MIR-only violation: function {} has no basic blocks",
+            func.name
+        ));
+    }
+    if func.entry >= block_count {
+        return Err(format!(
+            "MIR-only violation: function {} entry block {} out of range",
+            func.name, func.entry
+        ));
+    }
+    if func.block_depths.len() != block_count {
+        return Err(format!(
+            "MIR-only violation: function {} block_depths length mismatch",
+            func.name
+        ));
+    }
+    if func.block_scopes.len() != block_count {
+        return Err(format!(
+            "MIR-only violation: function {} block_scopes length mismatch",
+            func.name
+        ));
+    }
+    if func.block_exit_scopes.len() != block_count {
+        return Err(format!(
+            "MIR-only violation: function {} block_exit_scopes length mismatch",
+            func.name
+        ));
+    }
+
+    for (scope_id, scope) in func.scopes.iter().enumerate() {
+        if scope.depth < 0 {
+            return Err(format!(
+                "MIR-only violation: function {} scope {} has negative depth",
+                func.name, scope_id
+            ));
+        }
+        if let Some(parent) = scope.parent {
+            if parent >= func.scopes.len() {
+                return Err(format!(
+                    "MIR-only violation: function {} scope {} has invalid parent {}",
+                    func.name, scope_id, parent
+                ));
+            }
+            let parent_depth = func.scopes[parent].depth;
+            if parent_depth >= scope.depth {
+                return Err(format!(
+                    "MIR-only violation: function {} scope {} depth {} not greater than parent depth {}",
+                    func.name, scope_id, scope.depth, parent_depth
+                ));
+            }
+        }
+    }
+
+    for (bb_idx, block) in func.blocks.iter().enumerate() {
+        let depth = func.block_depths[bb_idx];
+        if depth < 0 {
+            return Err(format!(
+                "MIR-only violation: function {} bb {} has negative depth",
+                func.name, bb_idx
+            ));
+        }
+        if let Some(scope_id) = func.block_scopes[bb_idx] {
+            if scope_id >= func.scopes.len() {
+                return Err(format!(
+                    "MIR-only violation: function {} bb {} has invalid scope {}",
+                    func.name, bb_idx, scope_id
+                ));
+            }
+        }
+        if let Some(scope_id) = func.block_exit_scopes[bb_idx] {
+            if scope_id >= func.scopes.len() {
+                return Err(format!(
+                    "MIR-only violation: function {} bb {} has invalid exit scope {}",
+                    func.name, bb_idx, scope_id
+                ));
+            }
+        }
+
+        let check_target = |target: usize, func_name: &str, bb_idx: usize| -> Result<(), String> {
+            if target >= block_count {
+                return Err(format!(
+                    "MIR-only violation: function {} bb {} has invalid target bb {}",
+                    func_name, bb_idx, target
+                ));
+            }
+            Ok(())
+        };
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            match stmt {
+                MirStmt::Select { .. } => {
+                    return Err(format!(
+                        "MIR-only violation: MirStmt::Select remains in {} (bb {}, stmt {})",
+                        func.name, bb_idx, stmt_idx
+                    ));
+                }
+                MirStmt::ForIn { .. } => {
+                    return Err(format!(
+                        "MIR-only violation: MirStmt::ForIn remains in {} (bb {}, stmt {})",
+                        func.name, bb_idx, stmt_idx
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match &block.term {
+            Terminator::Goto(target) => {
+                check_target(*target, &func.name, bb_idx)?;
+            }
+            Terminator::If { then_bb, else_bb, .. } => {
+                check_target(*then_bb, &func.name, bb_idx)?;
+                check_target(*else_bb, &func.name, bb_idx)?;
+            }
+            Terminator::Match { arms, default, .. } => {
+                for (_, target) in arms {
+                    check_target(*target, &func.name, bb_idx)?;
+                }
+                if let Some(target) = default {
+                    check_target(*target, &func.name, bb_idx)?;
+                }
+            }
+            Terminator::Return { .. } | Terminator::ReturnError { .. } => {}
+        }
     }
     Ok(())
 }
@@ -527,7 +660,6 @@ fn apply_stmt_effects(
             }
             Ok(())
         }
-        MirStmt::Ast(stmt) => apply_ast_stmt_moves(stmt, state, name_to_local, linear_mask, local_names),
         MirStmt::ForIn { iter, body, .. } => {
             apply_expr_moves(
                 iter,
@@ -853,11 +985,19 @@ fn apply_expr_moves(
             }
             Ok(())
         }
-        ExprKind::Call { args, .. } => {
+        ExprKind::Call { callee, args, .. } => {
+            let mut arg_ctx = ExprCtx::Value;
+            if let ExprKind::Ident(name) = &callee.kind {
+                if name == "__gost_chan_can_send" || name == "__gost_chan_can_recv" {
+                    arg_ctx = ExprCtx::Place;
+                } else if name == "__gost_select_wait" {
+                    return Ok(());
+                }
+            }
             for arg in args {
                 apply_expr_moves(
                     arg,
-                    ExprCtx::Value,
+                    arg_ctx,
                     state,
                     name_to_local,
                     linear_mask,
@@ -926,11 +1066,11 @@ fn apply_expr_moves(
             apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
         ExprKind::Send { chan, value } => {
-            apply_expr_moves(chan, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
+            apply_expr_moves(chan, ExprCtx::Place, state, name_to_local, linear_mask, local_names)?;
             apply_expr_moves(value, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
         ExprKind::Recv { chan } | ExprKind::Close { chan } => {
-            apply_expr_moves(chan, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
+            apply_expr_moves(chan, ExprCtx::Place, state, name_to_local, linear_mask, local_names)
         }
         ExprKind::After { ms } => {
             apply_expr_moves(ms, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
@@ -950,6 +1090,7 @@ fn needs_drop(defs: &TypeDefs, ty: &Type) -> bool {
         Type::Builtin(_) => false,
         Type::Slice(_) | Type::Map(_, _) | Type::Chan(_) | Type::Shared(_) => true,
         Type::Tuple(items) => items.iter().any(|item| needs_drop(defs, item)),
+        Type::Result(ok, err) => needs_drop(defs, ok) || needs_drop(defs, err),
         Type::Named(name) => match defs.get(name) {
             Some(TypeDefKind::Struct(def)) => def
                 .fields

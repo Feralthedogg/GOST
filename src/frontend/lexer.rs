@@ -61,6 +61,7 @@ pub enum Symbol {
     Arrow,
     FatArrow,
     Pipe,
+    PipeGt,
     Amp,
     Star,
     Plus,
@@ -276,7 +277,10 @@ impl<'a> Lexer<'a> {
             }
             '|' => {
                 self.advance();
-                if self.peek_char() == '|' {
+                if self.peek_char() == '>' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::PipeGt)
+                } else if self.peek_char() == '|' {
                     self.advance();
                     TokenKind::Symbol(Symbol::OrOr)
                 } else {

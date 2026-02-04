@@ -273,6 +273,7 @@ pub enum TypeAstKind {
     MutRef(Box<TypeAst>),
     Slice(Box<TypeAst>),
     Map(Box<TypeAst>, Box<TypeAst>),
+    Result(Box<TypeAst>, Box<TypeAst>),
     Chan(Box<TypeAst>),
     Shared(Box<TypeAst>),
     Interface,
