@@ -243,6 +243,7 @@ struct gost_m {
     curg: *mut gost_g,
     id: i32,
     p: *mut gost_p,
+    stats: gost_stats_local,
 }
 
 #[repr(C)]
@@ -511,72 +512,66 @@ unsafe fn os_thread_join(t: OsThread) {
     pthread_join(t, ptr::null_mut());
 }
 
-#[allow(dead_code)]
-static ST_G_CREATED: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_G_FREED: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_GOREADY_CALLS: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_GOPARK_CALLS: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_RUNQ_PUSH: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_RUNQ_POP: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_RUNQ_DUPE_BLOCKED: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SCHED_SWITCH: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SUDOG_ALLOC: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SUDOG_FREE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_SEND_FAST: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_SEND_BUF: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_SEND_BLOCK: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_RECV_FAST: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_RECV_BUF: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_RECV_BLOCK: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_CHAN_CLOSE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TIMER_ADD: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TIMER_FIRED: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_WAITER_ALLOC: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_WAITER_FREE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_NODE_ALLOC: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_NODE_FREE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_NOTIFY_CALLS: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_SELECT_WAKE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_STEAL_CALLS: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_STEAL_FAIL: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_STEAL_TAKE: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TH_PUSH: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TH_POP: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TH_SIFT_UP: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TH_SIFT_DOWN: AtomicI64 = AtomicI64::new(0);
-#[allow(dead_code)]
-static ST_TH_MAXLEN: AtomicI64 = AtomicI64::new(0);
+#[derive(Copy, Clone)]
+struct StatSlot(usize);
+
+const ST_G_CREATED: StatSlot = StatSlot(0);
+const ST_G_FREED: StatSlot = StatSlot(1);
+const ST_GOREADY_CALLS: StatSlot = StatSlot(2);
+const ST_GOPARK_CALLS: StatSlot = StatSlot(3);
+const ST_RUNQ_PUSH: StatSlot = StatSlot(4);
+const ST_RUNQ_POP: StatSlot = StatSlot(5);
+const ST_RUNQ_DUPE_BLOCKED: StatSlot = StatSlot(6);
+const ST_SCHED_SWITCH: StatSlot = StatSlot(7);
+const ST_SUDOG_ALLOC: StatSlot = StatSlot(8);
+const ST_SUDOG_FREE: StatSlot = StatSlot(9);
+const ST_CHAN_SEND_FAST: StatSlot = StatSlot(10);
+const ST_CHAN_SEND_BUF: StatSlot = StatSlot(11);
+const ST_CHAN_SEND_BLOCK: StatSlot = StatSlot(12);
+const ST_CHAN_RECV_FAST: StatSlot = StatSlot(13);
+const ST_CHAN_RECV_BUF: StatSlot = StatSlot(14);
+const ST_CHAN_RECV_BLOCK: StatSlot = StatSlot(15);
+const ST_CHAN_CLOSE: StatSlot = StatSlot(16);
+const ST_TIMER_ADD: StatSlot = StatSlot(17);
+const ST_TIMER_FIRED: StatSlot = StatSlot(18);
+const ST_SELECT_WAITER_ALLOC: StatSlot = StatSlot(19);
+const ST_SELECT_WAITER_FREE: StatSlot = StatSlot(20);
+const ST_SELECT_NODE_ALLOC: StatSlot = StatSlot(21);
+const ST_SELECT_NODE_FREE: StatSlot = StatSlot(22);
+const ST_SELECT_NOTIFY_CALLS: StatSlot = StatSlot(23);
+const ST_SELECT_WAKE: StatSlot = StatSlot(24);
+const ST_STEAL_CALLS: StatSlot = StatSlot(25);
+const ST_STEAL_FAIL: StatSlot = StatSlot(26);
+const ST_STEAL_TAKE: StatSlot = StatSlot(27);
+const ST_TH_PUSH: StatSlot = StatSlot(28);
+const ST_TH_POP: StatSlot = StatSlot(29);
+const ST_TH_SIFT_UP: StatSlot = StatSlot(30);
+const ST_TH_SIFT_DOWN: StatSlot = StatSlot(31);
+const ST_TH_MAXLEN: StatSlot = StatSlot(32);
+
+const STAT_COUNT: usize = 33;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct gost_stats_local {
+    data: [i64; STAT_COUNT],
+}
+
+impl gost_stats_local {
+    const ZERO: gost_stats_local = gost_stats_local { data: [0; STAT_COUNT] };
+    #[inline(always)]
+    fn inc(&mut self, idx: usize, v: i64) {
+        self.data[idx] += v;
+    }
+    #[inline(always)]
+    fn max(&mut self, idx: usize, v: i64) {
+        if v > self.data[idx] {
+            self.data[idx] = v;
+        }
+    }
+}
+
+static mut BOOT_STATS: gost_stats_local = gost_stats_local::ZERO;
 
 static G_LIVE: AtomicI64 = AtomicI64::new(0);
 
@@ -584,25 +579,73 @@ const TIMER_DUE_BATCH: usize = 4096;
 const TIMER_WAKE_BATCH: usize = 4096;
 
 #[cfg(feature = "stats")]
-fn stat_inc(x: &AtomicI64) { x.fetch_add(1, Ordering::Relaxed); }
+fn stat_inc(slot: &StatSlot) {
+    unsafe {
+        let m = tls_m_get();
+        if !m.is_null() {
+            (*m).stats.inc(slot.0, 1);
+        } else {
+            BOOT_STATS.inc(slot.0, 1);
+        }
+    }
+}
 #[cfg(feature = "stats")]
-fn stat_add(x: &AtomicI64, v: i64) { x.fetch_add(v, Ordering::Relaxed); }
+fn stat_add(slot: &StatSlot, v: i64) {
+    unsafe {
+        let m = tls_m_get();
+        if !m.is_null() {
+            (*m).stats.inc(slot.0, v);
+        } else {
+            BOOT_STATS.inc(slot.0, v);
+        }
+    }
+}
 #[cfg(feature = "stats")]
-fn stat_max(x: &AtomicI64, v: i64) {
-    let mut cur = x.load(Ordering::Relaxed);
-    while v > cur {
-        match x.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(prev) => cur = prev,
+fn stat_max(slot: &StatSlot, v: i64) {
+    unsafe {
+        let m = tls_m_get();
+        if !m.is_null() {
+            (*m).stats.max(slot.0, v);
+        } else {
+            BOOT_STATS.max(slot.0, v);
         }
     }
 }
 #[cfg(not(feature = "stats"))]
-fn stat_inc(_x: &AtomicI64) {}
+fn stat_inc(_slot: &StatSlot) {}
 #[cfg(not(feature = "stats"))]
-fn stat_add(_x: &AtomicI64, _v: i64) {}
+fn stat_add(_slot: &StatSlot, _v: i64) {}
 #[cfg(not(feature = "stats"))]
-fn stat_max(_x: &AtomicI64, _v: i64) {}
+fn stat_max(_slot: &StatSlot, _v: i64) {}
+
+#[cfg(feature = "stats")]
+unsafe fn stats_total(slot: &StatSlot) -> i64 {
+    let mut total = BOOT_STATS.data[slot.0];
+    let sched = g_sched_mut();
+    if !sched.ms.is_null() {
+        let count = if sched.mcount > 0 { sched.mcount as usize } else { 0 };
+        for i in 0..count {
+            total += (*sched.ms.add(i)).stats.data[slot.0];
+        }
+    }
+    total
+}
+
+#[cfg(feature = "stats")]
+unsafe fn stats_max_val(slot: &StatSlot) -> i64 {
+    let mut maxv = BOOT_STATS.data[slot.0];
+    let sched = g_sched_mut();
+    if !sched.ms.is_null() {
+        let count = if sched.mcount > 0 { sched.mcount as usize } else { 0 };
+        for i in 0..count {
+            let v = (*sched.ms.add(i)).stats.data[slot.0];
+            if v > maxv {
+                maxv = v;
+            }
+        }
+    }
+    maxv
+}
 
 static G_ERROR_NEXT: AtomicI32 = AtomicI32::new(1);
 
@@ -728,7 +771,7 @@ unsafe fn stack_free(base: *mut c_void, _reserve: usize) {
     }
     #[cfg(not(windows))]
     {
-        let _ = munmap(base, reserve);
+        let _ = munmap(base, _reserve);
     }
 }
 
@@ -1129,7 +1172,6 @@ unsafe extern "C" fn sched_init_once() {
     sched.shutting_down = 0;
     sched.main_done = 0;
     sched.main_exit = 0;
-    sched.rr_p = 0;
     sched.rr_p = 0;
     sched.timers_heap = ptr::null_mut();
     sched.ps = ptr::null_mut();
@@ -2242,77 +2284,79 @@ pub extern "C" fn __gost_after_ms(ms: i64) -> *mut __gost_chan {
 unsafe fn __gost_rt_dump_stats() {
     let mut out = String::new();
     let _ = writeln!(&mut out, "---- GOST STATS ----");
+    let g_created = stats_total(&ST_G_CREATED);
+    let g_freed = stats_total(&ST_G_FREED);
     let _ = writeln!(
         &mut out,
         "g: created={} freed={} live={} glive={}",
-        ST_G_CREATED.load(Ordering::Relaxed),
-        ST_G_FREED.load(Ordering::Relaxed),
-        ST_G_CREATED.load(Ordering::Relaxed) - ST_G_FREED.load(Ordering::Relaxed),
+        g_created,
+        g_freed,
+        g_created - g_freed,
         G_LIVE.load(Ordering::Relaxed)
     );
     let _ = writeln!(
         &mut out,
         "sched: goready={} gopark={} switch={}",
-        ST_GOREADY_CALLS.load(Ordering::Relaxed),
-        ST_GOPARK_CALLS.load(Ordering::Relaxed),
-        ST_SCHED_SWITCH.load(Ordering::Relaxed)
+        stats_total(&ST_GOREADY_CALLS),
+        stats_total(&ST_GOPARK_CALLS),
+        stats_total(&ST_SCHED_SWITCH)
     );
     let _ = writeln!(
         &mut out,
         "runq: push={} pop={} dupe_blocked={}",
-        ST_RUNQ_PUSH.load(Ordering::Relaxed),
-        ST_RUNQ_POP.load(Ordering::Relaxed),
-        ST_RUNQ_DUPE_BLOCKED.load(Ordering::Relaxed)
+        stats_total(&ST_RUNQ_PUSH),
+        stats_total(&ST_RUNQ_POP),
+        stats_total(&ST_RUNQ_DUPE_BLOCKED)
     );
     let _ = writeln!(
         &mut out,
         "sudog: alloc={} free={} live={}",
-        ST_SUDOG_ALLOC.load(Ordering::Relaxed),
-        ST_SUDOG_FREE.load(Ordering::Relaxed),
-        ST_SUDOG_ALLOC.load(Ordering::Relaxed) - ST_SUDOG_FREE.load(Ordering::Relaxed)
+        stats_total(&ST_SUDOG_ALLOC),
+        stats_total(&ST_SUDOG_FREE),
+        stats_total(&ST_SUDOG_ALLOC) - stats_total(&ST_SUDOG_FREE)
     );
     let _ = writeln!(
         &mut out,
         "chan: send(fast={} buf={} block={}) recv(fast={} buf={} block={}) close={}",
-        ST_CHAN_SEND_FAST.load(Ordering::Relaxed),
-        ST_CHAN_SEND_BUF.load(Ordering::Relaxed),
-        ST_CHAN_SEND_BLOCK.load(Ordering::Relaxed),
-        ST_CHAN_RECV_FAST.load(Ordering::Relaxed),
-        ST_CHAN_RECV_BUF.load(Ordering::Relaxed),
-        ST_CHAN_RECV_BLOCK.load(Ordering::Relaxed),
-        ST_CHAN_CLOSE.load(Ordering::Relaxed)
+        stats_total(&ST_CHAN_SEND_FAST),
+        stats_total(&ST_CHAN_SEND_BUF),
+        stats_total(&ST_CHAN_SEND_BLOCK),
+        stats_total(&ST_CHAN_RECV_FAST),
+        stats_total(&ST_CHAN_RECV_BUF),
+        stats_total(&ST_CHAN_RECV_BLOCK),
+        stats_total(&ST_CHAN_CLOSE)
     );
     let _ = writeln!(
         &mut out,
         "timer: add={} fired={}",
-        ST_TIMER_ADD.load(Ordering::Relaxed),
-        ST_TIMER_FIRED.load(Ordering::Relaxed)
+        stats_total(&ST_TIMER_ADD),
+        stats_total(&ST_TIMER_FIRED)
     );
     let _ = writeln!(
         &mut out,
         "select: waiter alloc={} free={} node alloc={} free={} notify={} wake={}",
-        ST_SELECT_WAITER_ALLOC.load(Ordering::Relaxed),
-        ST_SELECT_WAITER_FREE.load(Ordering::Relaxed),
-        ST_SELECT_NODE_ALLOC.load(Ordering::Relaxed),
-        ST_SELECT_NODE_FREE.load(Ordering::Relaxed),
-        ST_SELECT_NOTIFY_CALLS.load(Ordering::Relaxed),
-        ST_SELECT_WAKE.load(Ordering::Relaxed)
+        stats_total(&ST_SELECT_WAITER_ALLOC),
+        stats_total(&ST_SELECT_WAITER_FREE),
+        stats_total(&ST_SELECT_NODE_ALLOC),
+        stats_total(&ST_SELECT_NODE_FREE),
+        stats_total(&ST_SELECT_NOTIFY_CALLS),
+        stats_total(&ST_SELECT_WAKE)
     );
     let _ = writeln!(
         &mut out,
         "steal: calls={} fail={} take={}",
-        ST_STEAL_CALLS.load(Ordering::Relaxed),
-        ST_STEAL_FAIL.load(Ordering::Relaxed),
-        ST_STEAL_TAKE.load(Ordering::Relaxed)
+        stats_total(&ST_STEAL_CALLS),
+        stats_total(&ST_STEAL_FAIL),
+        stats_total(&ST_STEAL_TAKE)
     );
     let _ = writeln!(
         &mut out,
         "timerheap: push={} pop={} up={} down={} max={}",
-        ST_TH_PUSH.load(Ordering::Relaxed),
-        ST_TH_POP.load(Ordering::Relaxed),
-        ST_TH_SIFT_UP.load(Ordering::Relaxed),
-        ST_TH_SIFT_DOWN.load(Ordering::Relaxed),
-        ST_TH_MAXLEN.load(Ordering::Relaxed)
+        stats_total(&ST_TH_PUSH),
+        stats_total(&ST_TH_POP),
+        stats_total(&ST_TH_SIFT_UP),
+        stats_total(&ST_TH_SIFT_DOWN),
+        stats_max_val(&ST_TH_MAXLEN)
     );
     let _ = writeln!(&mut out, "--------------------");
     fd_write_bytes(2, out.as_bytes());
