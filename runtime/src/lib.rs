@@ -1,4 +1,4 @@
-﻿#![allow(private_interfaces)]
+﻿// #![allow(private_interfaces)]
 #![allow(non_camel_case_types, non_snake_case, dead_code, unsafe_op_in_unsafe_fn, static_mut_refs)]
 use std::cell::Cell;
 #[cfg(feature = "stats")]
@@ -258,6 +258,8 @@ struct gost_sched {
     main_done: i32,
     main_exit: i32,
     rr_p: i32,
+    timer_due_batch: usize,
+    timer_wake_batch: usize,
     timers_heap: *mut gost_timer_heap,
     ps: *mut gost_p,
     ms: *mut gost_m,
@@ -328,9 +330,15 @@ struct __gost_slice {
 
 #[repr(C)]
 struct __gost_shared {
-    refcount: AtomicI64,
+    strong: AtomicI64,
+    weak: AtomicI64,
     drop_payload: Option<extern "C" fn(*mut c_void)>,
     payload: [u8; 0],
+}
+
+#[repr(C)]
+struct __gost_weak {
+    inner: *mut __gost_shared,
 }
 
 #[repr(C)]
@@ -534,22 +542,23 @@ const ST_CHAN_RECV_BLOCK: StatSlot = StatSlot(15);
 const ST_CHAN_CLOSE: StatSlot = StatSlot(16);
 const ST_TIMER_ADD: StatSlot = StatSlot(17);
 const ST_TIMER_FIRED: StatSlot = StatSlot(18);
-const ST_SELECT_WAITER_ALLOC: StatSlot = StatSlot(19);
-const ST_SELECT_WAITER_FREE: StatSlot = StatSlot(20);
-const ST_SELECT_NODE_ALLOC: StatSlot = StatSlot(21);
-const ST_SELECT_NODE_FREE: StatSlot = StatSlot(22);
-const ST_SELECT_NOTIFY_CALLS: StatSlot = StatSlot(23);
-const ST_SELECT_WAKE: StatSlot = StatSlot(24);
-const ST_STEAL_CALLS: StatSlot = StatSlot(25);
-const ST_STEAL_FAIL: StatSlot = StatSlot(26);
-const ST_STEAL_TAKE: StatSlot = StatSlot(27);
-const ST_TH_PUSH: StatSlot = StatSlot(28);
-const ST_TH_POP: StatSlot = StatSlot(29);
-const ST_TH_SIFT_UP: StatSlot = StatSlot(30);
-const ST_TH_SIFT_DOWN: StatSlot = StatSlot(31);
-const ST_TH_MAXLEN: StatSlot = StatSlot(32);
+const ST_TIMER_CANCELED_EXIT: StatSlot = StatSlot(19);
+const ST_SELECT_WAITER_ALLOC: StatSlot = StatSlot(20);
+const ST_SELECT_WAITER_FREE: StatSlot = StatSlot(21);
+const ST_SELECT_NODE_ALLOC: StatSlot = StatSlot(22);
+const ST_SELECT_NODE_FREE: StatSlot = StatSlot(23);
+const ST_SELECT_NOTIFY_CALLS: StatSlot = StatSlot(24);
+const ST_SELECT_WAKE: StatSlot = StatSlot(25);
+const ST_STEAL_CALLS: StatSlot = StatSlot(26);
+const ST_STEAL_FAIL: StatSlot = StatSlot(27);
+const ST_STEAL_TAKE: StatSlot = StatSlot(28);
+const ST_TH_PUSH: StatSlot = StatSlot(29);
+const ST_TH_POP: StatSlot = StatSlot(30);
+const ST_TH_SIFT_UP: StatSlot = StatSlot(31);
+const ST_TH_SIFT_DOWN: StatSlot = StatSlot(32);
+const ST_TH_MAXLEN: StatSlot = StatSlot(33);
 
-const STAT_COUNT: usize = 33;
+const STAT_COUNT: usize = 34;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -574,9 +583,6 @@ impl gost_stats_local {
 static mut BOOT_STATS: gost_stats_local = gost_stats_local::ZERO;
 
 static G_LIVE: AtomicI64 = AtomicI64::new(0);
-
-const TIMER_DUE_BATCH: usize = 4096;
-const TIMER_WAKE_BATCH: usize = 4096;
 
 #[cfg(feature = "stats")]
 fn stat_inc(slot: &StatSlot) {
@@ -670,6 +676,17 @@ fn env_usize(name: &str, def_kb: usize) -> usize {
         }
     }
     def_kb
+}
+
+fn env_usize_clamp(name: &str, defv: usize, lo: usize, hi: usize) -> usize {
+    if let Ok(val) = std::env::var(name) {
+        if let Ok(v) = val.parse::<usize>() {
+            if v > 0 {
+                return v.clamp(lo, hi);
+            }
+        }
+    }
+    defv
 }
 
 #[inline(always)]
@@ -1043,6 +1060,29 @@ unsafe fn q_push_enq_ret(head: &mut *mut gost_g, tail: &mut *mut gost_g, g: *mut
     true
 }
 
+unsafe fn timer_cancel_all_on_exit() {
+    let sched = g_sched_mut();
+    os_mutex_lock(&mut sched.mu);
+    let mut list: *mut gost_timer = ptr::null_mut();
+    if !sched.timers_heap.is_null() {
+        loop {
+            let t = th_pop(sched.timers_heap);
+            if t.is_null() { break; }
+            (*t).next = list;
+            list = t;
+        }
+    }
+    os_mutex_unlock(&mut sched.mu);
+
+    while !list.is_null() {
+        let next = (*list).next;
+        stat_inc(&ST_TIMER_CANCELED_EXIT);
+        __gost_chan_release((*list).ch);
+        libc::free(list as *mut c_void);
+        list = next;
+    }
+}
+
 unsafe fn q_push_enq(head: &mut *mut gost_g, tail: &mut *mut gost_g, g: *mut gost_g) {
     let _ = q_push_enq_ret(head, tail, g);
 }
@@ -1173,6 +1213,8 @@ unsafe extern "C" fn sched_init_once() {
     sched.main_done = 0;
     sched.main_exit = 0;
     sched.rr_p = 0;
+    sched.timer_due_batch = 4096;
+    sched.timer_wake_batch = 16384;
     sched.timers_heap = ptr::null_mut();
     sched.ps = ptr::null_mut();
     sched.ms = ptr::null_mut();
@@ -1340,7 +1382,7 @@ unsafe fn sched_loop(m: *mut gost_m) {
         let mut due: *mut gost_timer = ptr::null_mut();
         let now = now_ms();
         if th_peek_when(sched.timers_heap) <= now {
-            due = timer_pop_due_batch(now, TIMER_DUE_BATCH);
+            due = timer_pop_due_batch(now, sched.timer_due_batch);
         }
         if !due.is_null() {
             os_mutex_unlock(&mut sched.mu);
@@ -1467,7 +1509,9 @@ unsafe fn chan_send_nowait_collect(ch: *mut __gost_chan, wake: &mut Vec<*mut gos
 }
 
 unsafe fn timer_fire_list(mut list: *mut gost_timer) {
-    let mut wake: Vec<*mut gost_g> = Vec::with_capacity(TIMER_WAKE_BATCH);
+    let sched = g_sched_mut();
+    let wake_batch = sched.timer_wake_batch;
+    let mut wake: Vec<*mut gost_g> = Vec::with_capacity(wake_batch.min(4096));
     while !list.is_null() {
         let next = (*list).next;
         chan_send_nowait_collect((*list).ch, &mut wake);
@@ -1475,7 +1519,7 @@ unsafe fn timer_fire_list(mut list: *mut gost_timer) {
         __gost_chan_release((*list).ch);
         libc::free(list as *mut c_void);
         list = next;
-        if wake.len() >= TIMER_WAKE_BATCH {
+        if wake.len() >= wake_batch {
             goready_batch(&mut wake);
         }
     }
@@ -1552,6 +1596,10 @@ pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
         let gp = env_i("GOST_GOMAXPROCS", 1);
         sched.gomaxprocs = gp;
         sched.mcount = gp;
+        os_mutex_lock(&mut sched.mu);
+        sched.timer_due_batch = env_usize_clamp("GOST_TIMER_DUE_BATCH", 4096, 256, 1 << 20);
+        sched.timer_wake_batch = env_usize_clamp("GOST_TIMER_WAKE_BATCH", 16384, 256, 1 << 20);
+        os_mutex_unlock(&mut sched.mu);
 
         let ps = libc::calloc(gp as usize, mem::size_of::<gost_p>()) as *mut gost_p;
         let ms = libc::calloc(gp as usize, mem::size_of::<gost_m>()) as *mut gost_m;
@@ -1587,6 +1635,8 @@ pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
             let t = *mt.add((i - 1) as usize);
             os_thread_join(t);
         }
+
+        timer_cancel_all_on_exit();
 
         __gost_rt_dump_stats();
 
@@ -2080,7 +2130,8 @@ pub extern "C" fn __gost_shared_new(payload_size: usize, drop_payload: Option<ex
     unsafe {
         let total = mem::size_of::<__gost_shared>() + if payload_size > 0 { payload_size } else { 1 };
         let s = __gost_alloc(total, 1) as *mut __gost_shared;
-        (*s).refcount.store(1, Ordering::Relaxed);
+        (*s).strong.store(1, Ordering::Relaxed);
+        (*s).weak.store(1, Ordering::Relaxed);
         (*s).drop_payload = drop_payload;
         if payload_size > 0 && !payload_bytes.is_null() {
             ptr::copy_nonoverlapping(payload_bytes as *const u8, (*s).payload.as_mut_ptr(), payload_size);
@@ -2091,16 +2142,16 @@ pub extern "C" fn __gost_shared_new(payload_size: usize, drop_payload: Option<ex
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_inc(s: *mut __gost_shared) {
-    unsafe { if !s.is_null() { (*s).refcount.fetch_add(1, Ordering::Relaxed); } }
+    unsafe { if !s.is_null() { (*s).strong.fetch_add(1, Ordering::Relaxed); } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_dec(s: *mut __gost_shared) {
     unsafe {
         if s.is_null() { return; }
-        if (*s).refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if (*s).strong.fetch_sub(1, Ordering::AcqRel) == 1 {
             if let Some(drop_fn) = (*s).drop_payload { drop_fn((*s).payload.as_mut_ptr() as *mut c_void); }
-            __gost_free(s as *mut c_void, 0, 1);
+            __gost_shared_weak_dec_inner(s);
         }
     }
 }
@@ -2112,7 +2163,59 @@ pub extern "C" fn __gost_shared_get_ptr(s: *mut __gost_shared) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_is_unique(s: *mut __gost_shared) -> i32 {
-    unsafe { if s.is_null() { 0 } else { if (*s).refcount.load(Ordering::Relaxed) == 1 { 1 } else { 0 } } }
+    unsafe { if s.is_null() { 0 } else { if (*s).strong.load(Ordering::Relaxed) == 1 { 1 } else { 0 } } }
+}
+
+unsafe fn __gost_shared_weak_dec_inner(s: *mut __gost_shared) {
+    if s.is_null() { return; }
+    if (*s).weak.fetch_sub(1, Ordering::AcqRel) == 1 {
+        __gost_free(s as *mut c_void, 0, 1);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_weak_new(s: *mut __gost_shared) -> *mut __gost_weak {
+    unsafe {
+        if s.is_null() { return ptr::null_mut(); }
+        (*s).weak.fetch_add(1, Ordering::Relaxed);
+        let w = __gost_alloc(mem::size_of::<__gost_weak>(), 1) as *mut __gost_weak;
+        (*w).inner = s;
+        w
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_weak_upgrade(w: *mut __gost_weak) -> *mut __gost_shared {
+    unsafe {
+        if w.is_null() { return ptr::null_mut(); }
+        let s = (*w).inner;
+        if s.is_null() { return ptr::null_mut(); }
+        loop {
+            let cur = (*s).strong.load(Ordering::Acquire);
+            if cur == 0 {
+                return ptr::null_mut();
+            }
+            if (*s)
+                .strong
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return s;
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_weak_dec(w: *mut __gost_weak) {
+    unsafe {
+        if w.is_null() { return; }
+        let s = (*w).inner;
+        if !s.is_null() {
+            __gost_shared_weak_dec_inner(s);
+        }
+        __gost_free(w as *mut c_void, 0, 1);
+    }
 }
 
 unsafe fn map_key_equal(m: *mut __gost_map, entry: *mut __gost_map_entry, key_bytes: *const c_void) -> bool {
@@ -2326,11 +2429,23 @@ unsafe fn __gost_rt_dump_stats() {
         stats_total(&ST_CHAN_RECV_BLOCK),
         stats_total(&ST_CHAN_CLOSE)
     );
+    let add = stats_total(&ST_TIMER_ADD);
+    let fired = stats_total(&ST_TIMER_FIRED);
+    let canceled = stats_total(&ST_TIMER_CANCELED_EXIT);
+    let pending = add - fired - canceled;
     let _ = writeln!(
         &mut out,
-        "timer: add={} fired={}",
-        stats_total(&ST_TIMER_ADD),
-        stats_total(&ST_TIMER_FIRED)
+        "timer: add={} fired={} canceled_exit={} pending={}",
+        add,
+        fired,
+        canceled,
+        pending
+    );
+    let _ = writeln!(
+        &mut out,
+        "timerbatch: due={} wake={}",
+        (*g_sched_mut()).timer_due_batch,
+        (*g_sched_mut()).timer_wake_batch
     );
     let _ = writeln!(
         &mut out,

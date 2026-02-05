@@ -35,6 +35,14 @@ struct MirLocalInfo {
     ptr: String,
 }
 
+#[derive(Clone)]
+struct LoopFrame {
+    break_label: String,
+    continue_label: String,
+    break_depth: usize,
+    continue_depth: usize,
+}
+
 pub(crate) struct FnEmitter<'a> {
     fn_name: String,
     fn_sigs: &'a HashMap<String, FunctionSig>,
@@ -49,7 +57,8 @@ pub(crate) struct FnEmitter<'a> {
     pub(crate) string_literals: Vec<String>,
     string_count: usize,
     deferred: Vec<Vec<DeferredCall>>,
-    loop_stack: Vec<(String, String)>,
+    loop_stack: Vec<LoopFrame>,
+    pending_exit_depth: Option<usize>,
     pub(crate) extra_functions: Vec<String>,
     go_counter: usize,
     drop_counter: usize,
@@ -86,6 +95,7 @@ impl<'a> FnEmitter<'a> {
             string_count: 0,
             deferred: vec![Vec::new()],
             loop_stack: Vec::new(),
+            pending_exit_depth: None,
             extra_functions: Vec::new(),
             go_counter: 0,
             drop_counter: 0,
@@ -227,7 +237,11 @@ impl<'a> FnEmitter<'a> {
         for stmt in &block.stmts {
             self.emit_stmt(stmt)?;
             if self.current_block_terminated() {
-                self.exit_scope()?;
+                if let Some(depth) = self.pending_exit_depth.take() {
+                    self.exit_scopes_to(depth)?;
+                } else {
+                    self.exit_scope()?;
+                }
                 return Ok(None);
             }
         }
@@ -392,20 +406,20 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             Stmt::Break { .. } => {
-                let (break_label, _) = self
+                let frame = self
                     .loop_stack
                     .last()
-                    .ok_or_else(|| "break outside loop".to_string())?
-                    .clone();
-                self.terminate(format!("br label %{}", break_label));
+                    .ok_or_else(|| "break outside loop".to_string())?;
+                self.pending_exit_depth = Some(frame.break_depth);
+                self.terminate(format!("br label %{}", frame.break_label));
             }
             Stmt::Continue { .. } => {
-                let (_, continue_label) = self
+                let frame = self
                     .loop_stack
                     .last()
-                    .ok_or_else(|| "continue outside loop".to_string())?
-                    .clone();
-                self.terminate(format!("br label %{}", continue_label));
+                    .ok_or_else(|| "continue outside loop".to_string())?;
+                self.pending_exit_depth = Some(frame.continue_depth);
+                self.terminate(format!("br label %{}", frame.continue_label));
             }
         }
         Ok(())
@@ -2325,7 +2339,9 @@ impl<'a> FnEmitter<'a> {
             cmp, body_name, end_name
         ));
         self.switch_to(body_idx);
+        let break_depth = self.scopes.len();
         self.enter_scope();
+        let continue_depth = self.scopes.len();
         let elem_ptr = self.emit_slice_elem_ptr(
             &slice_obj,
             &elem_ty,
@@ -2371,8 +2387,12 @@ impl<'a> FnEmitter<'a> {
         if let Some(scope) = self.scopes.last_mut() {
             scope.push(name.to_string());
         }
-        self.loop_stack
-            .push((end_name.clone(), step_name.clone()));
+        self.loop_stack.push(LoopFrame {
+            break_label: end_name.clone(),
+            continue_label: step_name.clone(),
+            break_depth,
+            continue_depth,
+        });
         let _ = self.emit_block(body)?;
         self.loop_stack.pop();
         self.exit_scope()?;
@@ -4207,6 +4227,13 @@ impl<'a> FnEmitter<'a> {
                     self.linear_states.remove(name);
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn exit_scopes_to(&mut self, depth: usize) -> Result<(), String> {
+        while self.scopes.len() > depth {
+            self.exit_scope()?;
         }
         Ok(())
     }

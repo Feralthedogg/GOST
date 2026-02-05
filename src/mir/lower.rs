@@ -4,8 +4,8 @@ use crate::frontend::ast::{
 use std::collections::HashMap;
 
 use crate::frontend::ast::{BlockOrExpr, ExprId};
-use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefs};
-use crate::sema::Program;
+use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
+use crate::sema::{FunctionSig, Program};
 use super::{
     BasicBlock, CleanupItem, Local, LocalId, MirFunction, MirModule, MirStmt, ScopeFrame, ScopeId,
     Terminator,
@@ -37,6 +37,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, String> {
                 locals,
                 &program.types,
                 &program.expr_types,
+                &program.functions,
                 next_expr_id,
             );
             lowerer.lower_block(&func.body, true)?;
@@ -73,6 +74,7 @@ struct Lowerer {
     loop_stack: Vec<(usize, usize)>,
     defs: TypeDefs,
     expr_types: HashMap<ExprId, Type>,
+    funcs: HashMap<String, FunctionSig>,
     next_temp: usize,
     next_expr_id: ExprId,
     synthetic_expr_types: HashMap<ExprId, Type>,
@@ -112,6 +114,7 @@ impl Lowerer {
         locals: Vec<Local>,
         defs: &TypeDefs,
         expr_types: &HashMap<ExprId, Type>,
+        funcs: &HashMap<String, FunctionSig>,
         next_expr_id: ExprId,
     ) -> Self {
         let entry = 0;
@@ -134,6 +137,7 @@ impl Lowerer {
             loop_stack: Vec::new(),
             defs: defs.clone(),
             expr_types: expr_types.clone(),
+            funcs: funcs.clone(),
             next_temp: 0,
             next_expr_id,
             synthetic_expr_types: HashMap::new(),
@@ -624,6 +628,91 @@ impl Lowerer {
             .get(&expr.id)
             .cloned()
             .ok_or_else(|| format!("missing expression type for {:?} (id {})", expr.kind, expr.id))
+    }
+
+    fn is_local_name(&self, name: &str) -> bool {
+        self.name_bindings.contains_key(name)
+    }
+
+    fn recv_param_compatible(&self, recv_ty: &Type, param0_ty: &Type) -> bool {
+        let (rbase, rk, _) = recv_ty.peel_refs();
+        let (pbase, pk, _) = param0_ty.peel_refs();
+        if rbase != pbase {
+            return false;
+        }
+        use crate::sema::types::RefKind;
+        match (rk, pk) {
+            (RefKind::None, RefKind::None) => true,
+            (RefKind::Shared, RefKind::Shared) => true,
+            (RefKind::Mut, RefKind::Mut) => true,
+            (RefKind::None, RefKind::Shared) => true,
+            (RefKind::None, RefKind::Mut) => true,
+            (RefKind::Shared, RefKind::None) => true,
+            (RefKind::Mut, RefKind::None) => true,
+            (RefKind::Mut, RefKind::Shared) => true,
+            (RefKind::Shared, RefKind::Mut) => false,
+        }
+    }
+
+    fn adjust_receiver_expr(
+        &mut self,
+        recv_expr: Expr,
+        param0_ty: &Type,
+    ) -> Result<Option<Expr>, String> {
+        let mut expr = recv_expr;
+        let mut ty = self.expr_type(&expr)?;
+
+        if self.recv_param_compatible(&ty, param0_ty) {
+            return Ok(Some(expr));
+        }
+
+        match param0_ty {
+            Type::Ref(_) | Type::MutRef(_) => {
+                // autoref
+                if !ty.is_ref() {
+                    let is_mut = matches!(param0_ty, Type::MutRef(_));
+                    let new_ty = param0_ty.clone();
+                    let span = expr.span.clone();
+                    expr = self.new_expr(
+                        ExprKind::Borrow {
+                            is_mut,
+                            expr: Box::new(expr),
+                        },
+                        span,
+                        Some(new_ty.clone()),
+                    );
+                    ty = new_ty;
+                    if self.recv_param_compatible(&ty, param0_ty) {
+                        return Ok(Some(expr));
+                    }
+                } else if self.recv_param_compatible(&ty, param0_ty) {
+                    return Ok(Some(expr));
+                }
+            }
+            _ => {
+                // autoderef
+                while ty.is_ref() {
+                    let inner = ty
+                        .deref_once()
+                        .ok_or_else(|| "deref_once failed".to_string())?
+                        .clone();
+                    let span = expr.span.clone();
+                    expr = self.new_expr(
+                        ExprKind::Deref {
+                            expr: Box::new(expr),
+                        },
+                        span,
+                        Some(inner.clone()),
+                    );
+                    ty = inner;
+                }
+                if ty == *param0_ty {
+                    return Ok(Some(expr));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn new_temp_local(&mut self, ty: Type) -> Result<(LocalId, String), String> {
@@ -1768,6 +1857,57 @@ impl Lowerer {
                 })
             }
             ExprKind::Call { callee, type_args, args } => {
+                // method-call lowering: p.foo(args...) -> foo(<adj recv>, args...)
+                if let ExprKind::Field { base, name } = &callee.kind {
+                    if let ExprKind::Ident(enum_name) = &base.kind {
+                        if !self.is_local_name(enum_name) {
+                            if let Some(TypeDefKind::Enum(_)) = self.defs.get(enum_name) {
+                                // enum constructor: keep as-is
+                            } else {
+                                // not enum, continue to method lowering
+                            }
+                        }
+                    }
+
+                    let is_enum_ctor = if let ExprKind::Ident(enum_name) = &base.kind {
+                        !self.is_local_name(enum_name)
+                            && matches!(self.defs.get(enum_name), Some(TypeDefKind::Enum(_)))
+                    } else {
+                        false
+                    };
+
+                    if !is_enum_ctor {
+                        if let Some(param0_ty) =
+                            self.funcs.get(name).and_then(|sig| sig.params.first().cloned())
+                        {
+                            let recv_expr = self.lower_expr_value(base)?;
+                            if let Some(adj_recv) =
+                                self.adjust_receiver_expr(recv_expr, &param0_ty)?
+                            {
+                                let mut lowered_args = Vec::with_capacity(args.len() + 1);
+                                lowered_args.push(adj_recv);
+                                for arg in args {
+                                    lowered_args.push(self.lower_expr_value(arg)?);
+                                }
+                                let callee_ident = self.ident_expr(
+                                    name.clone(),
+                                    expr.span.clone(),
+                                    Type::Builtin(BuiltinType::Unit),
+                                );
+                                return Ok(Expr {
+                                    id: expr.id,
+                                    kind: ExprKind::Call {
+                                        callee: Box::new(callee_ident),
+                                        type_args: type_args.clone(),
+                                        args: lowered_args,
+                                    },
+                                    span: expr.span.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 let callee_expr = self.lower_expr_value(callee)?;
                 let mut lowered_args = Vec::new();
                 for arg in args {

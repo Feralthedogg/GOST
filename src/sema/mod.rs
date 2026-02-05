@@ -3,9 +3,15 @@ pub mod types;
 use std::collections::{HashMap, HashSet};
 
 use crate::frontend::ast::*;
-use crate::frontend::diagnostic::Diagnostics;
+use crate::frontend::diagnostic::{
+    Diagnostic, Diagnostics, E_UNDEFINED_NAME, E_UNKNOWN_FIELD, E_UNKNOWN_FUNCTION, E_UNKNOWN_TYPE,
+    E_UNKNOWN_METHOD, E_UNKNOWN_VARIANT,
+};
+use crate::frontend::diagnostic::{E1104, E1105};
+use crate::frontend::suggest;
 use crate::sema::types::{
-    builtin_from_name, BuiltinType, EnumDef, StructDef, Type, TypeClass, TypeDefKind, TypeDefs,
+    builtin_from_name, builtin_names, BuiltinType, EnumDef, RefKind, StructDef, Type, TypeClass,
+    TypeDefKind, TypeDefs,
 };
 
 #[derive(Clone, Debug)]
@@ -239,7 +245,19 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
                 Some(ty)
             } else {
                 if defs.get(name).is_none() {
-                    diags.push(format!("unknown type `{}`", name), Some(ast.span.clone()));
+                    let mut candidates: Vec<String> =
+                        builtin_names().iter().map(|s| s.to_string()).collect();
+                    candidates.extend(defs.names());
+                    let mut d = Diagnostic::new(
+                        format!("unknown type `{}`", name),
+                        Some(ast.span.clone()),
+                    )
+                    .code(E_UNKNOWN_TYPE)
+                    .label(ast.span.clone(), "unknown type");
+                    if let Some(h) = suggest::did_you_mean(name, candidates) {
+                        d = d.help(h);
+                    }
+                    diags.push_diag(d);
                 }
                 Some(Type::Named(name.clone()))
             }
@@ -502,6 +520,22 @@ struct ExprResult {
     borrow: Option<BorrowInfo>,
 }
 
+#[derive(Clone, Debug)]
+enum AutoadjFailKind {
+    NotAddressable { need_mut: bool },
+    NotMutable,
+}
+
+#[derive(Clone, Debug)]
+struct AutoadjFail {
+    kind: AutoadjFailKind,
+    recv_span: Span,
+    method: String,
+    recv_base_name: Option<String>,
+    recv_ty: Type,
+    param0_ty: Type,
+}
+
 struct FunctionChecker<'a> {
     defs: &'a TypeDefs,
     funcs: &'a HashMap<String, FunctionSig>,
@@ -532,6 +566,134 @@ impl<'a> FunctionChecker<'a> {
             env: Env::new(),
             allow_iter_chain: false,
         }
+    }
+
+    fn function_candidates(&self) -> Vec<String> {
+        let mut out = self.funcs.keys().cloned().collect::<Vec<_>>();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn recv_param_compatible(&self, recv_ty: &Type, param0_ty: &Type) -> bool {
+        let (rbase, rk, _) = recv_ty.peel_refs();
+        let (pbase, pk, _) = param0_ty.peel_refs();
+        if !type_eq(rbase, pbase) {
+            return false;
+        }
+        match (rk, pk) {
+            (RefKind::None, RefKind::None) => true,
+            (RefKind::Shared, RefKind::Shared) => true,
+            (RefKind::Mut, RefKind::Mut) => true,
+            (RefKind::None, RefKind::Shared) => true,  // autoref
+            (RefKind::None, RefKind::Mut) => true,     // autoref mut
+            (RefKind::Shared, RefKind::None) => true,  // autoderef
+            (RefKind::Mut, RefKind::None) => true,     // autoderef
+            (RefKind::Mut, RefKind::Shared) => true,   // reborrow
+            (RefKind::Shared, RefKind::Mut) => false,
+        }
+    }
+
+    fn diag_autoadj_fail(&mut self, f: AutoadjFail) {
+        match f.kind {
+            AutoadjFailKind::NotAddressable { need_mut } => {
+                let mut d = Diagnostic::new(
+                    "cannot borrow temporary value as reference",
+                    Some(f.recv_span.clone()),
+                )
+                .code(E1104)
+                .label(f.recv_span.clone(), "temporary value is not addressable")
+                .note(format!("this call requires receiver type: {}", f.param0_ty.pretty()))
+                .note("but the receiver expression is a temporary value");
+                d = d.help("bind the receiver to a local first:");
+                if need_mut {
+                    d = d.with_help_snippet(
+                        f.recv_span.clone(),
+                        "let mut tmp = {snippet};",
+                    );
+                } else {
+                    d = d.with_help_snippet(
+                        f.recv_span.clone(),
+                        "let tmp = {snippet};",
+                    );
+                }
+                d = d.help(format!("tmp.{}(...)", f.method));
+                self.diags.push_diag(d);
+            }
+            AutoadjFailKind::NotMutable => {
+                let mut d = Diagnostic::new(
+                    "cannot borrow receiver as mutable",
+                    Some(f.recv_span.clone()),
+                )
+                .code(E1105)
+                .label(f.recv_span.clone(), "receiver is not mutable")
+                .note(format!("this call requires receiver type: {}", f.param0_ty.pretty()))
+                .note(format!("receiver type here is: {}", f.recv_ty.pretty()));
+
+                if let Some(name) = f.recv_base_name.clone() {
+                    d = d.help("make it mutable:")
+                        .help(format!("let mut {0} = {0};", name))
+                        .help(format!("{}.{}(...)", name, f.method));
+                } else {
+                    d = d
+                        .help("bind it to a mutable local first:")
+                        .with_help_snippet(f.recv_span.clone(), "let mut tmp = {snippet};")
+                        .help(format!("tmp.{}(...)", f.method));
+                }
+                d = d.note("mutable borrows require a mutable receiver");
+                self.diags.push_diag(d);
+            }
+        }
+    }
+
+    fn method_candidates_for_recv(&self, recv_ty: &Type) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, sig) in self.funcs.iter() {
+            if let Some(p0) = sig.params.first() {
+                if self.recv_param_compatible(recv_ty, p0) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn diag_unknown_function(&mut self, span: Span, name: &str) {
+        let mut d = Diagnostic::new(format!("unknown function `{}`", name), Some(span.clone()))
+            .code(E_UNKNOWN_FUNCTION)
+            .label(span, "unknown function")
+            .note("function names are case-sensitive");
+        let candidates = self.function_candidates();
+        if let Some(h) = suggest::did_you_mean(name, candidates) {
+            d = d.help(h);
+        }
+        self.diags.push_diag(d);
+    }
+
+    fn diag_unknown_method(&mut self, span: Span, recv_ty: Option<Type>, name: &str) {
+        let type_name = match recv_ty.as_ref() {
+            Some(Type::Named(n)) => n.clone(),
+            Some(_) => "<value>".to_string(),
+            None => "<value>".to_string(),
+        };
+        let mut d = Diagnostic::new(
+            format!("unknown method `{}` on `{}`", name, type_name),
+            Some(span.clone()),
+        )
+        .code(E_UNKNOWN_METHOD)
+        .label(span, format!("unknown method `{}`", name))
+        .note("methods are resolved by receiver type");
+        let candidates = match recv_ty.as_ref() {
+            Some(ty) => self.method_candidates_for_recv(ty),
+            None => Vec::new(),
+        };
+        if let Some(h) = suggest::did_you_mean(name, candidates) {
+            d = d.help(h);
+        }
+        d = d.note("consider calling a free function instead");
+        self.diags.push_diag(d);
     }
 
     fn check_function(&mut self, func: &Function) {
@@ -598,10 +760,14 @@ impl<'a> FunctionChecker<'a> {
                     let resolved = resolve_type(annot, self.defs, self.diags);
                     if let Some(resolved) = resolved {
                         if !type_eq(&resolved, &init_ty.ty) {
-                            self.diags.push(
+                            let d = Diagnostic::new(
                                 "let initializer type mismatch",
-                                Some(span.clone()),
-                            );
+                                Some(init.span.clone()),
+                            )
+                            .label(init.span.clone(), "type mismatch here")
+                            .note(format!("expected type: {}", resolved.pretty()))
+                            .note(format!("found type: {}", init_ty.ty.pretty()));
+                            self.diags.push_diag(d);
                         }
                         resolved
                     } else {
@@ -991,7 +1157,14 @@ impl<'a> FunctionChecker<'a> {
                         "Ok" | "ok" => ok_ty.as_ref().clone(),
                         "Err" | "err" => err_ty.as_ref().clone(),
                         _ => {
-                            self.diags.push("unknown enum variant", Some(span.clone()));
+                            let mut d = Diagnostic::new("unknown enum variant", Some(span.clone()))
+                                .code(E_UNKNOWN_VARIANT)
+                                .label(span.clone(), "unknown variant");
+                            let candidates = vec!["Ok".to_string(), "Err".to_string()];
+                            if let Some(h) = suggest::did_you_mean(variant, candidates) {
+                                d = d.help(h);
+                            }
+                            self.diags.push_diag(d);
                             return;
                         }
                     };
@@ -1027,7 +1200,18 @@ impl<'a> FunctionChecker<'a> {
                 let fields = match def.variants.iter().find(|(name, _)| name == variant) {
                     Some((_, fields)) => fields,
                     None => {
-                        self.diags.push("unknown enum variant", Some(span.clone()));
+                        let mut d = Diagnostic::new("unknown enum variant", Some(span.clone()))
+                            .code(E_UNKNOWN_VARIANT)
+                            .label(span.clone(), "unknown variant");
+                        let candidates = def
+                            .variants
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(h) = suggest::did_you_mean(variant, candidates) {
+                            d = d.help(h);
+                        }
+                        self.diags.push_diag(d);
                         return;
                     }
                 };
@@ -1106,8 +1290,14 @@ impl<'a> FunctionChecker<'a> {
                 }
             }
             _ => {
-                self.diags
-                    .push("unknown enum variant", Some(span.clone()));
+                let mut d = Diagnostic::new("unknown enum variant", Some(span.clone()))
+                    .code(E_UNKNOWN_VARIANT)
+                    .label(span.clone(), "unknown variant");
+                let candidates = vec!["Ok".to_string(), "Err".to_string()];
+                if let Some(h) = suggest::did_you_mean(variant, candidates) {
+                    d = d.help(h);
+                }
+                self.diags.push_diag(d);
                 return None;
             }
         }
@@ -1327,16 +1517,13 @@ impl<'a> FunctionChecker<'a> {
                                 return None;
                             }
                         };
-                        let sig = match self.funcs.get(&pred_name) {
-                            Some(sig) => sig,
-                            None => {
-                                self.diags.push(
-                                    "unknown function",
-                                    Some(args[1].span.clone()),
-                                );
-                                return None;
-                            }
-                        };
+                            let sig = match self.funcs.get(&pred_name) {
+                                Some(sig) => sig,
+                                None => {
+                                    self.diag_unknown_function(args[1].span.clone(), &pred_name);
+                                    return None;
+                                }
+                            };
                         if sig.params.len() != 1 {
                             self.diags.push(
                                 "filter predicate must take one argument",
@@ -1388,10 +1575,7 @@ impl<'a> FunctionChecker<'a> {
                         let sig = match self.funcs.get(&map_name) {
                             Some(sig) => sig,
                             None => {
-                                self.diags.push(
-                                    "unknown function",
-                                    Some(args[1].span.clone()),
-                                );
+                                self.diag_unknown_function(args[1].span.clone(), &map_name);
                                 return None;
                             }
                         };
@@ -1907,6 +2091,28 @@ impl<'a> FunctionChecker<'a> {
         }
     }
 
+    fn is_addressable_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(_) => true,
+            ExprKind::Field { base, .. } => self.is_addressable_expr(base),
+            ExprKind::Index { base, .. } => self.is_addressable_expr(base),
+            ExprKind::Deref { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn can_borrow_mut(&self, expr: &Expr) -> bool {
+        if let Some(base) = self.borrow_base_ident(expr) {
+            if let Some(info) = self.env.vars.get(&base) {
+                // if the base is a shared view, don't allow &mut
+                if info.view_of.is_some() && !info.view_is_mut {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn check_borrow_target(&mut self, expr: &Expr) -> Option<(Type, Option<String>)> {
         match &expr.kind {
             ExprKind::Ident(_) => {
@@ -1924,10 +2130,25 @@ impl<'a> FunctionChecker<'a> {
                             let base_name = self.borrow_base_ident(base);
                             return Some((ty.clone(), base_name));
                         }
+                        let mut d = Diagnostic::new(
+                            format!("unknown field `{}` on `{}`", name, type_name),
+                            Some(expr.span.clone()),
+                        )
+                        .code(E_UNKNOWN_FIELD)
+                        .label(expr.span.clone(), format!("unknown field `{}`", name))
+                        .note("field names are case-sensitive");
+                        let candidates = def
+                            .fields
+                            .iter()
+                            .map(|(field, _)| field.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(h) = suggest::did_you_mean(name, candidates) {
+                            d = d.help(h);
+                        }
+                        self.diags.push_diag(d);
+                        return None;
                     }
                 }
-                self.diags
-                    .push("unknown field access", Some(expr.span.clone()));
                 None
             }
             ExprKind::Index { base, index } => {
@@ -1979,10 +2200,25 @@ impl<'a> FunctionChecker<'a> {
                         {
                             return Some(ty.clone());
                         }
+                        let mut d = Diagnostic::new(
+                            format!("unknown field `{}` on `{}`", name, type_name),
+                            Some(expr.span.clone()),
+                        )
+                        .code(E_UNKNOWN_FIELD)
+                        .label(expr.span.clone(), format!("unknown field `{}`", name))
+                        .note("field names are case-sensitive");
+                        let candidates = def
+                            .fields
+                            .iter()
+                            .map(|(field, _)| field.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(h) = suggest::did_you_mean(name, candidates) {
+                            d = d.help(h);
+                        }
+                        self.diags.push_diag(d);
+                        return None;
                     }
                 }
-                self.diags
-                    .push("unknown field access", Some(expr.span.clone()));
                 None
             }
             ExprKind::Index { base, index } => {
@@ -2071,7 +2307,20 @@ impl<'a> FunctionChecker<'a> {
                         borrow: None,
                     })
                 } else {
-                    self.diags.push("unknown identifier", Some(expr.span.clone()));
+                    let mut candidates: Vec<String> =
+                        self.env.vars.keys().cloned().collect();
+                    candidates.extend(self.funcs.keys().cloned());
+                    let mut d = Diagnostic::new(
+                        format!("undefined name `{}`", name),
+                        Some(expr.span.clone()),
+                    )
+                    .code(E_UNDEFINED_NAME)
+                    .label(expr.span.clone(), "unknown name")
+                    .note("names are case-sensitive");
+                    if let Some(h) = suggest::did_you_mean(name, candidates) {
+                        d = d.help(h);
+                    }
+                    self.diags.push_diag(d);
                     None
                 }
             }
@@ -2173,10 +2422,6 @@ impl<'a> FunctionChecker<'a> {
                             }
                             return None;
                         }
-                        if self.env.vars.contains_key(enum_name) {
-                            self.diags.push("only direct calls are supported", Some(expr.span.clone()));
-                            return None;
-                        }
                         if !type_args.is_empty() {
                             self.diags.push(
                                 "type arguments not supported for enum constructors",
@@ -2188,8 +2433,21 @@ impl<'a> FunctionChecker<'a> {
                             {
                                 Some((_, fields)) => fields,
                                 None => {
-                                    self.diags
-                                        .push("unknown enum variant", Some(expr.span.clone()));
+                                    let mut d = Diagnostic::new(
+                                        "unknown enum variant",
+                                        Some(expr.span.clone()),
+                                    )
+                                    .code(E_UNKNOWN_VARIANT)
+                                    .label(expr.span.clone(), "unknown variant");
+                                    let candidates = def
+                                        .variants
+                                        .iter()
+                                        .map(|(name, _)| name.clone())
+                                        .collect::<Vec<_>>();
+                                    if let Some(h) = suggest::did_you_mean(variant, candidates) {
+                                        d = d.help(h);
+                                    }
+                                    self.diags.push_diag(d);
                                     return None;
                                 }
                             };
@@ -2219,6 +2477,82 @@ impl<'a> FunctionChecker<'a> {
                             );
                         }
                     }
+                    // Not an enum ctor: treat as method-like call (recv-first free function).
+                    let recv_res = match self.check_expr_no_move(base) {
+                        Some(res) => res,
+                        None => return None,
+                    };
+                    let recv_ty = recv_res.ty.clone();
+
+                    if let Some(sig) = self.funcs.get(variant) {
+                        if let Some(param0) = sig.params.first() {
+                            if self.recv_param_compatible(&recv_ty, param0) {
+                                if sig.params.len() != args.len() + 1 {
+                                    self.diags.push(
+                                        "argument count mismatch",
+                                        Some(expr.span.clone()),
+                                    );
+                                }
+                                for (idx, arg) in args.iter().enumerate() {
+                                    let res = self.check_expr(arg)?;
+                                    let param_ty = sig
+                                        .params
+                                        .get(idx + 1)
+                                        .unwrap_or(&Type::Builtin(BuiltinType::Unit));
+                                    if contains_view(self.defs, &res.ty) {
+                                        self.diags.push(
+                                            "view arguments can only be passed to intrinsics",
+                                            Some(arg.span.clone()),
+                                        );
+                                    }
+                                    if !type_eq(&res.ty, param_ty) {
+                                        self.diags.push(
+                                            "argument type mismatch",
+                                            Some(arg.span.clone()),
+                                        );
+                                    }
+                                }
+                                return self.record_expr(
+                                    expr,
+                                    ExprResult {
+                                        ty: sig.ret.clone(),
+                                        borrow: None,
+                                    },
+                                );
+                            }
+
+                            let need_mut = matches!(param0, Type::MutRef(_));
+                            if matches!(param0, Type::Ref(_) | Type::MutRef(_))
+                                && !self.is_addressable_expr(base)
+                            {
+                                let fail = AutoadjFail {
+                                    kind: AutoadjFailKind::NotAddressable { need_mut },
+                                    recv_span: base.span.clone(),
+                                    method: variant.clone(),
+                                    recv_base_name: self.borrow_base_ident(base),
+                                    recv_ty,
+                                    param0_ty: param0.clone(),
+                                };
+                                self.diag_autoadj_fail(fail);
+                                return None;
+                            }
+                            if matches!(param0, Type::MutRef(_)) && !self.can_borrow_mut(base) {
+                                let fail = AutoadjFail {
+                                    kind: AutoadjFailKind::NotMutable,
+                                    recv_span: base.span.clone(),
+                                    method: variant.clone(),
+                                    recv_base_name: self.borrow_base_ident(base),
+                                    recv_ty,
+                                    param0_ty: param0.clone(),
+                                };
+                                self.diag_autoadj_fail(fail);
+                                return None;
+                            }
+                        }
+                    }
+
+                    self.diag_unknown_method(callee.span.clone(), Some(recv_ty), variant);
+                    return None;
                 }
                 let callee_name = match &callee.kind {
                     ExprKind::Ident(name) => name.clone(),
@@ -2238,7 +2572,7 @@ impl<'a> FunctionChecker<'a> {
                 let sig = match self.funcs.get(&callee_name) {
                     Some(sig) => sig,
                     None => {
-                        self.diags.push("unknown function", Some(expr.span.clone()));
+                        self.diag_unknown_function(expr.span.clone(), &callee_name);
                         return None;
                     }
                 };
@@ -2267,7 +2601,21 @@ impl<'a> FunctionChecker<'a> {
                             let fields = match def.variants.iter().find(|(name, _)| name == field_name) {
                                 Some((_, fields)) => fields,
                                 None => {
-                                    self.diags.push("unknown enum variant", Some(expr.span.clone()));
+                                    let mut d = Diagnostic::new(
+                                        "unknown enum variant",
+                                        Some(expr.span.clone()),
+                                    )
+                                    .code(E_UNKNOWN_VARIANT)
+                                    .label(expr.span.clone(), "unknown variant");
+                                    let candidates = def
+                                        .variants
+                                        .iter()
+                                        .map(|(name, _)| name.clone())
+                                        .collect::<Vec<_>>();
+                                    if let Some(h) = suggest::did_you_mean(field_name, candidates) {
+                                        d = d.help(h);
+                                    }
+                                    self.diags.push_diag(d);
                                     return None;
                                 }
                             };
@@ -2308,9 +2656,25 @@ impl<'a> FunctionChecker<'a> {
                                 },
                             );
                         }
+                        let mut d = Diagnostic::new(
+                            format!("unknown field `{}` on `{}`", field_name, type_name),
+                            Some(expr.span.clone()),
+                        )
+                        .code(E_UNKNOWN_FIELD)
+                        .label(expr.span.clone(), format!("unknown field `{}`", field_name))
+                        .note("field names are case-sensitive");
+                        let candidates = def
+                            .fields
+                            .iter()
+                            .map(|(field, _)| field.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(h) = suggest::did_you_mean(field_name, candidates) {
+                            d = d.help(h);
+                        }
+                        self.diags.push_diag(d);
+                        return None;
                     }
                 }
-                self.diags.push("unknown field access", Some(expr.span.clone()));
                 None
             }
             ExprKind::Index { base, index } => {

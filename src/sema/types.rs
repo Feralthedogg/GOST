@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinType {
@@ -30,6 +31,141 @@ pub enum Type {
     Shared(Box<Type>),
     Interface,
     Tuple(Vec<Type>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    None,
+    Shared,
+    Mut,
+}
+
+impl Type {
+    /// &T / &mut T 한 번만 벗김
+    #[inline]
+    pub fn deref_once(&self) -> Option<&Type> {
+        match self {
+            Type::Ref(inner) | Type::MutRef(inner) => Some(inner.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// 모든 ref를 벗겨서 (base, outer_ref_kind, depth)를 반환
+    #[inline]
+    pub fn peel_refs(&self) -> (&Type, RefKind, usize) {
+        let mut cur = self;
+        let mut outer = RefKind::None;
+        let mut depth = 0;
+        loop {
+            match cur {
+                Type::Ref(inner) => {
+                    if depth == 0 {
+                        outer = RefKind::Shared;
+                    }
+                    cur = inner.as_ref();
+                    depth += 1;
+                }
+                Type::MutRef(inner) => {
+                    if depth == 0 {
+                        outer = RefKind::Mut;
+                    }
+                    cur = inner.as_ref();
+                    depth += 1;
+                }
+                _ => break,
+            }
+        }
+        (cur, outer, depth)
+    }
+
+    #[inline]
+    pub fn is_ref(&self) -> bool {
+        matches!(self, Type::Ref(_) | Type::MutRef(_))
+    }
+
+    #[inline]
+    pub fn pretty(&self) -> TypePretty<'_> {
+        TypePretty(self)
+    }
+}
+
+pub struct TypePretty<'a>(pub &'a Type);
+
+impl fmt::Display for TypePretty<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_type_pretty(self.0, f)
+    }
+}
+
+fn fmt_type_pretty(ty: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match ty {
+        Type::Ref(inner) => {
+            write!(f, "&")?;
+            fmt_type_pretty(inner, f)
+        }
+        Type::MutRef(inner) => {
+            write!(f, "&mut ")?;
+            fmt_type_pretty(inner, f)
+        }
+        Type::Slice(inner) => {
+            write!(f, "[]")?;
+            fmt_type_pretty(inner, f)
+        }
+        Type::Chan(inner) => {
+            write!(f, "chan[")?;
+            fmt_type_pretty(inner, f)?;
+            write!(f, "]")
+        }
+        Type::Shared(inner) => {
+            write!(f, "shared[")?;
+            fmt_type_pretty(inner, f)?;
+            write!(f, "]")
+        }
+        Type::Iter(inner) => {
+            write!(f, "iter[")?;
+            fmt_type_pretty(inner, f)?;
+            write!(f, "]")
+        }
+        Type::Map(k, v) => {
+            write!(f, "map[")?;
+            fmt_type_pretty(k, f)?;
+            write!(f, "]")?;
+            fmt_type_pretty(v, f)
+        }
+        Type::Result(ok, err) => {
+            write!(f, "result[")?;
+            fmt_type_pretty(ok, f)?;
+            write!(f, ", ")?;
+            fmt_type_pretty(err, f)?;
+            write!(f, "]")
+        }
+        Type::Tuple(items) => {
+            write!(f, "(")?;
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                fmt_type_pretty(it, f)?;
+            }
+            write!(f, ")")
+        }
+        Type::Interface => write!(f, "interface"),
+        Type::Named(name) => write!(f, "{}", name),
+        Type::Builtin(b) => match b {
+            BuiltinType::Bool => write!(f, "bool"),
+            BuiltinType::I32 => write!(f, "i32"),
+            BuiltinType::I64 => write!(f, "i64"),
+            BuiltinType::U32 => write!(f, "u32"),
+            BuiltinType::U64 => write!(f, "u64"),
+            BuiltinType::F32 => write!(f, "f32"),
+            BuiltinType::F64 => write!(f, "f64"),
+            BuiltinType::Char => write!(f, "char"),
+            BuiltinType::Unit => write!(f, "unit"),
+            BuiltinType::String => write!(f, "string"),
+            BuiltinType::Error => write!(f, "error"),
+            BuiltinType::Bytes => write!(f, "bytes"),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,4 +289,11 @@ pub fn builtin_from_name(name: &str) -> Option<Type> {
         _ => return None,
     };
     Some(Type::Builtin(b))
+}
+
+pub fn builtin_names() -> &'static [&'static str] {
+    &[
+        "bool", "i32", "i64", "u32", "u64", "f32", "f64", "char", "unit", "string", "error",
+        "bytes",
+    ]
 }
