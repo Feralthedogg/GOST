@@ -1,4 +1,4 @@
-use crate::frontend::ast::{Function, Item};
+use crate::frontend::ast::{ExternGlobal, Function, Item};
 use crate::mir::MirModule;
 use crate::sema::Program;
 use crate::sema::types::{BuiltinType, Type, TypeDefKind};
@@ -44,8 +44,12 @@ impl<'a> Codegen<'a> {
 
     fn emit_module(&mut self) -> Result<(), String> {
         self.emit_prelude()?;
+        self.emit_user_extern_decls()?;
         for item in &self.program.file.items {
             if let Item::Function(func) = item {
+                if func.is_extern {
+                    continue;
+                }
                 self.emit_function(func)?;
             }
         }
@@ -55,6 +59,7 @@ impl<'a> Codegen<'a> {
 
     fn emit_module_from_mir(&mut self, mir: &MirModule) -> Result<(), String> {
         self.emit_prelude()?;
+        self.emit_user_extern_decls()?;
         let mut has_main = false;
         for func in &mir.functions {
             if func.name == "main" {
@@ -90,6 +95,16 @@ impl<'a> Codegen<'a> {
             .push_str("declare i32 @__gost_rt_start(i32 ()*)\n");
         self.output
             .push_str("declare void @__gost_println_str(i8*, i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_string_len(i8*, i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_string_get(i8*, i64, i64)\n");
+        self.output
+            .push_str("declare void @__gost_string_slice(%string*, i8*, i64, i64, i64)\n");
+        self.output
+            .push_str("declare void @__gost_string_concat(%string*, i8*, i64, i8*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_string_from_byte(%string*, i32)\n");
         self.output
             .push_str("declare %slice_obj* @__gost_slice_new(i64, i64, i64, void (i8*)*)\n");
         self.output
@@ -129,6 +144,8 @@ impl<'a> Codegen<'a> {
         self.output
             .push_str("declare %chan* @__gost_chan_new(i64, i32)\n");
         self.output
+            .push_str("declare void @__gost_chan_retain(%chan*)\n");
+        self.output
             .push_str("declare i32 @__gost_chan_send(%chan*, i8*)\n");
         self.output
             .push_str("declare i32 @__gost_chan_can_send(%chan*)\n");
@@ -141,7 +158,7 @@ impl<'a> Codegen<'a> {
         self.output
             .push_str("declare void @__gost_chan_drop(%chan*)\n");
         self.output
-            .push_str("declare i32 @__gost_select_wait(%chan**, i32)\n");
+            .push_str("declare i32 @__gost_select_wait(%chan**, i32*, i32)\n");
         self.output
             .push_str("declare void @__gost_panic(i8*, i64)\n");
         self.output
@@ -151,11 +168,59 @@ impl<'a> Codegen<'a> {
         self.output
             .push_str("declare i32 @__gost_error_new(i8*, i64)\n");
         self.output
+            .push_str("declare i32 @__gost_singleton_acquire(i8*, i64)\n");
+        self.output
             .push_str("declare void @__gost_spawn_thread(void (i8*)*, i8*)\n");
         self.output
             .push_str("declare void @__gost_go_spawn(void (i8*)*, i8*)\n");
         self.output
             .push_str("declare %chan* @__gost_after_ms(i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_net_last_status()\n");
+        self.output
+            .push_str("declare i32 @__gost_net_last_http_status()\n");
+        self.output
+            .push_str("declare void @__gost_net_last_error(%string*)\n");
+        self.output
+            .push_str("declare void @__gost_net_last_peer(%string*)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_tcp_listen(i8*, i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_tcp_accept(i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_tcp_connect(i8*, i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_net_tcp_close(i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_tcp_write(i64, i8*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_net_tcp_read(%string*, i64, i32)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_udp_bind(i8*, i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_udp_connect(i8*, i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_net_udp_close(i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_udp_send(i64, i8*, i64)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_udp_send_to(i64, i8*, i64, i8*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_net_udp_recv(%string*, i64, i32)\n");
+        self.output
+            .push_str("declare void @__gost_net_udp_recv_from(%string*, i64, i32)\n");
+        self.output
+            .push_str("declare i64 @__gost_net_ws_connect(i8*, i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_net_ws_close(i64)\n");
+        self.output
+            .push_str("declare i32 @__gost_net_ws_send_text(i64, i8*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_net_ws_recv_text(%string*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_net_http_request(%string*, i8*, i64, i8*, i64, i8*, i64, i8*, i64)\n");
+        self.output
+            .push_str("declare void @__gost_net_http_request_headers(%string*, i8*, i64, i8*, i64, i8*, i64, i8*, i64, i8*, i64)\n");
         self.output.push('\n');
         Ok(())
     }
@@ -165,6 +230,62 @@ impl<'a> Codegen<'a> {
             self.output.push_str(&global);
             self.output.push('\n');
         }
+    }
+
+    fn emit_user_extern_decls(&mut self) -> Result<(), String> {
+        let mut any = false;
+        for item in &self.program.file.items {
+            match item {
+                Item::Function(func) => {
+                    if !func.is_extern {
+                        continue;
+                    }
+                    let sig = self
+                        .program
+                        .functions
+                        .get(&func.name)
+                        .ok_or_else(|| format!("missing signature for {}", func.name))?;
+                    let ret_ty = llvm_type(&sig.ret)?;
+                    let mut params_ir = Vec::new();
+                    for param in &sig.params {
+                        params_ir.push(llvm_type(param)?);
+                    }
+                    if sig.is_variadic {
+                        params_ir.push("...".to_string());
+                    }
+                    let cc = llvm_call_conv(sig.extern_abi.as_deref());
+                    self.output.push_str(&format!(
+                        "declare {}{} @{}({})\n",
+                        cc,
+                        ret_ty,
+                        func.name,
+                        params_ir.join(", ")
+                    ));
+                    any = true;
+                }
+                Item::ExternGlobal(global) => {
+                    self.emit_user_extern_global_decl(global)?;
+                    any = true;
+                }
+                _ => {}
+            }
+        }
+        if any {
+            self.output.push('\n');
+        }
+        Ok(())
+    }
+
+    fn emit_user_extern_global_decl(&mut self, global: &ExternGlobal) -> Result<(), String> {
+        let sig = self
+            .program
+            .extern_globals
+            .get(&global.name)
+            .ok_or_else(|| format!("missing extern global signature for {}", global.name))?;
+        let ty = llvm_type(&sig.ty)?;
+        self.output
+            .push_str(&format!("@{} = external global {}\n", global.name, ty));
+        Ok(())
     }
 
     fn emit_function(&mut self, func: &Function) -> Result<(), String> {
@@ -183,9 +304,11 @@ impl<'a> Codegen<'a> {
         let mut emitter = FnEmitter::new(
             &func.name,
             &self.program.functions,
+            &self.program.extern_globals,
             &self.program.types,
             sig.ret.clone(),
         );
+        emitter.set_mir_expr_types(&self.program.expr_types);
         let mut param_names = Vec::new();
         for param in &func.params {
             param_names.push(param.name.clone());
@@ -237,6 +360,7 @@ impl<'a> Codegen<'a> {
         let mut emitter = FnEmitter::new(
             &func.name,
             &self.program.functions,
+            &self.program.extern_globals,
             &self.program.types,
             sig.ret.clone(),
         );
@@ -368,6 +492,7 @@ impl<'a> Codegen<'a> {
         let mut emitter = FnEmitter::new(
             name_override,
             &self.program.functions,
+            &self.program.extern_globals,
             &self.program.types,
             sig.ret.clone(),
         );
@@ -497,11 +622,19 @@ impl<'a> Codegen<'a> {
                     for (_, ty) in &def.fields {
                         fields.push(llvm_type_for_tuple_elem(ty)?);
                     }
-                    self.output.push_str(&format!(
-                        "%{} = type {{ {} }}\n",
-                        name,
-                        fields.join(", ")
-                    ));
+                    if def.layout.pack.is_some() || def.layout.bitfield {
+                        self.output.push_str(&format!(
+                            "%{} = type <{{ {} }}>\n",
+                            name,
+                            fields.join(", ")
+                        ));
+                    } else {
+                        self.output.push_str(&format!(
+                            "%{} = type {{ {} }}\n",
+                            name,
+                            fields.join(", ")
+                        ));
+                    }
                 }
                 TypeDefKind::Enum(_) => {
                     if let TypeDefKind::Enum(def) = def {
@@ -544,6 +677,11 @@ pub(crate) fn llvm_type(ty: &Type) -> Result<String, String> {
         Type::Builtin(BuiltinType::String) => "%string".to_string(),
         Type::Builtin(BuiltinType::Error) => "i32".to_string(),
         Type::Builtin(BuiltinType::Bytes) => "%slice".to_string(),
+        Type::FnPtr {
+            params,
+            ret,
+            is_variadic,
+        } => format!("{}*", llvm_fn_sig(params, ret, *is_variadic)?),
         Type::Ref(inner) | Type::MutRef(inner) => {
             let inner_ty = llvm_type(inner)?;
             if inner_ty == "void" {
@@ -568,6 +706,36 @@ pub(crate) fn llvm_type(ty: &Type) -> Result<String, String> {
         Type::Named(name) => format!("%{}", name),
     };
     Ok(s)
+}
+
+pub(crate) fn llvm_call_conv(abi: Option<&str>) -> String {
+    let Some(abi) = abi else {
+        return String::new();
+    };
+    let a = abi.to_ascii_lowercase();
+    let cc = match a.as_str() {
+        "c" | "system" => "",
+        "stdcall" => "x86_stdcallcc ",
+        "fastcall" => "x86_fastcallcc ",
+        "vectorcall" => "x86_vectorcallcc ",
+        "thiscall" => "x86_thiscallcc ",
+        "win64" => "win64cc ",
+        "sysv64" => "x86_64_sysvcc ",
+        "aapcs" => "arm_aapcscc ",
+        _ => "",
+    };
+    cc.to_string()
+}
+
+fn llvm_fn_sig(params: &[Type], ret: &Type, is_variadic: bool) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for p in params {
+        parts.push(llvm_type(p)?);
+    }
+    if is_variadic {
+        parts.push("...".to_string());
+    }
+    Ok(format!("{} ({})", llvm_type(ret)?, parts.join(", ")))
 }
 
 fn llvm_result_type(ok: &Type, err: &Type) -> Result<String, String> {
@@ -620,6 +788,8 @@ pub(crate) fn zero_value(ty: &Type) -> Result<String, String> {
         | Type::Map(_, _)
         | Type::Interface
         | Type::Named(_) => Ok("zeroinitializer".to_string()),
-        Type::Chan(_) | Type::Ref(_) | Type::MutRef(_) => Ok("null".to_string()),
+        Type::FnPtr { .. } | Type::Chan(_) | Type::Ref(_) | Type::MutRef(_) => {
+            Ok("null".to_string())
+        }
     }
 }

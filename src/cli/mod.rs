@@ -169,6 +169,69 @@ where
         }
         return 0;
     }
+    if first == "bindgen" {
+        let mut header: Option<PathBuf> = None;
+        let mut out: Option<PathBuf> = None;
+        let mut module_name: Option<String> = None;
+        let mut abi = "C".to_string();
+        let mut bindgen_help = false;
+        while let Some(arg) = args.next() {
+            if arg == "--help" || arg == "-h" {
+                bindgen_help = true;
+                continue;
+            }
+            if arg == "-o" {
+                let Some(path) = args.next() else {
+                    eprintln!("error: expected output path after -o");
+                    return 1;
+                };
+                out = Some(PathBuf::from(path));
+                continue;
+            }
+            if arg == "--module" {
+                let Some(name) = args.next() else {
+                    eprintln!("error: expected module name after --module");
+                    return 1;
+                };
+                module_name = Some(name);
+                continue;
+            }
+            if arg == "--abi" {
+                let Some(name) = args.next() else {
+                    eprintln!("error: expected ABI name after --abi");
+                    return 1;
+                };
+                abi = name;
+                continue;
+            }
+            if header.is_none() {
+                header = Some(PathBuf::from(arg));
+            } else {
+                eprintln!("unknown argument: {}", arg);
+                return 1;
+            }
+        }
+        if bindgen_help {
+            print_help_bindgen();
+            return 0;
+        }
+        let Some(header) = header else {
+            print_help_bindgen();
+            return 1;
+        };
+        let stem = header
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bindings");
+        let module_name = module_name.unwrap_or_else(|| sanitize_module_name(stem));
+        let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.gs", stem)));
+        if let Err(err) = run_bindgen(&header, &out, &module_name, &abi) {
+            eprintln!("error: {}", err);
+            return 1;
+        }
+        println!("generated {}", out.display());
+        return 0;
+    }
     let (mode, input) = if first == "run" {
         let next = match args.next() {
             Some(arg) => arg,
@@ -287,6 +350,7 @@ fn print_help_global() {
     eprintln!("  run       Run a .gs entry file");
     eprintln!("  build     Build a .gs entry file");
     eprintln!("  mod       Module/dependency management");
+    eprintln!("  bindgen   Generate gost extern bindings from C headers");
     eprintln!("  explain   Show detailed explanation for a diagnostic code");
     eprintln!("  help      Print this message or the help of the given subcommand(s)");
     eprintln!();
@@ -311,8 +375,22 @@ fn print_help_global() {
     eprintln!("  gs mod download");
     eprintln!("  gs mod download --online");
     eprintln!("  gs mod graph");
+    eprintln!("  gs bindgen native.h -o native.gs --module native");
     eprintln!("  gs explain E1101");
     eprintln!("  gs --explain E1101");
+}
+
+fn print_help_bindgen() {
+    eprintln!("Generate Gost extern bindings from a C header.");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  gs bindgen [OPTIONS] <header.h>");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -o <file.gs>         Output file path (default: <header-stem>.gs)");
+    eprintln!("  --module <name>      Module name for generated file (default: header stem)");
+    eprintln!("  --abi <name>         Extern ABI string (default: C)");
+    eprintln!("  -h, --help           Print help");
 }
 
 fn explain_code(code: &str) -> i32 {
@@ -581,6 +659,9 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
     let rt_lib = build_runtime(&runtime_dir, &cc)?;
     let obj_path = input_path.with_extension("o");
     let exe_path = input_path.with_extension(if cfg!(windows) { "exe" } else { "" });
+    if exe_path.exists() {
+        let _ = std::fs::remove_file(&exe_path);
+    }
     compile_ll_to_obj(&cc, ll_path, &obj_path)?;
     let mut link_args = vec![
         obj_path.display().to_string(),
@@ -607,6 +688,13 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
         link_args.push("-lgdi32".into());
         link_args.push("-lwinmm".into());
         link_args.push("-lsecur32".into());
+    }
+    if let Ok(ldflags) = std::env::var("GOST_LDFLAGS") {
+        for tok in ldflags.split_whitespace() {
+            if !tok.is_empty() {
+                link_args.push(tok.to_string());
+            }
+        }
     }
     link_args.push("-o".into());
     link_args.push(exe_path.display().to_string());
@@ -644,6 +732,8 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
     cmd.arg("build")
         .arg("--manifest-path")
         .arg(runtime_dir.join("Cargo.toml"));
+    // Isolate runtime build artifacts from the main crate to avoid locking gs.exe on Windows.
+    cmd.env("CARGO_TARGET_DIR", runtime_dir.join("target"));
     if let Some(target) = &target {
         cmd.arg("--target").arg(target);
     }
@@ -770,6 +860,288 @@ fn is_gcc(cc: &str) -> bool {
 
 fn command_exists(cmd: &str) -> bool {
     Command::new(cmd).arg("--version").output().is_ok()
+}
+
+fn sanitize_module_name(raw: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in raw.chars().enumerate() {
+        let valid = ch.is_ascii_alphanumeric() || ch == '_';
+        let c = if valid { ch } else { '_' };
+        if i == 0 {
+            if c.is_ascii_alphabetic() || c == '_' {
+                out.push(c);
+            } else {
+                out.push('_');
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        "bindings".to_string()
+    } else {
+        out
+    }
+}
+
+fn run_bindgen(header: &Path, out: &Path, module: &str, abi: &str) -> Result<(), String> {
+    let source = std::fs::read_to_string(header)
+        .map_err(|e| format!("failed to read {}: {}", header.display(), e))?;
+    let stripped = strip_c_comments(&source);
+    let stmts = split_c_statements(&stripped);
+
+    #[derive(Clone)]
+    struct FnSig {
+        name: String,
+        ret: String,
+        params: Vec<(String, String)>,
+        variadic: bool,
+    }
+    #[derive(Clone)]
+    struct GlobalSig {
+        name: String,
+        ty: String,
+    }
+
+    let mut fns: Vec<FnSig> = Vec::new();
+    let mut globals: Vec<GlobalSig> = Vec::new();
+    for stmt in stmts {
+        let s = stmt.trim();
+        if s.is_empty()
+            || s.starts_with('#')
+            || s.contains('{')
+            || s.contains('}')
+            || s.starts_with("typedef")
+        {
+            continue;
+        }
+        if let Some(sig) = parse_c_function_decl(s) {
+            fns.push(FnSig {
+                name: sig.0,
+                ret: sig.1,
+                params: sig.2,
+                variadic: sig.3,
+            });
+            continue;
+        }
+        if let Some(g) = parse_c_global_decl(s) {
+            globals.push(GlobalSig { name: g.0, ty: g.1 });
+        }
+    }
+
+    let mut generated = String::new();
+    generated.push_str(&format!("module {}\n\n", sanitize_module_name(module)));
+    for g in &globals {
+        generated.push_str(&format!("extern \"{}\" let {}: {};\n", abi, g.name, g.ty));
+    }
+    if !globals.is_empty() && !fns.is_empty() {
+        generated.push('\n');
+    }
+    for f in &fns {
+        let mut params = Vec::new();
+        for (name, ty) in &f.params {
+            params.push(format!("{}: {}", name, ty));
+        }
+        if f.variadic {
+            if !params.is_empty() {
+                params.push("...".to_string());
+            } else {
+                params.push("...".to_string());
+            }
+        }
+        generated.push_str(&format!(
+            "extern \"{}\" fn {}({}) -> {};\n",
+            abi,
+            f.name,
+            params.join(", "),
+            f.ret
+        ));
+    }
+    std::fs::write(out, generated)
+        .map_err(|e| format!("failed to write {}: {}", out.display(), e))?;
+    Ok(())
+}
+
+fn strip_c_comments(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn split_c_statements(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in input.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ';' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+fn parse_c_function_decl(
+    stmt: &str,
+) -> Option<(String, String, Vec<(String, String)>, bool)> {
+    let open = stmt.find('(')?;
+    let close = stmt.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let head = stmt[..open].trim();
+    if head.is_empty() {
+        return None;
+    }
+    let (name, head_start) = extract_trailing_ident(head)?;
+    let ret_c = head[..head_start].trim();
+    if ret_c.is_empty() {
+        return None;
+    }
+    let ret = map_c_type_to_gs(ret_c);
+    let params_raw = stmt[open + 1..close].trim();
+    let mut params = Vec::new();
+    let mut variadic = false;
+    if !params_raw.is_empty() && params_raw != "void" {
+        for (idx, p) in params_raw.split(',').enumerate() {
+            let p = p.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if p == "..." {
+                variadic = true;
+                continue;
+            }
+            let (pname, pty) = parse_c_param_decl(p, idx);
+            params.push((pname, pty));
+        }
+    }
+    Some((name, ret, params, variadic))
+}
+
+fn parse_c_param_decl(param: &str, idx: usize) -> (String, String) {
+    if let Some((name, start)) = extract_trailing_ident(param) {
+        let mut ty = param[..start].trim().to_string();
+        if ty.is_empty() {
+            ty = param.trim().to_string();
+            return (format!("arg{}", idx), map_c_type_to_gs(&ty));
+        }
+        if ty.ends_with('*') {
+            ty.push(' ');
+        }
+        (name, map_c_type_to_gs(&ty))
+    } else {
+        (format!("arg{}", idx), map_c_type_to_gs(param))
+    }
+}
+
+fn parse_c_global_decl(stmt: &str) -> Option<(String, String)> {
+    let s = stmt.trim();
+    if !s.starts_with("extern ") || s.contains('(') {
+        return None;
+    }
+    let body = s.trim_start_matches("extern").trim();
+    let (name, start) = extract_trailing_ident(body)?;
+    let ty = body[..start].trim();
+    if ty.is_empty() {
+        return None;
+    }
+    Some((name, map_c_type_to_gs(ty)))
+}
+
+fn extract_trailing_ident(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 {
+        let c = bytes[start - 1] as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    Some((s[start..end].to_string(), start))
+}
+
+fn map_c_type_to_gs(c_ty: &str) -> String {
+    let mut t = c_ty.replace('\t', " ");
+    for q in ["const", "volatile", "restrict", "register"] {
+        t = t.replace(q, " ");
+    }
+    let lower = t
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let is_ptr = lower.contains('*') || lower.contains('[');
+    if is_ptr {
+        if lower.contains("char") {
+            return "string".to_string();
+        }
+        return "i64".to_string();
+    }
+    match lower.as_str() {
+        "void" => "unit".to_string(),
+        "bool" | "_bool" => "bool".to_string(),
+        "char" | "signed char" | "short" | "short int" | "int" | "int32_t" => "i32".to_string(),
+        "unsigned char" | "unsigned short" | "unsigned short int" | "unsigned int" | "uint32_t" => {
+            "u32".to_string()
+        }
+        "long" | "long int" | "long long" | "long long int" | "int64_t" | "ssize_t" => {
+            "i64".to_string()
+        }
+        "unsigned long"
+        | "unsigned long int"
+        | "unsigned long long"
+        | "unsigned long long int"
+        | "uint64_t"
+        | "size_t" => "u64".to_string(),
+        "float" => "f32".to_string(),
+        "double" | "long double" => "f64".to_string(),
+        _ => "i64".to_string(),
+    }
 }
 
 

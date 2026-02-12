@@ -111,16 +111,24 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
         let (start_line, start_col) = line_col_at(source, start);
         let (end_line, end_col) = line_col_at(source, end);
 
-        out.push_str(&format!(
-            "{}:{}:{}: {}{}: {}\n",
-            file_display, start_line, start_col, err, code_col, diag.message
-        ));
+        let msg = diag.message.trim_start();
+        if code.is_empty() {
+            out.push_str(&format!(
+                "{}:{}:{}: {}: {}\n",
+                file_display, start_line, start_col, err, msg
+            ));
+        } else {
+            out.push_str(&format!(
+                "{}:{}:{}: {}{}: {}\n",
+                file_display, start_line, start_col, err, code_col, msg
+            ));
+        }
         out.push_str(&format!(
             "  --> {}:{}:{}\n",
             file_display, start_line, start_col
         ));
 
-        let line_w = end_line.to_string().len().max(start_line.to_string().len());
+        let line_w = source.lines().count().to_string().len().max(1);
 
         if start_line == end_line {
             let line_text = source
@@ -201,7 +209,7 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
             }
         }
 
-        for h in &diag.helps {
+        for h in diag.helps.iter().take(3) {
             out.push_str(&format!("{}: ", colorize("help", "1;36")));
             out.push_str(&render_help(h, source));
             out.push('\n');
@@ -222,9 +230,14 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
         } else {
             colorize(&code, "1;33")
         };
-        let mut out = format!("{}{}: {}", err, code_col, diag.message);
+        let msg = diag.message.trim_start();
+        let mut out = if code.is_empty() {
+            format!("{}: {}", err, msg)
+        } else {
+            format!("{}{}: {}", err, code_col, msg)
+        };
         out.push('\n');
-        for h in &diag.helps {
+        for h in diag.helps.iter().take(3) {
             out.push_str(&format!("{}: ", colorize("help", "1;36")));
             out.push_str(&render_help(h, source));
             out.push('\n');
@@ -283,7 +296,7 @@ fn snippet_one_line(source: &str, span: Span) -> String {
     const LIM: usize = 80;
     if s.len() > LIM {
         s.truncate(LIM);
-        s.push('…');
+        s.push_str("...");
     }
     s
 }

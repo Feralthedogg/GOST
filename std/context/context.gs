@@ -11,17 +11,36 @@ struct Cancel {
     ch: chan[unit];
 }
 
+struct WithCancel {
+    ctx: Context;
+    cancel: Cancel;
+}
+
+// helpers to avoid struct literals with local names in callers
+fn ctx_new(d: chan[unit], e: shared[error]) -> Context {
+    return Context { done = d, err = e };
+}
+
+fn with_cancel_new(ctx: Context, cancel: Cancel) -> WithCancel {
+    return WithCancel { ctx = ctx, cancel = cancel };
+}
+
 fn background() -> Context {
     let e = shared_new[error](nil);
     let d = make_chan[unit](0);
-    return Context { done: d, err: e };
+    return ctx_new(d, e);
 }
 
-fn done(ctx: &Context) -> chan[unit] {
+// Local wrapper to avoid module qualification issues in early std import model.
+fn error_new(msg: string) -> error {
+    return __gost_error_new(msg);
+}
+
+fn done(ctx: Context) -> chan[unit] {
     return ctx.done;
 }
 
-fn err(ctx: &Context) -> error {
+fn err(ctx: Context) -> error {
     let p = shared_get[error](&ctx.err);
     return *p;
 }
@@ -30,57 +49,72 @@ fn cancel(c: Cancel) {
     close(c.ch);
 }
 
-fn with_cancel(parent: Context) -> (Context, Cancel) {
-    let d = make_chan[unit](0);
-    let e = shared_new[error](nil);
-    let cch = make_chan[unit](0);
-    let c = Cancel { ch: cch };
-
-    go fn() {
-        select {
-            case recv(parent.done) => {
-                let pe = shared_get[error](&parent.err);
-                let ce = shared_get[error](&e);
-                *ce = *pe;
-                close(d);
-            },
-            case recv(cch) => {
-                let ce = shared_get[error](&e);
-                *ce = error_new("context canceled");
-                close(d);
-            },
-        }
-    }();
-
-    return (Context { done: d, err: e }, c);
+// Consume WithCancel to cancel and return its done channel in one move.
+fn cancel_and_done(wc: WithCancel) -> chan[unit] {
+    close(wc.cancel.ch);
+    return wc.ctx.done;
 }
 
-fn with_timeout(parent: Context, ms: i32) -> (Context, Cancel) {
+// Consume WithCancel and return its done channel.
+fn done_chan(wc: WithCancel) -> chan[unit] {
+    return wc.ctx.done;
+}
+
+fn watch_cancel(parent: Context, d: chan[unit], e: shared[error], cch: chan[unit]) {
+    select {
+        case recv(parent.done) => {
+            let pe = shared_get[error](&parent.err);
+            let ce = shared_get[error](&e);
+            *ce = *pe;
+            close(d);
+        },
+        case recv(cch) => {
+            let ce = shared_get[error](&e);
+            *ce = error_new("context canceled");
+            close(d);
+        },
+    }
+}
+
+fn watch_timeout(parent: Context, d: chan[unit], e: shared[error], cch: chan[unit], ms: i32) {
+    select {
+        case recv(parent.done) => {
+            let pe = shared_get[error](&parent.err);
+            let ce = shared_get[error](&e);
+            *ce = *pe;
+            close(d);
+        },
+        case recv(cch) => {
+            let ce = shared_get[error](&e);
+            *ce = error_new("context canceled");
+            close(d);
+        },
+        case after(ms) => {
+            let ce = shared_get[error](&e);
+            *ce = error_new("context deadline exceeded");
+            close(d);
+        },
+    }
+}
+
+fn with_cancel(parent: Context) -> WithCancel {
     let d = make_chan[unit](0);
     let e = shared_new[error](nil);
     let cch = make_chan[unit](0);
-    let c = Cancel { ch: cch };
+    let c = Cancel { ch = cch };
 
-    go fn() {
-        select {
-            case recv(parent.done) => {
-                let pe = shared_get[error](&parent.err);
-                let ce = shared_get[error](&e);
-                *ce = *pe;
-                close(d);
-            },
-            case recv(cch) => {
-                let ce = shared_get[error](&e);
-                *ce = error_new("context canceled");
-                close(d);
-            },
-            case after(ms) => {
-                let ce = shared_get[error](&e);
-                *ce = error_new("context deadline exceeded");
-                close(d);
-            },
-        }
-    }();
+    go watch_cancel(parent, d, e, cch);
 
-    return (Context { done: d, err: e }, c);
+    return with_cancel_new(ctx_new(d, e), c);
+}
+
+fn with_timeout(parent: Context, ms: i32) -> WithCancel {
+    let d = make_chan[unit](0);
+    let e = shared_new[error](nil);
+    let cch = make_chan[unit](0);
+    let c = Cancel { ch = cch };
+
+    go watch_timeout(parent, d, e, cch, ms);
+
+    return with_cancel_new(ctx_new(d, e), c);
 }

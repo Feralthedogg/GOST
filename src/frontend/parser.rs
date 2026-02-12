@@ -7,6 +7,7 @@ pub struct Parser {
     idx: usize,
     pub diags: Diagnostics,
     next_expr_id: ExprId,
+    allow_struct_lit: bool,
 }
 
 impl Parser {
@@ -20,6 +21,7 @@ impl Parser {
             idx: 0,
             diags: Diagnostics::default(),
             next_expr_id,
+            allow_struct_lit: true,
         }
     }
 
@@ -31,6 +33,14 @@ impl Parser {
         let id = self.next_expr_id;
         self.next_expr_id += 1;
         Expr { id, kind, span }
+    }
+
+    fn parse_expr_no_struct_lit(&mut self) -> Option<Expr> {
+        let prev = self.allow_struct_lit;
+        self.allow_struct_lit = false;
+        let expr = self.parse_expr();
+        self.allow_struct_lit = prev;
+        expr
     }
 
     pub fn parse_file(&mut self) -> Option<FileAst> {
@@ -54,19 +64,84 @@ impl Parser {
                 self.bump();
                 continue;
             }
+            let layout = self.parse_layout_modifiers();
+            let has_layout = layout.repr_c || layout.pack.is_some() || layout.bitfield;
+            if has_layout
+                && !self.at_keyword(Keyword::Copy)
+                && !self.at_keyword(Keyword::Struct)
+                && !self.at_keyword(Keyword::Enum)
+            {
+                self.diags.push(
+                    "layout modifiers apply only to struct/enum items",
+                    self.peek_span(),
+                );
+            }
+            let mut is_unsafe = false;
+            let mut start_override: Option<Span> = None;
+            if self.at_keyword(Keyword::Unsafe) {
+                let start = self.bump().span;
+                is_unsafe = true;
+                start_override = Some(start.clone());
+                if !self.at_keyword(Keyword::Extern) && !self.at_keyword(Keyword::Fn) {
+                    self.diags
+                        .push("expected fn or extern after unsafe", Some(start));
+                    continue;
+                }
+            }
+            if self.at_keyword(Keyword::Extern) {
+                let start = start_override.unwrap_or_else(|| {
+                    self.peek_span().unwrap_or(Span {
+                        start: 0,
+                        end: 0,
+                        line: 1,
+                        column: 1,
+                    })
+                });
+                self.bump();
+                let abi = if matches!(self.peek().kind, TokenKind::StringLit(_)) {
+                    self.parse_string_lit().unwrap_or_else(|| "C".to_string())
+                } else {
+                    "C".to_string()
+                };
+                if self.at_keyword(Keyword::Unsafe) {
+                    if is_unsafe {
+                        self.error_here("duplicate unsafe");
+                    }
+                    self.bump();
+                    is_unsafe = true;
+                }
+                if self.at_keyword(Keyword::Fn) {
+                    if let Some(func) =
+                        self.parse_function(true, is_unsafe, Some(abi), Some(start))
+                    {
+                        items.push(Item::Function(func));
+                    }
+                } else if self.at_keyword(Keyword::Let) {
+                    if is_unsafe {
+                        self.error_here("extern global cannot be unsafe");
+                    }
+                    if let Some(global) = self.parse_extern_global(Some(abi), Some(start)) {
+                        items.push(Item::ExternGlobal(global));
+                    }
+                } else {
+                    self.error_here("expected fn or let after extern");
+                    self.bump();
+                }
+                continue;
+            }
             if self.at_keyword(Keyword::Fn) {
-                if let Some(func) = self.parse_function() {
+                if let Some(func) = self.parse_function(false, is_unsafe, None, start_override) {
                     items.push(Item::Function(func));
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Copy) {
                 if self.peek_is_keyword(Keyword::Struct) {
-                    if let Some(def) = self.parse_struct_def() {
+                    if let Some(def) = self.parse_struct_def(layout.clone()) {
                         items.push(Item::Struct(def));
                     }
                 } else if self.peek_is_keyword(Keyword::Enum) {
-                    if let Some(def) = self.parse_enum_def() {
+                    if let Some(def) = self.parse_enum_def(layout.clone()) {
                         items.push(Item::Enum(def));
                     }
                 } else {
@@ -76,13 +151,13 @@ impl Parser {
                 continue;
             }
             if self.at_keyword(Keyword::Struct) {
-                if let Some(def) = self.parse_struct_def() {
+                if let Some(def) = self.parse_struct_def(layout.clone()) {
                     items.push(Item::Struct(def));
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Enum) {
-                if let Some(def) = self.parse_enum_def() {
+                if let Some(def) = self.parse_enum_def(layout.clone()) {
                     items.push(Item::Enum(def));
                 }
                 continue;
@@ -112,13 +187,19 @@ impl Parser {
         }
     }
 
-    fn parse_function(&mut self) -> Option<Function> {
-        let start = self.peek_span().unwrap_or(Span {
+    fn parse_function(
+        &mut self,
+        is_extern: bool,
+        is_unsafe: bool,
+        extern_abi: Option<String>,
+        start_override: Option<Span>,
+    ) -> Option<Function> {
+        let start = start_override.unwrap_or_else(|| self.peek_span().unwrap_or(Span {
             start: 0,
             end: 0,
             line: 1,
             column: 1,
-        });
+        }));
         self.expect_keyword(Keyword::Fn);
         let name = match self.bump().kind {
             TokenKind::Ident(name) => name,
@@ -129,8 +210,14 @@ impl Parser {
         };
         self.expect_symbol(Symbol::LParen);
         let mut params = Vec::new();
+        let mut is_variadic = false;
         if !self.at_symbol(Symbol::RParen) {
             loop {
+                if self.at_variadic_marker() {
+                    self.consume_variadic_marker();
+                    is_variadic = true;
+                    break;
+                }
                 let param_start = self.peek_span().unwrap_or(start.clone());
                 let param_name = match self.bump().kind {
                     TokenKind::Ident(name) => name,
@@ -151,6 +238,11 @@ impl Parser {
                     if self.at_symbol(Symbol::RParen) {
                         break;
                     }
+                    if self.at_variadic_marker() {
+                        self.consume_variadic_marker();
+                        is_variadic = true;
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -163,12 +255,29 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let body = if is_extern {
+            if !self.at_symbol(Symbol::Semi) {
+                self.error_here("expected `;` after extern fn declaration");
+                return None;
+            }
+            let semi = self.bump().span;
+            Block {
+                stmts: Vec::new(),
+                tail: None,
+                span: semi.clone(),
+            }
+        } else {
+            self.parse_block()?
+        };
         let end = body.span.clone();
         Some(Function {
             name,
             params,
+            is_variadic,
             ret_type,
+            is_extern,
+            is_unsafe,
+            extern_abi,
             body,
             span: Span {
                 start: start.start,
@@ -179,7 +288,46 @@ impl Parser {
         })
     }
 
-    fn parse_struct_def(&mut self) -> Option<StructDef> {
+    fn parse_extern_global(
+        &mut self,
+        extern_abi: Option<String>,
+        start_override: Option<Span>,
+    ) -> Option<ExternGlobal> {
+        let start = start_override.unwrap_or_else(|| self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        }));
+        self.expect_keyword(Keyword::Let);
+        let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected global name");
+                return None;
+            }
+        };
+        self.expect_symbol(Symbol::Colon);
+        let ty = self.parse_type()?;
+        if !self.at_symbol(Symbol::Semi) {
+            self.error_here("expected `;` after extern global declaration");
+            return None;
+        }
+        let semi = self.bump().span;
+        Some(ExternGlobal {
+            name,
+            ty,
+            extern_abi,
+            span: Span {
+                start: start.start,
+                end: semi.end,
+                line: start.line,
+                column: start.column,
+            },
+        })
+    }
+
+    fn parse_struct_def(&mut self, mut layout: LayoutAttr) -> Option<StructDef> {
         let start = self.peek_span().unwrap_or(Span {
             start: 0,
             end: 0,
@@ -190,6 +338,12 @@ impl Parser {
         if self.at_keyword(Keyword::Copy) {
             is_copy = true;
             self.bump();
+        }
+        let extra_layout = self.parse_layout_modifiers();
+        layout.repr_c |= extra_layout.repr_c;
+        layout.bitfield |= extra_layout.bitfield;
+        if extra_layout.pack.is_some() {
+            layout.pack = extra_layout.pack;
         }
         self.expect_keyword(Keyword::Struct);
         let name = match self.bump().kind {
@@ -224,11 +378,12 @@ impl Parser {
             name,
             fields,
             is_copy,
+            layout,
             span: start,
         })
     }
 
-    fn parse_enum_def(&mut self) -> Option<EnumDef> {
+    fn parse_enum_def(&mut self, mut layout: LayoutAttr) -> Option<EnumDef> {
         let start = self.peek_span().unwrap_or(Span {
             start: 0,
             end: 0,
@@ -239,6 +394,12 @@ impl Parser {
         if self.at_keyword(Keyword::Copy) {
             is_copy = true;
             self.bump();
+        }
+        let extra_layout = self.parse_layout_modifiers();
+        layout.repr_c |= extra_layout.repr_c;
+        layout.bitfield |= extra_layout.bitfield;
+        if extra_layout.pack.is_some() {
+            layout.pack = extra_layout.pack;
         }
         self.expect_keyword(Keyword::Enum);
         let name = match self.bump().kind {
@@ -289,8 +450,60 @@ impl Parser {
             name,
             variants,
             is_copy,
+            layout,
             span: start,
         })
+    }
+
+    fn parse_layout_modifiers(&mut self) -> LayoutAttr {
+        let mut layout = LayoutAttr::default();
+        loop {
+            if self.at_ident("repr") {
+                let repr_span = self.bump().span;
+                self.expect_symbol(Symbol::LParen);
+                let repr_name = match self.bump().kind {
+                    TokenKind::Ident(name) => name,
+                    TokenKind::StringLit(name) => name,
+                    _ => {
+                        self.error_here("expected repr name");
+                        String::new()
+                    }
+                };
+                self.expect_symbol(Symbol::RParen);
+                if repr_name.eq_ignore_ascii_case("c") {
+                    layout.repr_c = true;
+                } else {
+                    self.diags.push(
+                        format!("unsupported repr `{}` (only repr(C) is supported)", repr_name),
+                        Some(repr_span),
+                    );
+                }
+                continue;
+            }
+            if self.at_ident("pack") {
+                let pack_span = self.bump().span;
+                self.expect_symbol(Symbol::LParen);
+                let n = match self.bump().kind {
+                    TokenKind::IntLit(v) => v.parse::<u32>().ok(),
+                    _ => None,
+                };
+                self.expect_symbol(Symbol::RParen);
+                match n {
+                    Some(v) if v > 0 => layout.pack = Some(v),
+                    _ => self
+                        .diags
+                        .push("pack(N) expects positive integer N", Some(pack_span)),
+                }
+                continue;
+            }
+            if self.at_ident("bitfield") {
+                self.bump();
+                layout.bitfield = true;
+                continue;
+            }
+            break;
+        }
+        layout
     }
 
     fn parse_block(&mut self) -> Option<Block> {
@@ -307,6 +520,12 @@ impl Parser {
             if self.at_symbol(Symbol::Semi) {
                 self.bump();
                 continue;
+            }
+            if self.at_label_stmt_start() {
+                if let Some(stmt) = self.parse_label_stmt() {
+                    stmts.push(stmt);
+                    continue;
+                }
             }
             if self.at_keyword(Keyword::Return) {
                 let span = self.bump().span;
@@ -344,6 +563,16 @@ impl Parser {
             }
             if self.at_keyword(Keyword::For) {
                 let stmt = self.parse_for_stmt()?;
+                stmts.push(stmt);
+                continue;
+            }
+            if self.at_keyword(Keyword::While) {
+                let stmt = self.parse_while_stmt()?;
+                stmts.push(stmt);
+                continue;
+            }
+            if self.at_keyword(Keyword::Loop) {
+                let stmt = self.parse_loop_stmt()?;
                 stmts.push(stmt);
                 continue;
             }
@@ -389,6 +618,19 @@ impl Parser {
                 stmts.push(Stmt::Expr { expr, span });
                 continue;
             }
+            if !self.at_symbol(Symbol::RBrace)
+                && matches!(
+                    expr.kind,
+                    ExprKind::If { .. }
+                        | ExprKind::Match { .. }
+                        | ExprKind::Block(_)
+                        | ExprKind::UnsafeBlock(_)
+                )
+            {
+                let span = expr.span.clone();
+                stmts.push(Stmt::Expr { expr, span });
+                continue;
+            }
             tail = Some(expr);
             break;
         }
@@ -404,6 +646,42 @@ impl Parser {
                 column: start.column,
             },
         })
+    }
+
+    fn at_label_stmt_start(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(
+                self.tokens.get(self.idx + 1).map(|t| &t.kind),
+                Some(TokenKind::Symbol(Symbol::Colon))
+            )
+    }
+
+    fn parse_label_stmt(&mut self) -> Option<Stmt> {
+        let start = self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        });
+        let label_name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected label name");
+                return None;
+            }
+        };
+        self.expect_symbol(Symbol::Colon);
+        let callee = self.new_expr(ExprKind::Ident("asm_label".to_string()), start.clone());
+        let label_arg = self.new_expr(ExprKind::String(label_name), start.clone());
+        let expr = self.new_expr(
+            ExprKind::Call {
+                callee: Box::new(callee),
+                type_args: Vec::new(),
+                args: vec![label_arg],
+            },
+            start.clone(),
+        );
+        Some(Stmt::Expr { expr, span: start })
     }
 
     fn parse_let_stmt(&mut self) -> Option<Stmt> {
@@ -444,7 +722,7 @@ impl Parser {
             }
         };
         self.expect_keyword(Keyword::In);
-        let iter = self.parse_expr()?;
+        let iter = self.parse_expr_no_struct_lit()?;
         let body = self.parse_block()?;
         Some(Stmt::ForIn {
             name,
@@ -452,6 +730,19 @@ impl Parser {
             body,
             span,
         })
+    }
+
+    fn parse_while_stmt(&mut self) -> Option<Stmt> {
+        let span = self.bump().span;
+        let cond = self.parse_expr_no_struct_lit()?;
+        let body = self.parse_block()?;
+        Some(Stmt::While { cond, body, span })
+    }
+
+    fn parse_loop_stmt(&mut self) -> Option<Stmt> {
+        let span = self.bump().span;
+        let body = self.parse_block()?;
+        Some(Stmt::Loop { body, span })
     }
 
     fn parse_select_stmt(&mut self) -> Option<Stmt> {
@@ -779,6 +1070,23 @@ impl Parser {
             line: 1,
             column: 1,
         });
+        if self.at_ident("asm")
+            && (self.peek_is_ident("volatile") || self.peek_is_ident("goto"))
+        {
+            return self.parse_colon_inline_asm_expr();
+        }
+        if self.at_keyword(Keyword::Unsafe) {
+            self.bump();
+            if !self.at_symbol(Symbol::LBrace) {
+                self.error_here("expected block after unsafe");
+                return None;
+            }
+            let block = self.parse_block()?;
+            return Some(self.new_expr(
+                ExprKind::UnsafeBlock(Box::new(block.clone())),
+                block.span,
+            ));
+        }
         if self.at_symbol(Symbol::LBrace) {
             let block = self.parse_block()?;
             return Some(self.new_expr(
@@ -788,7 +1096,7 @@ impl Parser {
         }
         if self.at_keyword(Keyword::If) {
             self.bump();
-            let cond = self.parse_expr()?;
+            let cond = self.parse_expr_no_struct_lit()?;
             let then_block = Box::new(self.parse_block()?);
             let else_block = if self.at_keyword(Keyword::Else) {
                 self.bump();
@@ -807,7 +1115,7 @@ impl Parser {
         }
         if self.at_keyword(Keyword::Match) {
             self.bump();
-            let scrutinee = self.parse_expr()?;
+            let scrutinee = self.parse_expr_no_struct_lit()?;
             self.expect_symbol(Symbol::LBrace);
             let mut arms = Vec::new();
             while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
@@ -839,7 +1147,12 @@ impl Parser {
             TokenKind::Keyword(Keyword::True) => Some(self.new_expr(ExprKind::Bool(true), span)),
             TokenKind::Keyword(Keyword::False) => Some(self.new_expr(ExprKind::Bool(false), span)),
             TokenKind::Keyword(Keyword::Nil) => Some(self.new_expr(ExprKind::Nil, span)),
-            TokenKind::Ident(name) => Some(self.new_expr(ExprKind::Ident(name), span)),
+            TokenKind::Ident(name) => {
+                if self.allow_struct_lit && self.at_symbol(Symbol::LBrace) {
+                    return self.parse_struct_lit(name, span);
+                }
+                Some(self.new_expr(ExprKind::Ident(name), span))
+            }
             TokenKind::Symbol(Symbol::LParen) => {
                 if self.at_symbol(Symbol::RParen) {
                     self.bump();
@@ -923,6 +1236,359 @@ impl Parser {
                 None
             }
         }
+    }
+
+    fn parse_colon_inline_asm_expr(&mut self) -> Option<Expr> {
+        let start = self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        });
+        if !self.at_ident("asm") {
+            self.error_here("expected `asm`");
+            return None;
+        }
+        self.bump();
+
+        let mut is_volatile = false;
+        let mut is_goto = false;
+        let mut saw_qual = false;
+        loop {
+            if self.at_ident("volatile") {
+                is_volatile = true;
+                saw_qual = true;
+                self.bump();
+                continue;
+            }
+            if self.at_ident("goto") {
+                is_goto = true;
+                saw_qual = true;
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        if !saw_qual {
+            self.error_here("expected `volatile` or `goto` after asm");
+            return None;
+        }
+
+        self.expect_symbol(Symbol::LParen);
+        let template_raw = match self.parse_string_lit() {
+            Some(s) => s,
+            None => {
+                self.error_here("asm template must be string literal");
+                return None;
+            }
+        };
+
+        let mut outputs: Vec<(Option<String>, String, Expr)> = Vec::new();
+        let mut inputs: Vec<(Option<String>, String, Expr)> = Vec::new();
+        let mut clobbers: Vec<String> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+
+        if self.at_symbol(Symbol::Colon) {
+            self.bump();
+            outputs = self.parse_colon_asm_operand_section()?;
+            if self.at_symbol(Symbol::Colon) {
+                self.bump();
+                inputs = self.parse_colon_asm_operand_section()?;
+            }
+            if self.at_symbol(Symbol::Colon) {
+                self.bump();
+                clobbers = self.parse_colon_asm_clobber_section()?;
+            }
+            if self.at_symbol(Symbol::Colon) {
+                self.bump();
+                labels = self.parse_colon_asm_label_section()?;
+            }
+        }
+
+        self.expect_symbol(Symbol::RParen);
+
+        let mut operand_names: Vec<Option<String>> = Vec::with_capacity(outputs.len() + inputs.len());
+        for (name, _, _) in &outputs {
+            operand_names.push(name.clone());
+        }
+        for (name, _, _) in &inputs {
+            operand_names.push(name.clone());
+        }
+        let operand_count = operand_names.len();
+        let rewritten_template = rewrite_gcc_asm_template(
+            &template_raw,
+            &labels,
+            &operand_names,
+            operand_count,
+        );
+        let mut constraints =
+            build_asm_constraints(&outputs, &inputs, &clobbers);
+        if is_goto || !labels.is_empty() {
+            for _ in 0..labels.len() {
+                if !constraints.is_empty() {
+                    constraints.push(',');
+                }
+                constraints.push_str("!i");
+            }
+            let mut args = Vec::new();
+            args.push(self.new_expr(
+                ExprKind::String(rewritten_template),
+                start.clone(),
+            ));
+            args.push(self.new_expr(
+                ExprKind::String(constraints),
+                start.clone(),
+            ));
+            args.push(self.new_expr(
+                ExprKind::String(labels.join(",")),
+                start.clone(),
+            ));
+            for (_, _, expr) in &outputs {
+                args.push(expr.clone());
+            }
+            for (_, _, expr) in &inputs {
+                args.push(expr.clone());
+            }
+            let callee = self.new_expr(ExprKind::Ident("asm_goto".to_string()), start.clone());
+            let call_expr = self.new_expr(
+                ExprKind::Call {
+                    callee: Box::new(callee),
+                    type_args: Vec::new(),
+                    args,
+                },
+                start.clone(),
+            );
+            return Some(self.lower_colon_asm_outputs(call_expr, &outputs, &start));
+        }
+
+        let mut call_args = Vec::new();
+        call_args.push(self.new_expr(
+            ExprKind::String(rewritten_template),
+            start.clone(),
+        ));
+        call_args.push(self.new_expr(
+            ExprKind::String(constraints),
+            start.clone(),
+        ));
+        for (_, _, expr) in &outputs {
+            call_args.push(expr.clone());
+        }
+        for (_, _, expr) in &inputs {
+            call_args.push(expr.clone());
+        }
+        let callee_name = if is_volatile {
+            "asm_volatile"
+        } else {
+            "asm"
+        };
+        let callee = self.new_expr(ExprKind::Ident(callee_name.to_string()), start.clone());
+
+        if outputs.is_empty() {
+            let unit_type = TypeAst {
+                kind: TypeAstKind::Named("unit".to_string()),
+                span: start.clone(),
+            };
+            return Some(self.new_expr(
+                ExprKind::Call {
+                    callee: Box::new(callee),
+                    type_args: vec![unit_type],
+                    args: call_args,
+                },
+                start,
+            ));
+        }
+        let call_expr = self.new_expr(
+            ExprKind::Call {
+                callee: Box::new(callee),
+                type_args: Vec::new(),
+                args: call_args,
+            },
+            start.clone(),
+        );
+        Some(self.lower_colon_asm_outputs(call_expr, &outputs, &start))
+    }
+
+    fn lower_colon_asm_outputs(
+        &mut self,
+        call_expr: Expr,
+        outputs: &[(Option<String>, String, Expr)],
+        span: &Span,
+    ) -> Expr {
+        if outputs.is_empty() {
+            return call_expr;
+        }
+        if outputs.len() == 1 {
+            let assign = Stmt::Assign {
+                target: outputs[0].2.clone(),
+                value: call_expr,
+                span: span.clone(),
+            };
+            let block = Block {
+                stmts: vec![assign],
+                tail: None,
+                span: span.clone(),
+            };
+            return self.new_expr(ExprKind::Block(Box::new(block)), span.clone());
+        }
+        let tmp_name = format!("__asm_out_{}_{}", span.start, self.next_expr_id);
+        let mut stmts = vec![Stmt::Let {
+            name: tmp_name.clone(),
+            ty: None,
+            init: call_expr,
+            span: span.clone(),
+        }];
+        for (idx, (_, _, target)) in outputs.iter().enumerate() {
+            let base = self.new_expr(ExprKind::Ident(tmp_name.clone()), span.clone());
+            let index = self.new_expr(ExprKind::Int(idx.to_string()), span.clone());
+            let value = self.new_expr(
+                ExprKind::Index {
+                    base: Box::new(base),
+                    index: Box::new(index),
+                },
+                span.clone(),
+            );
+            stmts.push(Stmt::Assign {
+                target: target.clone(),
+                value,
+                span: span.clone(),
+            });
+        }
+        let block = Block {
+            stmts,
+            tail: None,
+            span: span.clone(),
+        };
+        self.new_expr(ExprKind::Block(Box::new(block)), span.clone())
+    }
+
+    fn parse_colon_asm_operand_section(&mut self) -> Option<Vec<(Option<String>, String, Expr)>> {
+        let mut items = Vec::new();
+        if self.at_symbol(Symbol::Colon) || self.at_symbol(Symbol::RParen) {
+            return Some(items);
+        }
+        loop {
+            let mut name: Option<String> = None;
+            if self.at_symbol(Symbol::LBracket) {
+                self.bump();
+                match self.bump().kind {
+                    TokenKind::Ident(s) => name = Some(s),
+                    _ => {
+                        self.error_here("expected asm operand name");
+                        return None;
+                    }
+                }
+                self.expect_symbol(Symbol::RBracket);
+            }
+            let constraint = match self.parse_string_lit() {
+                Some(s) => s,
+                None => {
+                    self.error_here("expected asm operand constraint string");
+                    return None;
+                }
+            };
+            self.expect_symbol(Symbol::LParen);
+            let expr = self.parse_expr()?;
+            self.expect_symbol(Symbol::RParen);
+            items.push((name, constraint, expr));
+            if self.at_symbol(Symbol::Comma) {
+                self.bump();
+                if self.at_symbol(Symbol::Colon) || self.at_symbol(Symbol::RParen) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Some(items)
+    }
+
+    fn parse_colon_asm_clobber_section(&mut self) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        if self.at_symbol(Symbol::Colon) || self.at_symbol(Symbol::RParen) {
+            return Some(out);
+        }
+        loop {
+            let clobber = match self.parse_string_lit() {
+                Some(s) => s,
+                None => {
+                    self.error_here("expected asm clobber string");
+                    return None;
+                }
+            };
+            out.push(clobber);
+            if self.at_symbol(Symbol::Comma) {
+                self.bump();
+                if self.at_symbol(Symbol::Colon) || self.at_symbol(Symbol::RParen) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    fn parse_colon_asm_label_section(&mut self) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        if self.at_symbol(Symbol::RParen) {
+            return Some(out);
+        }
+        loop {
+            let label = match self.bump().kind {
+                TokenKind::Ident(s) => s,
+                _ => {
+                    self.error_here("expected asm goto label");
+                    return None;
+                }
+            };
+            out.push(label);
+            if self.at_symbol(Symbol::Comma) {
+                self.bump();
+                if self.at_symbol(Symbol::RParen) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    fn parse_struct_lit(&mut self, name: String, start_span: Span) -> Option<Expr> {
+        let _lbrace = self.expect_symbol(Symbol::LBrace);
+        let mut fields: Vec<(String, Expr)> = Vec::new();
+        while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
+            let field_name = match self.bump().kind {
+                TokenKind::Ident(n) => n,
+                _ => {
+                    self.error_here("expected field name");
+                    return None;
+                }
+            };
+            self.expect_symbol(Symbol::Eq);
+            let expr = self.parse_expr()?;
+            fields.push((field_name, expr));
+            if self.at_symbol(Symbol::Comma) {
+                self.bump();
+                if self.at_symbol(Symbol::RBrace) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        let rbrace_span = self.peek_span().unwrap_or(start_span.clone());
+        self.expect_symbol(Symbol::RBrace);
+        let span = Span {
+            start: start_span.start,
+            end: rbrace_span.end,
+            line: start_span.line,
+            column: start_span.column,
+        };
+        Some(self.new_expr(
+            ExprKind::StructLit { name, fields },
+            span,
+        ))
     }
 
     fn parse_type_args(&mut self) -> Option<Vec<TypeAst>> {
@@ -1047,6 +1713,53 @@ impl Parser {
                 span,
             });
         }
+        if self.at_keyword(Keyword::Fn) {
+            self.bump();
+            self.expect_symbol(Symbol::LParen);
+            let mut params = Vec::new();
+            let mut is_variadic = false;
+            if !self.at_symbol(Symbol::RParen) {
+                loop {
+                    if self.at_variadic_marker() {
+                        self.consume_variadic_marker();
+                        is_variadic = true;
+                        break;
+                    }
+                    params.push(self.parse_type()?);
+                    if self.at_symbol(Symbol::Comma) {
+                        self.bump();
+                        if self.at_symbol(Symbol::RParen) {
+                            break;
+                        }
+                        if self.at_variadic_marker() {
+                            self.consume_variadic_marker();
+                            is_variadic = true;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect_symbol(Symbol::RParen);
+            let ret = if self.at_symbol(Symbol::Arrow) {
+                self.bump();
+                self.parse_type()?
+            } else {
+                TypeAst {
+                    kind: TypeAstKind::Named("unit".to_string()),
+                    span: span.clone(),
+                }
+            };
+            return Some(TypeAst {
+                kind: TypeAstKind::FnPtr {
+                    params,
+                    ret: Box::new(ret),
+                    is_variadic,
+                },
+                span,
+            });
+        }
         if self.at_ident("ref") {
             self.bump();
             self.expect_symbol(Symbol::LBracket);
@@ -1164,8 +1877,38 @@ impl Parser {
         )
     }
 
+    fn peek_is_ident(&self, name: &str) -> bool {
+        matches!(
+            self.tokens.get(self.idx + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(s)) if s == name
+        )
+    }
+
     fn at_ident(&self, name: &str) -> bool {
         matches!(self.peek().kind, TokenKind::Ident(ref s) if s == name)
+    }
+
+    fn at_variadic_marker(&self) -> bool {
+        matches!(
+            self.tokens.get(self.idx).map(|t| &t.kind),
+            Some(TokenKind::Symbol(Symbol::Dot))
+        ) && matches!(
+            self.tokens.get(self.idx + 1).map(|t| &t.kind),
+            Some(TokenKind::Symbol(Symbol::Dot))
+        ) && matches!(
+            self.tokens.get(self.idx + 2).map(|t| &t.kind),
+            Some(TokenKind::Symbol(Symbol::Dot))
+        )
+    }
+
+    fn consume_variadic_marker(&mut self) {
+        if self.at_variadic_marker() {
+            self.bump();
+            self.bump();
+            self.bump();
+        } else {
+            self.error_here("expected `...`");
+        }
     }
 
     fn is_builtin_generic_callee(&self, expr: &Expr) -> bool {
@@ -1189,6 +1932,9 @@ impl Parser {
                     | "map_set"
                     | "map_del"
                     | "map_len"
+                    | "asm"
+                    | "asm_pure"
+                    | "asm_volatile"
             ),
             ExprKind::Field { base, name } => {
                 if let ExprKind::Ident(base_name) = &base.kind {
@@ -1251,4 +1997,125 @@ impl Parser {
         };
         Some(op)
     }
+}
+
+fn normalize_clobber_constraint(clobber: &str) -> String {
+    let mut raw = clobber.trim().to_string();
+    if raw.starts_with("~{") && raw.ends_with('}') {
+        return raw;
+    }
+    if raw.starts_with('%') {
+        raw = raw[1..].to_string();
+    }
+    format!("~{{{}}}", raw)
+}
+
+fn build_asm_constraints(
+    outputs: &[(Option<String>, String, Expr)],
+    inputs: &[(Option<String>, String, Expr)],
+    clobbers: &[String],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (_, c, _) in outputs {
+        parts.push(c.clone());
+    }
+    for (_, c, _) in inputs {
+        parts.push(c.clone());
+    }
+    for c in clobbers {
+        parts.push(normalize_clobber_constraint(c));
+    }
+    parts.join(",")
+}
+
+fn rewrite_gcc_asm_template(
+    template: &str,
+    labels: &[String],
+    operand_names: &[Option<String>],
+    operand_count: usize,
+) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= chars.len() {
+            out.push('%');
+            break;
+        }
+        let next = chars[i + 1];
+        if next == '%' {
+            out.push('%');
+            i += 2;
+            continue;
+        }
+        if next == 'l' {
+            let mut j = i + 2;
+            if j < chars.len() && chars[j] == '[' {
+                j += 1;
+                let name_start = j;
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ']' {
+                    let name: String = chars[name_start..j].iter().collect();
+                    if let Some(idx) = labels.iter().position(|s| s == &name) {
+                        out.push_str(&format!("${{{}:l}}", operand_count + idx));
+                    } else {
+                        out.push_str(&format!("%l[{}]", name));
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            let digit_start = j;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digit_start {
+                let num: String = chars[digit_start..j].iter().collect();
+                let idx = num.parse::<usize>().unwrap_or(0);
+                out.push_str(&format!("${{{}:l}}", operand_count + idx));
+                i = j;
+                continue;
+            }
+        }
+        if next == '[' {
+            let mut j = i + 2;
+            let name_start = j;
+            while j < chars.len() && chars[j] != ']' {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ']' {
+                let name: String = chars[name_start..j].iter().collect();
+                if let Some(idx) = operand_names
+                    .iter()
+                    .position(|opt| opt.as_deref() == Some(name.as_str()))
+                {
+                    out.push('$');
+                    out.push_str(&idx.to_string());
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        if next.is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let num: String = chars[i + 1..j].iter().collect();
+            out.push('$');
+            out.push_str(&num);
+            i = j;
+            continue;
+        }
+        out.push('%');
+        i += 1;
+    }
+    out
 }

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use crate::frontend::ast::{Block, Expr, ExprId, ExprKind, Stmt, TypeAst};
 use crate::mir::{MirStmt, Terminator};
-use crate::sema::FunctionSig;
+use crate::sema::{ExternGlobalSig, FunctionSig};
 use crate::sema::types::{builtin_from_name, BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
 
 use super::{
-    is_float_type, llvm_storage_type, llvm_type, llvm_type_for_tuple_elem, zero_value,
+    is_float_type, llvm_call_conv, llvm_storage_type, llvm_type, llvm_type_for_tuple_elem,
+    zero_value,
 };
 
 #[derive(Clone)]
@@ -19,6 +20,72 @@ pub(crate) struct BlockInsts {
     pub(crate) name: String,
     pub(crate) instrs: Vec<String>,
     pub(crate) terminated: bool,
+}
+
+fn escape_llvm_inline_asm(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\{:02X}", b));
+        }
+    }
+    out
+}
+
+fn is_asm_label_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr { expr, .. } => match &expr.kind {
+            ExprKind::Call { callee, .. } => {
+                matches!(&callee.kind, ExprKind::Ident(name) if name == "asm_label")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsmOutputKind {
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AsmConstraintSpec {
+    outputs: Vec<AsmOutputKind>,
+    readwrite_outputs: usize,
+    input_count: usize,
+    label_count: usize,
+}
+
+fn parse_asm_constraint_spec(raw: &str) -> AsmConstraintSpec {
+    let mut spec = AsmConstraintSpec::default();
+    for item in raw.split(',') {
+        let c = item.trim();
+        if c.is_empty() {
+            continue;
+        }
+        if c == "!i" {
+            spec.label_count += 1;
+            continue;
+        }
+        if c.starts_with("~{") {
+            continue;
+        }
+        if c.starts_with('=') {
+            spec.outputs.push(AsmOutputKind::WriteOnly);
+            continue;
+        }
+        if c.starts_with('+') {
+            spec.outputs.push(AsmOutputKind::ReadWrite);
+            spec.readwrite_outputs += 1;
+            continue;
+        }
+        spec.input_count += 1;
+    }
+    spec
 }
 
 #[derive(Clone)]
@@ -46,6 +113,7 @@ struct LoopFrame {
 pub(crate) struct FnEmitter<'a> {
     fn_name: String,
     fn_sigs: &'a HashMap<String, FunctionSig>,
+    extern_globals: &'a HashMap<String, ExternGlobalSig>,
     types: &'a TypeDefs,
     ret_type: Type,
     pub(crate) blocks: Vec<BlockInsts>,
@@ -63,6 +131,7 @@ pub(crate) struct FnEmitter<'a> {
     go_counter: usize,
     drop_counter: usize,
     linear_states: HashMap<String, bool>,
+    asm_labels: HashMap<String, usize>,
     mir_mode: bool,
     mir_local_ptrs: Vec<Option<MirLocalInfo>>,
     mir_expr_types: HashMap<ExprId, Type>,
@@ -72,6 +141,7 @@ impl<'a> FnEmitter<'a> {
     pub(crate) fn new(
         fn_name: impl Into<String>,
         fn_sigs: &'a HashMap<String, FunctionSig>,
+        extern_globals: &'a HashMap<String, ExternGlobalSig>,
         types: &'a TypeDefs,
         ret_type: Type,
     ) -> Self {
@@ -83,6 +153,7 @@ impl<'a> FnEmitter<'a> {
         Self {
             fn_name: fn_name.into(),
             fn_sigs,
+            extern_globals,
             types,
             ret_type,
             blocks: vec![entry],
@@ -100,6 +171,7 @@ impl<'a> FnEmitter<'a> {
             go_counter: 0,
             drop_counter: 0,
             linear_states: HashMap::new(),
+            asm_labels: HashMap::new(),
             mir_mode: false,
             mir_local_ptrs: Vec::new(),
             mir_expr_types: HashMap::new(),
@@ -234,9 +306,18 @@ impl<'a> FnEmitter<'a> {
 
     pub(crate) fn emit_block(&mut self, block: &Block) -> Result<Option<Value>, String> {
         self.enter_scope();
-        for stmt in &block.stmts {
-            self.emit_stmt(stmt)?;
+        let mut idx = 0usize;
+        while idx < block.stmts.len() {
+            self.emit_stmt(&block.stmts[idx])?;
+            idx += 1;
             if self.current_block_terminated() {
+                while idx < block.stmts.len() && is_asm_label_stmt(&block.stmts[idx]) {
+                    self.emit_stmt(&block.stmts[idx])?;
+                    idx += 1;
+                }
+                if !self.current_block_terminated() {
+                    continue;
+                }
                 if let Some(depth) = self.pending_exit_depth.take() {
                     self.exit_scopes_to(depth)?;
                 } else {
@@ -262,15 +343,7 @@ impl<'a> FnEmitter<'a> {
         match stmt {
             Stmt::Let { name, init, .. } => {
                 let value = self.emit_expr(init)?;
-                if let ExprKind::Call { callee, .. } = &init.kind {
-                    if let ExprKind::Ident(callee_name) = &callee.kind {
-                        if callee_name != "shared_new" {
-                            self.emit_shared_inc_value(&value)?;
-                        }
-                    } else {
-                        self.emit_shared_inc_value(&value)?;
-                    }
-                } else {
+                if !self.is_rc_fresh_expr(init) {
                     self.emit_shared_inc_value(&value)?;
                 }
                 let alloca = self.new_temp();
@@ -314,16 +387,12 @@ impl<'a> FnEmitter<'a> {
                     }
                 }
                 let val = self.emit_expr(value)?;
-                if let ExprKind::Call { callee, .. } = &value.kind {
-                    if let ExprKind::Ident(callee_name) = &callee.kind {
-                        if callee_name != "shared_new" {
-                            self.emit_shared_inc_value(&val)?;
-                        }
-                    } else {
-                        self.emit_shared_inc_value(&val)?;
-                    }
-                } else {
+                if !self.is_rc_fresh_expr(value) {
                     self.emit_shared_inc_value(&val)?;
+                }
+                let mut val = val;
+                if target_ty != val.ty && self.is_int_type(&target_ty) && self.is_int_type(&val.ty) {
+                    val = self.cast_int_value(val, &target_ty)?;
                 }
                 if target_ty != Type::Builtin(BuiltinType::Unit) {
                     self.emit(format!(
@@ -353,6 +422,9 @@ impl<'a> FnEmitter<'a> {
             }
             Stmt::ForIn { name, iter, body, .. } => {
                 self.emit_for_in_stmt(name, iter, body)?;
+            }
+            Stmt::While { .. } | Stmt::Loop { .. } => {
+                return Err("while/loop must be lowered to MIR CFG before codegen".to_string());
             }
             Stmt::Select { arms, .. } => {
                 self.emit_select_stmt(arms)?;
@@ -564,6 +636,32 @@ impl<'a> FnEmitter<'a> {
                         self.mark_moved(name);
                     }
                     Ok(Value { ty, ir: tmp })
+                } else if let Some(sig) = self.fn_sigs.get(name) {
+                    Ok(Value {
+                        ty: Type::FnPtr {
+                            params: sig.params.clone(),
+                            ret: Box::new(sig.ret.clone()),
+                            is_variadic: sig.is_variadic,
+                        },
+                        ir: format!("@{}", name),
+                    })
+                } else if let Some(global) = self.extern_globals.get(name) {
+                    let ty = global.ty.clone();
+                    if ty == Type::Builtin(BuiltinType::Unit) {
+                        return Ok(Value {
+                            ty,
+                            ir: String::new(),
+                        });
+                    }
+                    let tmp = self.new_temp();
+                    self.emit(format!(
+                        "{} = load {}, {}* @{}",
+                        tmp,
+                        llvm_type(&ty)?,
+                        llvm_type(&ty)?,
+                        name
+                    ));
+                    Ok(Value { ty, ir: tmp })
                 } else {
                     let block_name = self
                         .blocks
@@ -576,12 +674,56 @@ impl<'a> FnEmitter<'a> {
                     ))
                 }
             }
+            ExprKind::StructLit { name, fields } => {
+                let def = match self.types.get(name) {
+                    Some(TypeDefKind::Struct(def)) => def,
+                    _ => return Err(format!("unknown struct {}", name)),
+                };
+                let mut map: HashMap<String, &Expr> = HashMap::new();
+                for (fname, fexpr) in fields.iter() {
+                    map.insert(fname.clone(), fexpr);
+                }
+                let struct_ty = Type::Named(name.clone());
+                let llvm_struct = llvm_type(&struct_ty)?;
+                let mut cur = "undef".to_string();
+                let mut have_any = false;
+                for (idx, (field_name, field_ty)) in def.fields.iter().enumerate() {
+                    let fexpr = map
+                        .get(field_name)
+                        .ok_or_else(|| format!("missing field {} in {}", field_name, name))?;
+                    let val = self.emit_expr(fexpr)?;
+                    if !self.is_rc_fresh_expr(fexpr) {
+                        self.emit_shared_inc_value(&val)?;
+                    }
+                    let val_ir = if val.ty == Type::Builtin(BuiltinType::Unit) {
+                        "0".to_string()
+                    } else {
+                        val.ir.clone()
+                    };
+                    let base = if have_any { cur.clone() } else { "undef".to_string() };
+                    let tmp = self.new_temp();
+                    self.emit(format!(
+                        "{} = insertvalue {} {}, {} {}, {}",
+                        tmp,
+                        llvm_struct,
+                        base,
+                        llvm_type(field_ty)?,
+                        val_ir,
+                        idx
+                    ));
+                    cur = tmp;
+                    have_any = true;
+                }
+                Ok(Value { ty: struct_ty, ir: cur })
+            }
             ExprKind::Tuple(items) => {
                 let mut values = Vec::new();
                 let mut tys = Vec::new();
                 for item in items {
                     let val = self.emit_expr(item)?;
-                    self.emit_shared_inc_value(&val)?;
+                    if !self.is_rc_fresh_expr(item) {
+                        self.emit_shared_inc_value(&val)?;
+                    }
                     tys.push(val.ty.clone());
                     values.push(val);
                 }
@@ -688,6 +830,13 @@ impl<'a> FnEmitter<'a> {
                 })
             }
             ExprKind::Block(block) => {
+                let value = self.emit_block(block)?;
+                Ok(value.unwrap_or(Value {
+                    ty: Type::Builtin(BuiltinType::Unit),
+                    ir: String::new(),
+                }))
+            }
+            ExprKind::UnsafeBlock(block) => {
                 let value = self.emit_block(block)?;
                 Ok(value.unwrap_or(Value {
                     ty: Type::Builtin(BuiltinType::Unit),
@@ -1062,19 +1211,40 @@ impl<'a> FnEmitter<'a> {
                         }
                     }
                 }
-                let name = match &callee.kind {
-                    ExprKind::Ident(name) => name.clone(),
-                    _ => return Err("only direct calls are supported".to_string()),
-                };
+                if let ExprKind::Ident(name) = &callee.kind {
+                    if name == "asm" || name == "asm_pure" || name == "asm_volatile" {
+                        return self.emit_inline_asm_call(name, type_args, args);
+                    }
+                    if name == "asm_label" {
+                        return self.emit_inline_asm_label(args);
+                    }
+                    if name == "asm_goto" {
+                        return self.emit_inline_asm_goto_call(type_args, args);
+                    }
+                }
                 let mut resolved_args = Vec::new();
                 for arg in args {
                     resolved_args.push(self.emit_expr(arg)?);
                 }
-                let mut resolved_types = Vec::new();
-                for arg in type_args {
-                    resolved_types.push(self.resolve_type_ast(arg)?);
+                if let ExprKind::Ident(name) = &callee.kind {
+                    if self.locals.contains_key(name) || self.extern_globals.contains_key(name) {
+                        if !type_args.is_empty() {
+                            return Err("type arguments not supported for indirect calls".to_string());
+                        }
+                        let callee_val = self.emit_expr(callee)?;
+                        return self.emit_call_ptr(callee_val, resolved_args);
+                    }
+                    let mut resolved_types = Vec::new();
+                    for arg in type_args {
+                        resolved_types.push(self.resolve_type_ast(arg)?);
+                    }
+                    return self.emit_call_by_name(name, &resolved_types, resolved_args);
                 }
-                self.emit_call_by_name(&name, &resolved_types, resolved_args)
+                if !type_args.is_empty() {
+                    return Err("type arguments not supported for indirect calls".to_string());
+                }
+                let callee_val = self.emit_expr(callee)?;
+                self.emit_call_ptr(callee_val, resolved_args)
             }
             ExprKind::Borrow { is_mut, expr: inner } => {
                 let (ty, ptr) = self.emit_place_ptr(inner)?;
@@ -1395,6 +1565,37 @@ impl<'a> FnEmitter<'a> {
                 Ok(val)
             }
             ExprKind::Index { .. } => {
+                if let ExprKind::Index { base, index } = &expr.kind {
+                    let base_val = self.emit_expr(base)?;
+                    if let Type::Tuple(items) = &base_val.ty {
+                        let idx = match &index.kind {
+                            ExprKind::Int(v) => v.parse::<usize>().ok(),
+                            _ => None,
+                        }
+                        .ok_or_else(|| "tuple index must be integer literal".to_string())?;
+                        let elem_ty = items
+                            .get(idx)
+                            .cloned()
+                            .ok_or_else(|| "tuple index out of bounds".to_string())?;
+                        if elem_ty == Type::Builtin(BuiltinType::Unit) {
+                            return Ok(Value {
+                                ty: elem_ty,
+                                ir: String::new(),
+                            });
+                        }
+                        let tmp = self.new_temp();
+                        self.emit(format!(
+                            "{} = extractvalue {} {}, {}",
+                            tmp,
+                            llvm_type(&base_val.ty)?,
+                            base_val.ir,
+                            idx
+                        ));
+                        let val = Value { ty: elem_ty, ir: tmp };
+                        self.emit_shared_inc_value(&val)?;
+                        return Ok(val);
+                    }
+                }
                 let (elem_ty, elem_ptr) = self.emit_place_ptr(expr)?;
                 if elem_ty == Type::Builtin(BuiltinType::Unit) {
                     return Ok(Value {
@@ -1440,8 +1641,13 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             ExprKind::Binary { op, left, right } => {
-                let lhs = self.emit_expr(left)?;
-                let rhs = self.emit_expr(right)?;
+                let lhs0 = self.emit_expr(left)?;
+                let rhs0 = self.emit_expr(right)?;
+                let (lhs, rhs) = if self.is_int_type(&lhs0.ty) && self.is_int_type(&rhs0.ty) {
+                    self.coerce_int_pair(lhs0, rhs0)?
+                } else {
+                    (lhs0, rhs0)
+                };
                 if is_float_type(&lhs.ty) {
                     let tmp = self.new_temp();
                     let instr = match op {
@@ -1535,6 +1741,131 @@ impl<'a> FnEmitter<'a> {
             return Ok(Value {
                 ty: Type::Builtin(BuiltinType::Unit),
                 ir: String::new(),
+            });
+        }
+        if name == "string_len" {
+            if !type_args.is_empty() {
+                return Err("string_len does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("string_len expects one argument".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String) {
+                return Err("string_len expects string".to_string());
+            }
+            let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i64 @__gost_string_len(i8* {}, i64 {})",
+                tmp, s_ptr, s_len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I64),
+                ir: tmp,
+            });
+        }
+        if name == "string_get" {
+            if !type_args.is_empty() {
+                return Err("string_get does not take type arguments".to_string());
+            }
+            if args.len() != 2 {
+                return Err("string_get expects two arguments".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String) {
+                return Err("string_get expects string as first argument".to_string());
+            }
+            let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let idx_ir = self.emit_index_i64(&args[1])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_string_get(i8* {}, i64 {}, i64 {})",
+                tmp, s_ptr, s_len, idx_ir
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "string_slice" {
+            if !type_args.is_empty() {
+                return Err("string_slice does not take type arguments".to_string());
+            }
+            if args.len() != 3 {
+                return Err("string_slice expects three arguments".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String) {
+                return Err("string_slice expects string as first argument".to_string());
+            }
+            let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let start_ir = self.emit_index_i64(&args[1])?;
+            let len_ir = self.emit_index_i64(&args[2])?;
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!(
+                "call void @__gost_string_slice(%string* {}, i8* {}, i64 {}, i64 {}, i64 {})",
+                out_ptr, s_ptr, s_len, start_ir, len_ir
+            ));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
+            });
+        }
+        if name == "string_concat" {
+            if !type_args.is_empty() {
+                return Err("string_concat does not take type arguments".to_string());
+            }
+            if args.len() != 2 {
+                return Err("string_concat expects two arguments".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String)
+                || args[1].ty != Type::Builtin(BuiltinType::String)
+            {
+                return Err("string_concat expects string arguments".to_string());
+            }
+            let (a_ptr, a_len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let (b_ptr, b_len) = self.emit_string_ptr_len_from_value(&args[1])?;
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!(
+                "call void @__gost_string_concat(%string* {}, i8* {}, i64 {}, i8* {}, i64 {})",
+                out_ptr, a_ptr, a_len, b_ptr, b_len
+            ));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
+            });
+        }
+        if name == "string_from_byte" {
+            if !type_args.is_empty() {
+                return Err("string_from_byte does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("string_from_byte expects one argument".to_string());
+            }
+            let b_ir = match args[0].ty {
+                Type::Builtin(BuiltinType::I32) => args[0].ir.clone(),
+                Type::Builtin(BuiltinType::I64) => {
+                    let tmp = self.new_temp();
+                    self.emit(format!("{} = trunc i64 {} to i32", tmp, args[0].ir));
+                    tmp
+                }
+                _ => return Err("string_from_byte expects i32 byte value".to_string()),
+            };
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!(
+                "call void @__gost_string_from_byte(%string* {}, i32 {})",
+                out_ptr, b_ir
+            ));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
             });
         }
         if name == "make_chan" {
@@ -1645,7 +1976,7 @@ impl<'a> FnEmitter<'a> {
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
             let elem_ptr = self.emit_slice_elem_ptr(&slice_obj, &elem_ty, &args[1], true)?;
             let storage_ty = llvm_storage_type(&elem_ty)?;
-            if matches!(elem_ty, Type::Shared(_)) {
+            if matches!(elem_ty, Type::Shared(_) | Type::Chan(_)) {
                 self.emit_shared_inc_value(&args[2])?;
             }
             self.emit(format!(
@@ -1698,20 +2029,32 @@ impl<'a> FnEmitter<'a> {
         }
         if name == "__gost_select_wait" {
             let tmp = self.new_temp();
-            if args.is_empty() {
+            let mut chan_args: Vec<&Value> = Vec::new();
+            let mut op_args: Vec<&Value> = Vec::new();
+            for arg in args.iter() {
+                if matches!(arg.ty, Type::Chan(_)) {
+                    chan_args.push(arg);
+                } else if arg.ty == Type::Builtin(BuiltinType::I32) {
+                    op_args.push(arg);
+                } else {
+                    return Err("__gost_select_wait expects chan[T] and i32 op arguments".to_string());
+                }
+            }
+
+            if chan_args.is_empty() {
                 self.emit(format!(
-                    "{} = call i32 @__gost_select_wait(%chan** null, i32 0)",
+                    "{} = call i32 @__gost_select_wait(%chan** null, i32* null, i32 0)",
                     tmp
                 ));
             } else {
-                let arr_len = args.len();
+                if !op_args.is_empty() && op_args.len() != chan_args.len() {
+                    return Err("__gost_select_wait expects one op per channel".to_string());
+                }
+                let arr_len = chan_args.len();
                 let arr_ty = format!("[{} x %chan*]", arr_len);
                 let arr_ptr = self.new_temp();
                 self.emit(format!("{} = alloca {}", arr_ptr, arr_ty));
-                for (i, arg) in args.iter().enumerate() {
-                    if !matches!(arg.ty, Type::Chan(_)) {
-                        return Err("__gost_select_wait expects chan[T] arguments".to_string());
-                    }
+                for (i, arg) in chan_args.iter().enumerate() {
                     let slot = self.new_temp();
                     self.emit(format!(
                         "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
@@ -1724,9 +2067,30 @@ impl<'a> FnEmitter<'a> {
                     "{} = bitcast {}* {} to %chan**",
                     cast_ptr, arr_ty, arr_ptr
                 ));
+                let op_ptr = if op_args.is_empty() {
+                    "null".to_string()
+                } else {
+                    let op_arr_ty = format!("[{} x i32]", arr_len);
+                    let op_arr_ptr = self.new_temp();
+                    self.emit(format!("{} = alloca {}", op_arr_ptr, op_arr_ty));
+                    for (i, op) in op_args.iter().enumerate() {
+                        let slot = self.new_temp();
+                        self.emit(format!(
+                            "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
+                            slot, op_arr_ty, op_arr_ty, op_arr_ptr, i
+                        ));
+                        self.emit(format!("store i32 {}, i32* {}", op.ir, slot));
+                    }
+                    let cast_op_ptr = self.new_temp();
+                    self.emit(format!(
+                        "{} = bitcast {}* {} to i32*",
+                        cast_op_ptr, op_arr_ty, op_arr_ptr
+                    ));
+                    cast_op_ptr
+                };
                 self.emit(format!(
-                    "{} = call i32 @__gost_select_wait(%chan** {}, i32 {})",
-                    tmp, cast_ptr, arr_len
+                    "{} = call i32 @__gost_select_wait(%chan** {}, i32* {}, i32 {})",
+                    tmp, cast_ptr, op_ptr, arr_len
                 ));
             }
             return Ok(Value {
@@ -1756,6 +2120,300 @@ impl<'a> FnEmitter<'a> {
             ));
             return Ok(Value {
                 ty: Type::Builtin(BuiltinType::Error),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_singleton_acquire" {
+            if !type_args.is_empty() {
+                return Err("__gost_singleton_acquire does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_singleton_acquire expects 1 argument".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String) {
+                return Err("__gost_singleton_acquire expects string name".to_string());
+            }
+            let (ptr, len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_singleton_acquire(i8* {}, i64 {})",
+                tmp, ptr, len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_last_status" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_last_status does not take type arguments".to_string());
+            }
+            if !args.is_empty() {
+                return Err("__gost_net_last_status expects 0 arguments".to_string());
+            }
+            let tmp = self.new_temp();
+            self.emit(format!("{} = call i32 @__gost_net_last_status()", tmp));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_last_http_status" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_last_http_status does not take type arguments".to_string());
+            }
+            if !args.is_empty() {
+                return Err("__gost_net_last_http_status expects 0 arguments".to_string());
+            }
+            let tmp = self.new_temp();
+            self.emit(format!("{} = call i32 @__gost_net_last_http_status()", tmp));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_last_error" || name == "__gost_net_last_peer" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_last_error does not take type arguments".to_string());
+            }
+            if !args.is_empty() {
+                return Err("__gost_net_last_error expects 0 arguments".to_string());
+            }
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!("call void @{}(%string* {})", name, out_ptr));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_tcp_listen"
+            || name == "__gost_net_tcp_connect"
+            || name == "__gost_net_udp_bind"
+            || name == "__gost_net_udp_connect"
+            || name == "__gost_net_ws_connect"
+        {
+            if !type_args.is_empty() {
+                return Err("__gost_net_* does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_net_* expects 1 argument".to_string());
+            }
+            if args[0].ty != Type::Builtin(BuiltinType::String) {
+                return Err("__gost_net_* expects string address".to_string());
+            }
+            let (ptr, len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i64 @{}(i8* {}, i64 {})",
+                tmp, name, ptr, len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I64),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_tcp_accept" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_tcp_accept does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_net_tcp_accept expects 1 argument".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i64 @__gost_net_tcp_accept(i64 {})",
+                tmp, handle
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I64),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_tcp_close" || name == "__gost_net_udp_close" || name == "__gost_net_ws_close" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_*_close does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_net_*_close expects 1 argument".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let tmp = self.new_temp();
+            self.emit(format!("{} = call i32 @{}(i64 {})", tmp, name, handle));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_ws_send_text" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_ws_send_text does not take type arguments".to_string());
+            }
+            if args.len() != 2 {
+                return Err("__gost_net_ws_send_text expects 2 arguments".to_string());
+            }
+            if args[1].ty != Type::Builtin(BuiltinType::String) {
+                return Err("__gost_net_ws_send_text expects string payload".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let (ptr, len) = self.emit_string_ptr_len_from_value(&args[1])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i32 @__gost_net_ws_send_text(i64 {}, i8* {}, i64 {})",
+                tmp, handle, ptr, len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I32),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_tcp_write" || name == "__gost_net_udp_send" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_* does not take type arguments".to_string());
+            }
+            if args.len() != 2 {
+                return Err("__gost_net_* expects 2 arguments".to_string());
+            }
+            if args[1].ty != Type::Builtin(BuiltinType::String) {
+                return Err("__gost_net_* expects string payload".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let (ptr, len) = self.emit_string_ptr_len_from_value(&args[1])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i64 @{}(i64 {}, i8* {}, i64 {})",
+                tmp, name, handle, ptr, len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I64),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_udp_send_to" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_udp_send_to does not take type arguments".to_string());
+            }
+            if args.len() != 3 {
+                return Err("__gost_net_udp_send_to expects 3 arguments".to_string());
+            }
+            if args[1].ty != Type::Builtin(BuiltinType::String)
+                || args[2].ty != Type::Builtin(BuiltinType::String)
+            {
+                return Err("__gost_net_udp_send_to expects string address and payload".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let (addr_ptr, addr_len) = self.emit_string_ptr_len_from_value(&args[1])?;
+            let (data_ptr, data_len) = self.emit_string_ptr_len_from_value(&args[2])?;
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call i64 @__gost_net_udp_send_to(i64 {}, i8* {}, i64 {}, i8* {}, i64 {})",
+                tmp, handle, addr_ptr, addr_len, data_ptr, data_len
+            ));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::I64),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_tcp_read"
+            || name == "__gost_net_udp_recv"
+            || name == "__gost_net_udp_recv_from"
+        {
+            if !type_args.is_empty() {
+                return Err("__gost_net_* does not take type arguments".to_string());
+            }
+            if args.len() != 2 {
+                return Err("__gost_net_* expects 2 arguments".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let max_i32 = match args[1].ty {
+                Type::Builtin(BuiltinType::I32) => args[1].ir.clone(),
+                Type::Builtin(BuiltinType::I64) => {
+                    let t = self.new_temp();
+                    self.emit(format!("{} = trunc i64 {} to i32", t, args[1].ir));
+                    t
+                }
+                _ => return Err("__gost_net_* max must be i32/i64".to_string()),
+            };
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!(
+                "call void @{}(%string* {}, i64 {}, i32 {})",
+                name, out_ptr, handle, max_i32
+            ));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_ws_recv_text" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_ws_recv_text does not take type arguments".to_string());
+            }
+            if args.len() != 1 {
+                return Err("__gost_net_ws_recv_text expects 1 argument".to_string());
+            }
+            let handle = self.emit_index_i64(&args[0])?;
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            self.emit(format!(
+                "call void @__gost_net_ws_recv_text(%string* {}, i64 {})",
+                out_ptr, handle
+            ));
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
+                ir: tmp,
+            });
+        }
+        if name == "__gost_net_http_request" || name == "__gost_net_http_request_headers" {
+            if !type_args.is_empty() {
+                return Err("__gost_net_http_request does not take type arguments".to_string());
+            }
+            let expected = if name == "__gost_net_http_request_headers" {
+                5
+            } else {
+                4
+            };
+            if args.len() != expected {
+                return Err(if expected == 5 {
+                    "__gost_net_http_request_headers expects 5 arguments".to_string()
+                } else {
+                    "__gost_net_http_request expects 4 arguments".to_string()
+                });
+            }
+            for arg in args.iter() {
+                if arg.ty != Type::Builtin(BuiltinType::String) {
+                    return Err("__gost_net_http_request expects string arguments".to_string());
+                }
+            }
+            let (m_ptr, m_len) = self.emit_string_ptr_len_from_value(&args[0])?;
+            let (u_ptr, u_len) = self.emit_string_ptr_len_from_value(&args[1])?;
+            let (b_ptr, b_len) = self.emit_string_ptr_len_from_value(&args[2])?;
+            let (ct_ptr, ct_len) = self.emit_string_ptr_len_from_value(&args[3])?;
+            let out_ptr = self.new_temp();
+            self.emit(format!("{} = alloca %string", out_ptr));
+            if name == "__gost_net_http_request_headers" {
+                let (h_ptr, h_len) = self.emit_string_ptr_len_from_value(&args[4])?;
+                self.emit(format!(
+                    "call void @__gost_net_http_request_headers(%string* {}, i8* {}, i64 {}, i8* {}, i64 {}, i8* {}, i64 {}, i8* {}, i64 {}, i8* {}, i64 {})",
+                    out_ptr, m_ptr, m_len, u_ptr, u_len, b_ptr, b_len, ct_ptr, ct_len, h_ptr, h_len
+                ));
+            } else {
+                self.emit(format!(
+                    "call void @__gost_net_http_request(%string* {}, i8* {}, i64 {}, i8* {}, i64 {}, i8* {}, i64 {}, i8* {}, i64 {})",
+                    out_ptr, m_ptr, m_len, u_ptr, u_len, b_ptr, b_len, ct_ptr, ct_len
+                ));
+            }
+            let tmp = self.new_temp();
+            self.emit(format!("{} = load %string, %string* {}", tmp, out_ptr));
+            return Ok(Value {
+                ty: Type::Builtin(BuiltinType::String),
                 ir: tmp,
             });
         }
@@ -1789,7 +2447,7 @@ impl<'a> FnEmitter<'a> {
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
             let storage_ty = llvm_storage_type(&elem_ty)?;
-            if matches!(elem_ty, Type::Shared(_)) {
+            if matches!(elem_ty, Type::Shared(_) | Type::Chan(_)) {
                 self.emit_shared_inc_value(&args[1])?;
             }
             let alloca = self.new_temp();
@@ -2112,7 +2770,7 @@ impl<'a> FnEmitter<'a> {
             let val_alloca = self.new_temp();
             let val_storage = llvm_storage_type(&val_ty)?;
             self.emit(format!("{} = alloca {}", val_alloca, val_storage));
-            if matches!(val_ty, Type::Shared(_)) {
+            if matches!(val_ty, Type::Shared(_) | Type::Chan(_)) {
                 self.emit_shared_inc_value(&args[2])?;
             }
             self.emit(format!(
@@ -2184,16 +2842,35 @@ impl<'a> FnEmitter<'a> {
         if !type_args.is_empty() {
             return Err("type arguments not supported for this call".to_string());
         }
+        if (!fn_sig.is_variadic && args.len() != fn_sig.params.len())
+            || (fn_sig.is_variadic && args.len() < fn_sig.params.len())
+        {
+            return Err("argument count mismatch".to_string());
+        }
         let mut args_ir = Vec::new();
-        for (val, ty) in args.iter().zip(fn_sig.params.iter()) {
-            if matches!(ty, Type::Shared(_)) {
-                self.emit_shared_inc_value(val)?;
+        for (idx, val) in args.iter().enumerate() {
+            if let Some(ty) = fn_sig.params.get(idx) {
+                if matches!(ty, Type::Shared(_) | Type::Chan(_)) {
+                    self.emit_shared_inc_value(val)?;
+                }
+                args_ir.push(format!("{} {}", llvm_type(ty)?, val.ir));
+            } else {
+                if matches!(val.ty, Type::Shared(_) | Type::Chan(_)) {
+                    self.emit_shared_inc_value(val)?;
+                }
+                args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
             }
-            args_ir.push(format!("{} {}", llvm_type(ty)?, val.ir));
         }
         let ret_ty = llvm_type(&fn_sig.ret)?;
+        let cc = llvm_call_conv(fn_sig.extern_abi.as_deref());
         if fn_sig.ret == Type::Builtin(BuiltinType::Unit) {
-            self.emit(format!("call {} @{}({})", ret_ty, name, args_ir.join(", ")));
+            self.emit(format!(
+                "call {}{} @{}({})",
+                cc,
+                ret_ty,
+                name,
+                args_ir.join(", ")
+            ));
             Ok(Value {
                 ty: Type::Builtin(BuiltinType::Unit),
                 ir: String::new(),
@@ -2201,8 +2878,9 @@ impl<'a> FnEmitter<'a> {
         } else {
             let tmp = self.new_temp();
             self.emit(format!(
-                "{} = call {} @{}({})",
+                "{} = call {}{} @{}({})",
                 tmp,
+                cc,
                 ret_ty,
                 name,
                 args_ir.join(", ")
@@ -2212,6 +2890,448 @@ impl<'a> FnEmitter<'a> {
                 ir: tmp,
             })
         }
+    }
+
+    fn emit_call_ptr(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
+        let (params, ret, is_variadic) = match &callee.ty {
+            Type::FnPtr {
+                params,
+                ret,
+                is_variadic,
+            } => (params.clone(), *ret.clone(), *is_variadic),
+            _ => return Err("call target must be function pointer".to_string()),
+        };
+        if (!is_variadic && args.len() != params.len()) || (is_variadic && args.len() < params.len())
+        {
+            return Err("argument count mismatch".to_string());
+        }
+        let mut args_ir = Vec::new();
+        for (idx, val) in args.iter().enumerate() {
+            if let Some(pty) = params.get(idx) {
+                if matches!(pty, Type::Shared(_) | Type::Chan(_)) {
+                    self.emit_shared_inc_value(val)?;
+                }
+                args_ir.push(format!("{} {}", llvm_type(pty)?, val.ir));
+            } else {
+                if matches!(val.ty, Type::Shared(_) | Type::Chan(_)) {
+                    self.emit_shared_inc_value(val)?;
+                }
+                args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+        }
+        let ret_ty = llvm_type(&ret)?;
+        if ret == Type::Builtin(BuiltinType::Unit) {
+            self.emit(format!(
+                "call {} {}({})",
+                ret_ty,
+                callee.ir,
+                args_ir.join(", ")
+            ));
+            Ok(Value {
+                ty: Type::Builtin(BuiltinType::Unit),
+                ir: String::new(),
+            })
+        } else {
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call {} {}({})",
+                tmp,
+                ret_ty,
+                callee.ir,
+                args_ir.join(", ")
+            ));
+            Ok(Value { ty: ret, ir: tmp })
+        }
+    }
+
+    fn emit_inline_asm_call(
+        &mut self,
+        callee_name: &str,
+        type_args: &[TypeAst],
+        args: &[Expr],
+    ) -> Result<Value, String> {
+        if type_args.len() > 1 {
+            return Err("asm expects at most 1 type argument (return type)".to_string());
+        }
+        if args.is_empty() {
+            return Err("asm expects at least 1 argument".to_string());
+        }
+        let template = match &args[0].kind {
+            ExprKind::String(s) => s.clone(),
+            _ => return Err("asm template must be string literal".to_string()),
+        };
+        let constraints = if args.len() >= 2 {
+            match &args[1].kind {
+                ExprKind::String(s) => s.clone(),
+                _ => return Err("asm constraints must be string literal".to_string()),
+            }
+        } else {
+            "=r".to_string()
+        };
+        let mut operand_values = Vec::new();
+        if args.len() >= 3 {
+            for arg in args.iter().skip(2) {
+                let val = self.emit_expr(arg)?;
+                if val.ty == Type::Builtin(BuiltinType::Unit) {
+                    return Err("asm operands cannot be unit".to_string());
+                }
+                operand_values.push(val);
+            }
+        }
+        let spec = parse_asm_constraint_spec(&constraints);
+        let explicit_count = spec.outputs.len() + spec.input_count;
+        let legacy_count = spec.readwrite_outputs + spec.input_count;
+        let explicit_style = operand_values.len() == explicit_count;
+        let legacy_style = !explicit_style && operand_values.len() == legacy_count;
+        if !explicit_style && !legacy_style {
+            return Err(format!(
+                "asm operand count mismatch (expected {} with explicit outputs or {} in legacy style, found {})",
+                explicit_count,
+                legacy_count,
+                operand_values.len()
+            ));
+        }
+        let ret_ty = if let Some(ret) = type_args.first() {
+            self.resolve_type_ast(ret)?
+        } else if spec.outputs.is_empty() {
+            Type::Builtin(BuiltinType::I64)
+        } else if spec.outputs.len() == 1 {
+            if explicit_style {
+                operand_values
+                    .get(0)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or(Type::Builtin(BuiltinType::I64))
+            } else if spec.readwrite_outputs > 0 {
+                operand_values
+                    .get(0)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or(Type::Builtin(BuiltinType::I64))
+            } else {
+                Type::Builtin(BuiltinType::I64)
+            }
+        } else if explicit_style {
+            Type::Tuple(
+                operand_values
+                    .iter()
+                    .take(spec.outputs.len())
+                    .map(|v| v.ty.clone())
+                    .collect(),
+            )
+        } else if spec.readwrite_outputs == spec.outputs.len()
+            && operand_values.len() >= spec.outputs.len()
+        {
+            Type::Tuple(
+                operand_values
+                    .iter()
+                    .take(spec.outputs.len())
+                    .map(|v| v.ty.clone())
+                    .collect(),
+            )
+        } else {
+            return Err(
+                "multiple asm outputs require explicit output operands (colon syntax)"
+                    .to_string(),
+            );
+        };
+        let mut arg_ir = Vec::new();
+        if explicit_style {
+            for (idx, kind) in spec.outputs.iter().enumerate() {
+                if matches!(kind, AsmOutputKind::ReadWrite) {
+                    let val = operand_values
+                        .get(idx)
+                        .ok_or_else(|| "missing asm readwrite output operand".to_string())?;
+                    arg_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+                }
+            }
+            for val in operand_values.iter().skip(spec.outputs.len()) {
+                arg_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+        } else {
+            for val in operand_values.iter().take(spec.readwrite_outputs) {
+                arg_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+            for val in operand_values.iter().skip(spec.readwrite_outputs) {
+                arg_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+        }
+        let escaped = escape_llvm_inline_asm(&template);
+        let escaped_constraints = escape_llvm_inline_asm(&constraints);
+        let sideeffect = if callee_name == "asm_pure" {
+            ""
+        } else {
+            " sideeffect"
+        };
+        if ret_ty == Type::Builtin(BuiltinType::Unit) {
+            self.emit(format!(
+                "call void asm{} \"{}\", \"{}\"({})",
+                sideeffect,
+                escaped,
+                escaped_constraints,
+                arg_ir.join(", ")
+            ));
+            Ok(Value {
+                ty: Type::Builtin(BuiltinType::Unit),
+                ir: String::new(),
+            })
+        } else {
+            let tmp = self.new_temp();
+            self.emit(format!(
+                "{} = call {} asm{} \"{}\", \"{}\"({})",
+                tmp,
+                llvm_type(&ret_ty)?,
+                sideeffect,
+                escaped,
+                escaped_constraints,
+                arg_ir.join(", ")
+            ));
+            Ok(Value { ty: ret_ty, ir: tmp })
+        }
+    }
+
+    fn emit_inline_asm_label(&mut self, args: &[Expr]) -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err("asm_label expects exactly 1 argument".to_string());
+        }
+        let label = match &args[0].kind {
+            ExprKind::String(s) => s.trim(),
+            _ => return Err("asm_label argument must be a string literal".to_string()),
+        };
+        if label.is_empty() {
+            return Err("asm_label name cannot be empty".to_string());
+        }
+        let label_idx = self.ensure_asm_label_block(label);
+        let label_block = self
+            .blocks
+            .get(label_idx)
+            .map(|b| b.name.clone())
+            .ok_or_else(|| "invalid asm label block".to_string())?;
+        if !self.current_block_terminated() {
+            self.terminate(format!("br label %{}", label_block));
+        }
+        self.switch_to(label_idx);
+        Ok(Value {
+            ty: Type::Builtin(BuiltinType::Unit),
+            ir: String::new(),
+        })
+    }
+
+    fn emit_inline_asm_goto_call(
+        &mut self,
+        type_args: &[TypeAst],
+        args: &[Expr],
+    ) -> Result<Value, String> {
+        if args.len() < 3 {
+            return Err(
+                "asm_goto expects at least 3 arguments (template, constraints, labels)"
+                    .to_string(),
+            );
+        }
+        let template = match &args[0].kind {
+            ExprKind::String(s) => s.clone(),
+            _ => return Err("asm_goto template must be string literal".to_string()),
+        };
+        let constraints_raw = match &args[1].kind {
+            ExprKind::String(s) => s.clone(),
+            _ => return Err("asm_goto constraints must be string literal".to_string()),
+        };
+        let labels_raw = match &args[2].kind {
+            ExprKind::String(s) => s.clone(),
+            _ => return Err("asm_goto labels must be string literal".to_string()),
+        };
+        let labels: Vec<String> = labels_raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if labels.is_empty() {
+            return Err("asm_goto requires at least one label".to_string());
+        }
+
+        let mut operand_values = Vec::new();
+        for arg in args.iter().skip(3) {
+            let val = self.emit_expr(arg)?;
+            if val.ty == Type::Builtin(BuiltinType::Unit) {
+                return Err("asm_goto operands cannot be unit".to_string());
+            }
+            operand_values.push(val);
+        }
+        let spec = parse_asm_constraint_spec(&constraints_raw);
+        let explicit_count = spec.outputs.len() + spec.input_count;
+        let legacy_count = spec.readwrite_outputs + spec.input_count;
+        let explicit_style = operand_values.len() == explicit_count;
+        let legacy_style = !explicit_style && operand_values.len() == legacy_count;
+        if !explicit_style && !legacy_style {
+            return Err(format!(
+                "asm_goto operand count mismatch (expected {} with explicit outputs or {} in legacy style, found {})",
+                explicit_count,
+                legacy_count,
+                operand_values.len()
+            ));
+        }
+        let ret_ty = if let Some(ret) = type_args.first() {
+            self.resolve_type_ast(ret)?
+        } else if spec.outputs.is_empty() {
+            Type::Builtin(BuiltinType::Unit)
+        } else if spec.outputs.len() == 1 {
+            if explicit_style {
+                operand_values
+                    .get(0)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or(Type::Builtin(BuiltinType::I64))
+            } else if spec.readwrite_outputs > 0 {
+                operand_values
+                    .get(0)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or(Type::Builtin(BuiltinType::I64))
+            } else {
+                Type::Builtin(BuiltinType::I64)
+            }
+        } else if explicit_style {
+            Type::Tuple(
+                operand_values
+                    .iter()
+                    .take(spec.outputs.len())
+                    .map(|v| v.ty.clone())
+                    .collect(),
+            )
+        } else if spec.readwrite_outputs == spec.outputs.len()
+            && operand_values.len() >= spec.outputs.len()
+        {
+            Type::Tuple(
+                operand_values
+                    .iter()
+                    .take(spec.outputs.len())
+                    .map(|v| v.ty.clone())
+                    .collect(),
+            )
+        } else {
+            return Err(
+                "multiple asm_goto outputs require explicit output operands (colon syntax)"
+                    .to_string(),
+            );
+        };
+        let mut args_ir = Vec::new();
+        if explicit_style {
+            for (idx, kind) in spec.outputs.iter().enumerate() {
+                if matches!(kind, AsmOutputKind::ReadWrite) {
+                    let val = operand_values
+                        .get(idx)
+                        .ok_or_else(|| "missing asm_goto readwrite output operand".to_string())?;
+                    args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+                }
+            }
+            for val in operand_values.iter().skip(spec.outputs.len()) {
+                args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+        } else {
+            for val in operand_values.iter().take(spec.readwrite_outputs) {
+                args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+            for val in operand_values.iter().skip(spec.readwrite_outputs) {
+                args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
+            }
+        }
+
+        let raw_constraints: Vec<String> = constraints_raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let mut non_clobber_constraints = Vec::new();
+        let mut clobber_constraints = Vec::new();
+        let mut existing_label_constraints = 0usize;
+        for c in raw_constraints {
+            if c == "!i" {
+                existing_label_constraints += 1;
+            } else if c.starts_with("~{") {
+                clobber_constraints.push(c);
+            } else {
+                non_clobber_constraints.push(c);
+            }
+        }
+        let label_needed = labels.len().max(existing_label_constraints);
+        for _ in 0..label_needed {
+            non_clobber_constraints.push("!i".to_string());
+        }
+        let mut final_constraints = non_clobber_constraints;
+        final_constraints.extend(clobber_constraints);
+        let constraints = final_constraints.join(",");
+
+        let mut label_block_names = Vec::new();
+        for label in &labels {
+            let idx = self.ensure_asm_label_block(label);
+            let block_name = self
+                .blocks
+                .get(idx)
+                .map(|b| b.name.clone())
+                .ok_or_else(|| "invalid asm goto label block".to_string())?;
+            label_block_names.push(block_name);
+        }
+        let cont_name = self.new_block("asmgoto_cont");
+        let cont_idx = self.add_block(cont_name.clone());
+
+        let escaped_tmpl = escape_llvm_inline_asm(&template);
+        let escaped_constraints = escape_llvm_inline_asm(&constraints);
+        let mut dests = Vec::new();
+        for name in &label_block_names {
+            dests.push(format!("label %{}", name));
+        }
+        let ret_ir = if ret_ty == Type::Builtin(BuiltinType::Unit) {
+            self.terminate(format!(
+                "callbr void asm sideeffect \"{}\", \"{}\"({}) to label %{} [{}]",
+                escaped_tmpl,
+                escaped_constraints,
+                args_ir.join(", "),
+                cont_name,
+                dests.join(", ")
+            ));
+            String::new()
+        } else {
+            let tmp = self.new_temp();
+            self.terminate(format!(
+                "{} = callbr {} asm sideeffect \"{}\", \"{}\"({}) to label %{} [{}]",
+                tmp,
+                llvm_type(&ret_ty)?,
+                escaped_tmpl,
+                escaped_constraints,
+                args_ir.join(", "),
+                cont_name,
+                dests.join(", ")
+            ));
+            tmp
+        };
+        self.switch_to(cont_idx);
+        if ret_ty == Type::Builtin(BuiltinType::Unit) {
+            Ok(Value {
+                ty: ret_ty,
+                ir: String::new(),
+            })
+        } else {
+            Ok(Value { ty: ret_ty, ir: ret_ir })
+        }
+    }
+
+    fn ensure_asm_label_block(&mut self, label: &str) -> usize {
+        if let Some(idx) = self.asm_labels.get(label) {
+            return *idx;
+        }
+        let mut safe = String::new();
+        for ch in label.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                safe.push(ch);
+            } else {
+                safe.push('_');
+            }
+        }
+        if safe.is_empty() {
+            safe.push('L');
+        }
+        let name = self.new_block(&format!("asm_label_{}_", safe));
+        let idx = self.add_block(name);
+        self.asm_labels.insert(label.to_string(), idx);
+        idx
     }
 
     fn emit_go_spawn(
@@ -2242,7 +3362,7 @@ impl<'a> FnEmitter<'a> {
                 "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
                 slot, ctx_ty, ctx_ty, ctx_ptr, idx
             ));
-            if matches!(arg.ty, Type::Shared(_)) {
+            if matches!(arg.ty, Type::Shared(_) | Type::Chan(_)) {
                 self.emit_shared_inc_value(arg)?;
             }
             if arg.ty != Type::Builtin(BuiltinType::Unit) {
@@ -2411,6 +3531,7 @@ impl<'a> FnEmitter<'a> {
     fn emit_select_stmt(&mut self, arms: &[crate::frontend::ast::SelectArm]) -> Result<(), String> {
         let mut arm_channels: Vec<Option<Value>> = Vec::new();
         let mut arm_elem_tys: Vec<Option<Type>> = Vec::new();
+        let mut arm_ops: Vec<Option<i32>> = Vec::new();
         for arm in arms {
             match &arm.kind {
                 crate::frontend::ast::SelectArmKind::Send { chan, .. } => {
@@ -2421,6 +3542,7 @@ impl<'a> FnEmitter<'a> {
                     };
                     arm_channels.push(Some(chan_val));
                     arm_elem_tys.push(Some(elem_ty));
+                    arm_ops.push(Some(1));
                 }
                 crate::frontend::ast::SelectArmKind::Recv { chan, .. } => {
                     let chan_val = self.emit_expr(chan)?;
@@ -2430,6 +3552,7 @@ impl<'a> FnEmitter<'a> {
                     };
                     arm_channels.push(Some(chan_val));
                     arm_elem_tys.push(Some(elem_ty));
+                    arm_ops.push(Some(0));
                 }
                 crate::frontend::ast::SelectArmKind::After { ms } => {
                     let ms_val = self.emit_expr(ms)?;
@@ -2452,10 +3575,12 @@ impl<'a> FnEmitter<'a> {
                         ir: chan_tmp,
                     }));
                     arm_elem_tys.push(Some(Type::Builtin(BuiltinType::Unit)));
+                    arm_ops.push(Some(0));
                 }
                 crate::frontend::ast::SelectArmKind::Default => {
                     arm_channels.push(None);
                     arm_elem_tys.push(None);
+                    arm_ops.push(None);
                 }
             }
         }
@@ -2733,12 +3858,29 @@ impl<'a> FnEmitter<'a> {
                     "{} = bitcast {}* {} to %chan**",
                     cast_ptr, arr_ty, arr_ptr
                 ));
+                let op_arr_ty = format!("[{} x i32]", arr_len);
+                let op_arr_ptr = self.new_temp();
+                self.emit(format!("{} = alloca {}", op_arr_ptr, op_arr_ty));
+                for (i, arm_idx) in non_default.iter().enumerate() {
+                    let op = arm_ops[*arm_idx].unwrap_or(0);
+                    let slot = self.new_temp();
+                    self.emit(format!(
+                        "{} = getelementptr {}, {}* {}, i32 0, i32 {}",
+                        slot, op_arr_ty, op_arr_ty, op_arr_ptr, i
+                    ));
+                    self.emit(format!("store i32 {}, i32* {}", op, slot));
+                }
+                let op_cast_ptr = self.new_temp();
                 self.emit(format!(
-                    "call i32 @__gost_select_wait(%chan** {}, i32 {})",
-                    cast_ptr, arr_len
+                    "{} = bitcast {}* {} to i32*",
+                    op_cast_ptr, op_arr_ty, op_arr_ptr
+                ));
+                self.emit(format!(
+                    "call i32 @__gost_select_wait(%chan** {}, i32* {}, i32 {})",
+                    cast_ptr, op_cast_ptr, arr_len
                 ));
             } else {
-                self.emit("call i32 @__gost_select_wait(%chan** null, i32 0)");
+                self.emit("call i32 @__gost_select_wait(%chan** null, i32* null, i32 0)");
             }
             self.terminate(format!("br label %{}", start_name));
         }
@@ -2834,15 +3976,7 @@ impl<'a> FnEmitter<'a> {
                         .get(out[0])
                         .and_then(|opt| opt.clone())
                         .ok_or_else(|| "missing mir local".to_string())?;
-                    if let ExprKind::Call { callee, .. } = &expr.kind {
-                        if let ExprKind::Ident(name) = &callee.kind {
-                            if name != "shared_new" {
-                                self.emit_shared_inc_value(&val)?;
-                            }
-                        } else {
-                            self.emit_shared_inc_value(&val)?;
-                        }
-                    } else {
+                    if !self.is_rc_fresh_expr(expr) {
                         self.emit_shared_inc_value(&val)?;
                     }
                     if info.ty != Type::Builtin(BuiltinType::Unit) {
@@ -2925,15 +4059,7 @@ impl<'a> FnEmitter<'a> {
                     }
                 }
                 let val = self.emit_expr(value)?;
-                if let ExprKind::Call { callee, .. } = &value.kind {
-                    if let ExprKind::Ident(callee_name) = &callee.kind {
-                        if callee_name != "shared_new" {
-                            self.emit_shared_inc_value(&val)?;
-                        }
-                    } else {
-                        self.emit_shared_inc_value(&val)?;
-                    }
-                } else {
+                if !self.is_rc_fresh_expr(value) {
                     self.emit_shared_inc_value(&val)?;
                 }
                 if target_ty != Type::Builtin(BuiltinType::Unit) {
@@ -3111,6 +4237,11 @@ impl<'a> FnEmitter<'a> {
                     "  call void @__gost_shared_inc(%shared_obj* {})",
                     obj
                 ));
+            } else if matches!(ty, Type::Chan(_)) {
+                lines.push(format!(
+                    "  call void @__gost_chan_retain(%chan* {})",
+                    tmp
+                ));
             }
             arg_ir.push(tmp);
         }
@@ -3220,6 +4351,31 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    fn emit_string_ptr_len_from_value(&mut self, value: &Value) -> Result<(String, String), String> {
+        match &value.ty {
+            Type::Builtin(BuiltinType::String) => {
+                let ptr = self.new_temp();
+                let len = self.new_temp();
+                self.emit(format!("{} = extractvalue %string {}, 0", ptr, value.ir));
+                self.emit(format!("{} = extractvalue %string {}, 1", len, value.ir));
+                Ok((ptr, len))
+            }
+            Type::Ref(inner) | Type::MutRef(inner) => match &**inner {
+                Type::Builtin(BuiltinType::String) => {
+                    let tmp = self.new_temp();
+                    self.emit(format!("{} = load %string, %string* {}", tmp, value.ir));
+                    let ptr = self.new_temp();
+                    let len = self.new_temp();
+                    self.emit(format!("{} = extractvalue %string {}, 0", ptr, tmp));
+                    self.emit(format!("{} = extractvalue %string {}, 1", len, tmp));
+                    Ok((ptr, len))
+                }
+                _ => Err("expected ref to string".to_string()),
+            },
+            _ => Err("expected string".to_string()),
+        }
+    }
+
     fn emit_map_obj_from_value(&mut self, value: &Value) -> Result<String, String> {
         match &value.ty {
             Type::Map(_, _) => {
@@ -3281,11 +4437,88 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn emit_shared_inc_value(&mut self, value: &Value) -> Result<(), String> {
-        if let Type::Shared(_) = value.ty {
-            let obj = self.emit_shared_obj_from_value(value)?;
-            self.emit(format!("call void @__gost_shared_inc(%shared_obj* {})", obj));
+        match &value.ty {
+            Type::Shared(_) => {
+                let obj = self.emit_shared_obj_from_value(value)?;
+                self.emit(format!("call void @__gost_shared_inc(%shared_obj* {})", obj));
+            }
+            Type::Chan(_) => {
+                self.emit(format!("call void @__gost_chan_retain(%chan* {})", value.ir));
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    fn is_rc_fresh_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::After { .. } => true,
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    name == "shared_new" || name == "make_chan"
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn is_int_type(&self, ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Builtin(
+                BuiltinType::I32 | BuiltinType::I64 | BuiltinType::U32 | BuiltinType::U64
+            )
+        )
+    }
+
+    fn promote_int_type(&self, a: &Type, b: &Type) -> Option<Type> {
+        if a == b {
+            return Some(a.clone());
+        }
+        match (a, b) {
+            (Type::Builtin(BuiltinType::I64), Type::Builtin(BuiltinType::I32))
+            | (Type::Builtin(BuiltinType::I32), Type::Builtin(BuiltinType::I64)) => {
+                Some(Type::Builtin(BuiltinType::I64))
+            }
+            (Type::Builtin(BuiltinType::U64), Type::Builtin(BuiltinType::U32))
+            | (Type::Builtin(BuiltinType::U32), Type::Builtin(BuiltinType::U64)) => {
+                Some(Type::Builtin(BuiltinType::U64))
+            }
+            _ => None,
+        }
+    }
+
+    fn cast_int_value(&mut self, val: Value, target: &Type) -> Result<Value, String> {
+        if &val.ty == target {
+            return Ok(val);
+        }
+        let tmp = self.new_temp();
+        match (&val.ty, target) {
+            (Type::Builtin(BuiltinType::I32), Type::Builtin(BuiltinType::I64)) => {
+                self.emit(format!("{} = sext i32 {} to i64", tmp, val.ir));
+                Ok(Value { ty: target.clone(), ir: tmp })
+            }
+            (Type::Builtin(BuiltinType::U32), Type::Builtin(BuiltinType::U64)) => {
+                self.emit(format!("{} = zext i32 {} to i64", tmp, val.ir));
+                Ok(Value { ty: target.clone(), ir: tmp })
+            }
+            _ => Err("unsupported integer cast".to_string()),
+        }
+    }
+
+    fn coerce_int_pair(&mut self, lhs: Value, rhs: Value) -> Result<(Value, Value), String> {
+        if lhs.ty == rhs.ty {
+            return Ok((lhs, rhs));
+        }
+        let target = match self.promote_int_type(&lhs.ty, &rhs.ty) {
+            Some(t) => t,
+            None => return Ok((lhs, rhs)),
+        };
+        let lhs2 = self.cast_int_value(lhs, &target)?;
+        let rhs2 = self.cast_int_value(rhs, &target)?;
+        Ok((lhs2, rhs2))
     }
 
     fn emit_index_i64(&mut self, idx_val: &Value) -> Result<String, String> {
@@ -3714,12 +4947,13 @@ impl<'a> FnEmitter<'a> {
     fn emit_place_ptr(&mut self, expr: &Expr) -> Result<(Type, String), String> {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                let (ty, ptr) = self
-                    .locals
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| format!("unknown local {}", name))?;
-                Ok((ty, ptr))
+                if let Some((ty, ptr)) = self.locals.get(name).cloned() {
+                    Ok((ty, ptr))
+                } else if let Some(global) = self.extern_globals.get(name) {
+                    Ok((global.ty.clone(), format!("@{}", name)))
+                } else {
+                    Err(format!("unknown local {}", name))
+                }
             }
             ExprKind::Deref { expr: inner } => {
                 let inner_val = self.emit_expr(inner)?;
@@ -3879,7 +5113,7 @@ impl<'a> FnEmitter<'a> {
                 let val = arg_vals
                     .get(idx)
                     .ok_or_else(|| "missing enum argument".to_string())?;
-                if matches!(field_ty, Type::Shared(_)) {
+                if matches!(field_ty, Type::Shared(_) | Type::Chan(_)) {
                     self.emit_shared_inc_value(val)?;
                 }
                 self.emit(format!(
@@ -4098,6 +5332,22 @@ impl<'a> FnEmitter<'a> {
                     tys.push(self.resolve_type_ast(item)?);
                 }
                 Ok(Type::Tuple(tys))
+            }
+            crate::frontend::ast::TypeAstKind::FnPtr {
+                params,
+                ret,
+                is_variadic,
+            } => {
+                let mut ptys = Vec::new();
+                for p in params {
+                    ptys.push(self.resolve_type_ast(p)?);
+                }
+                let rty = self.resolve_type_ast(ret)?;
+                Ok(Type::FnPtr {
+                    params: ptys,
+                    ret: Box::new(rty),
+                    is_variadic: *is_variadic,
+                })
             }
         }
     }

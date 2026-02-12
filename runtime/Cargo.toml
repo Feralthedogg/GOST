@@ -17,6 +17,15 @@ panic = "abort"
 
 [dependencies]
 libc = "0.2"
+socket2 = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
 
 [build-dependencies]
 cc = "1.0"

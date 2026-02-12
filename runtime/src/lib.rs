@@ -1,13 +1,26 @@
 ﻿// #![allow(private_interfaces)]
 #![allow(non_camel_case_types, non_snake_case, dead_code, unsafe_op_in_unsafe_fn, static_mut_refs)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "stats")]
 use std::fmt::Write;
 use std::ffi::c_void;
+use std::io::{ErrorKind, Read, Write as IoWrite};
 use std::mem::{self, MaybeUninit};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, IntoRawSocket};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::Method;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect as ws_connect, Error as WsError, Message as WsMessage};
 
 #[cfg(not(windows))]
 use libc::{
@@ -26,6 +39,19 @@ use libc::{
 };
 
 use libc::write;
+
+#[cfg(target_os = "linux")]
+use libc::{
+    close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, eventfd, fcntl, read, EFD_CLOEXEC,
+    EFD_NONBLOCK, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, EPOLLONESHOT, EPOLL_CLOEXEC,
+    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, F_GETFL, F_SETFL, O_NONBLOCK,
+};
+
+#[cfg(target_os = "macos")]
+use libc::{
+    close, fcntl, pipe, poll, pollfd, read, F_GETFL, F_SETFL, O_NONBLOCK, POLLERR, POLLHUP,
+    POLLIN, POLLNVAL, POLLOUT,
+};
 
 #[cfg(windows)]
 #[repr(C)]
@@ -68,6 +94,14 @@ struct CONDITION_VARIABLE {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct WSAPOLLFD {
+    fd: usize,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(windows)]
 type OsMutex = CRITICAL_SECTION;
 #[cfg(windows)]
 type OsCond = CONDITION_VARIABLE;
@@ -86,6 +120,14 @@ unsafe extern "system" {
     fn GetTickCount64() -> u64;
     fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *mut FILETIME);
     fn GetSystemInfo(lpSystemInfo: *mut SYSTEM_INFO);
+    fn GetLastError() -> u32;
+    fn CreateMutexW(
+        lpMutexAttributes: *mut c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+    fn SetConsoleCP(wCodePageID: u32) -> i32;
     fn SwitchToThread() -> i32;
     fn InitializeCriticalSection(cs: *mut CRITICAL_SECTION);
     fn DeleteCriticalSection(cs: *mut CRITICAL_SECTION);
@@ -118,6 +160,12 @@ unsafe extern "system" {
         flNewProtect: u32,
         lpflOldProtect: *mut u32,
     ) -> i32;
+    fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
+    fn WSAPoll(fdArray: *mut WSAPOLLFD, fds: u32, timeout: i32) -> i32;
+    fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32;
+    fn recv(s: usize, buf: *mut u8, len: i32, flags: i32) -> i32;
+    fn closesocket(s: usize) -> i32;
+    fn WSAGetLastError() -> i32;
 }
 
 #[cfg(windows)]
@@ -132,6 +180,26 @@ const PAGE_READWRITE: u32 = 0x04;
 const PAGE_NOACCESS: u32 = 0x01;
 #[cfg(windows)]
 const INFINITE: u32 = 0xFFFF_FFFF;
+#[cfg(windows)]
+const FIONBIO: i32 = 0x8004_667E_u32 as i32;
+#[cfg(windows)]
+const WS_POLLIN: i16 = 0x0300;
+#[cfg(windows)]
+const WS_POLLOUT: i16 = 0x0010;
+#[cfg(windows)]
+const WS_POLLERR: i16 = 0x0001;
+#[cfg(windows)]
+const WS_POLLHUP: i16 = 0x0002;
+#[cfg(windows)]
+const WS_POLLNVAL: i16 = 0x0004;
+#[cfg(windows)]
+const WS_SOCKET_ERROR: i32 = -1;
+#[cfg(windows)]
+const WSA_EWOULDBLOCK: i32 = 10035;
+#[cfg(windows)]
+const WSA_EINPROGRESS: i32 = 10036;
+#[cfg(windows)]
+const WSA_EALREADY: i32 = 10037;
 
 type gost_thread_fn = extern "C" fn(*mut c_void);
 
@@ -283,6 +351,20 @@ impl gost_timer_heap {
     }
 }
 
+const PD_WANT_READ: u32 = 1 << 0;
+const PD_WANT_WRITE: u32 = 1 << 1;
+const PD_ARMED_READ: u32 = 1 << 2;
+const PD_ARMED_WRITE: u32 = 1 << 3;
+
+#[repr(C)]
+pub struct gost_poll_desc {
+    pub fd: i32,
+    handle: usize,
+    r_wait: AtomicPtr<gost_g>,
+    w_wait: AtomicPtr<gost_g>,
+    state: AtomicU32,
+}
+
 #[repr(C)]
 struct __gost_chan {
     mu: OsMutex,
@@ -379,10 +461,16 @@ static G_STACK_ONCE: Once = Once::new();
 
 static mut G_STACK_COMMIT: usize = 64 * 1024;
 static mut G_STACK_RESERVE: usize = 256 * 1024;
+#[cfg(windows)]
+static mut G_SINGLETON_MUTEX: *mut c_void = ptr::null_mut();
 
 thread_local! {
     static TLS_M: Cell<*mut gost_m> = Cell::new(ptr::null_mut());
     static TLS_G: Cell<*mut gost_g> = Cell::new(ptr::null_mut());
+    static NET_LAST_STATUS: Cell<i32> = Cell::new(0);
+    static NET_LAST_HTTP_STATUS: Cell<i32> = Cell::new(0);
+    static NET_LAST_ERR: RefCell<String> = RefCell::new(String::new());
+    static NET_LAST_PEER: RefCell<String> = RefCell::new(String::new());
 }
 
 fn tls_m_get() -> *mut gost_m { TLS_M.with(|c| c.get()) }
@@ -583,6 +671,59 @@ impl gost_stats_local {
 static mut BOOT_STATS: gost_stats_local = gost_stats_local::ZERO;
 
 static G_LIVE: AtomicI64 = AtomicI64::new(0);
+static NETPOLL_WAITER: AtomicI32 = AtomicI32::new(0);
+static NET_HANDLE_NEXT: AtomicI64 = AtomicI64::new(1);
+static NET_HANDLE_TABLE: OnceLock<Mutex<HashMap<i64, NetHandle>>> = OnceLock::new();
+static NET_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static CHAN_REGISTRY: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+type GostWs = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
+
+enum NetHandle {
+    TcpListener {
+        sock: Arc<TcpListener>,
+        pd: usize,
+    },
+    TcpStream {
+        sock: Arc<TcpStream>,
+        pd: usize,
+    },
+    UdpSocket {
+        sock: Arc<UdpSocket>,
+        pd: usize,
+    },
+    WsSocket {
+        ws: Arc<Mutex<GostWs>>,
+        pd: usize,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const NETPOLL_MAX_EVENTS: usize = 64;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+static NETPOLL_INIT_ONCE: Once = Once::new();
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+static NETPOLL_ENABLED: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(target_os = "linux")]
+const NETPOLL_BREAK_TAG: u64 = 1;
+#[cfg(target_os = "linux")]
+static mut NETPOLL_EPFD: i32 = -1;
+#[cfg(target_os = "linux")]
+static mut NETPOLL_BREAKFD: i32 = -1;
+
+#[cfg(target_os = "macos")]
+static mut NETPOLL_BREAK_RFD: i32 = -1;
+#[cfg(target_os = "macos")]
+static mut NETPOLL_BREAK_WFD: i32 = -1;
+
+#[cfg(windows)]
+static mut NETPOLL_BREAK_RSOCK: usize = 0;
+#[cfg(windows)]
+static mut NETPOLL_BREAK_WSOCK: usize = 0;
+
+#[cfg(any(target_os = "macos", windows))]
+static NETPOLL_REG: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 
 #[cfg(feature = "stats")]
 fn stat_inc(slot: &StatSlot) {
@@ -687,6 +828,1404 @@ fn env_usize_clamp(name: &str, defv: usize, lo: usize, hi: usize) -> usize {
         }
     }
     defv
+}
+
+fn net_table() -> &'static Mutex<HashMap<i64, NetHandle>> {
+    NET_HANDLE_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn net_table_lock() -> std::sync::MutexGuard<'static, HashMap<i64, NetHandle>> {
+    match net_table().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+#[cfg(windows)]
+unsafe fn os_console_utf8_init() {
+    const CP_UTF8: u32 = 65001;
+    let _ = SetConsoleOutputCP(CP_UTF8);
+    let _ = SetConsoleCP(CP_UTF8);
+}
+
+#[cfg(not(windows))]
+unsafe fn os_console_utf8_init() {}
+
+fn chan_registry() -> &'static Mutex<HashSet<usize>> {
+    CHAN_REGISTRY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn chan_register(ch: *mut __gost_chan) {
+    if ch.is_null() {
+        return;
+    }
+    let mut reg = match chan_registry().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    reg.insert(ch as usize);
+}
+
+fn chan_unregister(ch: *mut __gost_chan) {
+    if ch.is_null() {
+        return;
+    }
+    let mut reg = match chan_registry().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    reg.remove(&(ch as usize));
+}
+
+fn chan_is_registered(ch: *mut __gost_chan) -> bool {
+    if ch.is_null() {
+        return false;
+    }
+    let p = ch as usize;
+    if p < 4096 {
+        return false;
+    }
+    let align = mem::align_of::<__gost_chan>();
+    if align > 1 && (p & (align - 1)) != 0 {
+        return false;
+    }
+    let reg = match chan_registry().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    reg.contains(&p)
+}
+
+fn net_set_ok() {
+    NET_LAST_STATUS.with(|v| v.set(0));
+    NET_LAST_ERR.with(|v| v.borrow_mut().clear());
+}
+
+fn net_set_eof() {
+    NET_LAST_STATUS.with(|v| v.set(1));
+    NET_LAST_ERR.with(|v| v.borrow_mut().clear());
+}
+
+fn net_set_would_block() {
+    NET_LAST_STATUS.with(|v| v.set(2));
+    NET_LAST_ERR.with(|v| v.borrow_mut().clear());
+}
+
+fn net_set_err(msg: String) {
+    NET_LAST_STATUS.with(|v| v.set(-1));
+    NET_LAST_ERR.with(|v| *v.borrow_mut() = msg);
+}
+
+fn net_set_http_status(code: i32) {
+    NET_LAST_HTTP_STATUS.with(|v| v.set(code));
+}
+
+fn net_set_last_peer(peer: String) {
+    NET_LAST_PEER.with(|v| *v.borrow_mut() = peer);
+}
+
+fn net_clear_last_peer() {
+    NET_LAST_PEER.with(|v| v.borrow_mut().clear());
+}
+
+unsafe fn raw_bytes_from<'a>(ptr: *const u8, len: i64) -> Result<&'a [u8], String> {
+    if len < 0 {
+        return Err("negative length".to_string());
+    }
+    if ptr.is_null() && len != 0 {
+        return Err("null pointer with non-zero length".to_string());
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    Ok(std::slice::from_raw_parts(ptr, len as usize))
+}
+
+unsafe fn raw_utf8_from(ptr: *const u8, len: i64) -> Result<String, String> {
+    let b = raw_bytes_from(ptr, len)?;
+    match std::str::from_utf8(b) {
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => Err("invalid utf-8 string".to_string()),
+    }
+}
+
+unsafe fn gost_string_set_bytes(out: *mut gost_string, bytes: &[u8]) {
+    if out.is_null() {
+        return;
+    }
+    if bytes.is_empty() {
+        (*out).ptr = ptr::null();
+        (*out).len = 0;
+        return;
+    }
+    let dst = __gost_alloc(bytes.len(), 1) as *mut u8;
+    ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    (*out).ptr = dst as *const u8;
+    (*out).len = bytes.len() as i64;
+}
+
+fn net_insert_handle(h: NetHandle) -> i64 {
+    let id = NET_HANDLE_NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut table = net_table_lock();
+    table.insert(id, h);
+    id
+}
+
+unsafe fn net_handle_close_poll(h: &NetHandle) {
+    match h {
+        NetHandle::TcpListener { pd, .. } => {
+            let p = *pd as *mut gost_poll_desc;
+            if !p.is_null() {
+                __gost_poll_close(p);
+            }
+        }
+        NetHandle::TcpStream { pd, .. } => {
+            let p = *pd as *mut gost_poll_desc;
+            if !p.is_null() {
+                __gost_poll_close(p);
+            }
+        }
+        NetHandle::UdpSocket { pd, .. } => {
+            let p = *pd as *mut gost_poll_desc;
+            if !p.is_null() {
+                __gost_poll_close(p);
+            }
+        }
+        NetHandle::WsSocket { pd, .. } => {
+            let p = *pd as *mut gost_poll_desc;
+            if !p.is_null() {
+                __gost_poll_close(p);
+            }
+        }
+    }
+}
+
+fn net_remove_handle(id: i64) -> bool {
+    let mut table = net_table_lock();
+    let removed = table.remove(&id);
+    drop(table);
+    if let Some(h) = removed {
+        unsafe { net_handle_close_poll(&h); }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn netpoll_reg_lock() -> std::sync::MutexGuard<'static, HashSet<usize>> {
+    match NETPOLL_REG.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+unsafe fn netpoll_reg_add(pd: *mut gost_poll_desc) {
+    if pd.is_null() {
+        return;
+    }
+    let key = pd as usize;
+    let mut reg = netpoll_reg_lock();
+    reg.insert(key);
+}
+
+#[cfg(any(target_os = "macos", windows))]
+unsafe fn netpoll_reg_remove(pd: *mut gost_poll_desc) {
+    if pd.is_null() {
+        return;
+    }
+    let key = pd as usize;
+    let mut reg = netpoll_reg_lock();
+    reg.remove(&key);
+}
+
+#[cfg(any(target_os = "macos", windows))]
+unsafe fn netpoll_reg_contains(pd: *mut gost_poll_desc) -> bool {
+    if pd.is_null() {
+        return false;
+    }
+    let key = pd as usize;
+    let reg = netpoll_reg_lock();
+    reg.contains(&key)
+}
+
+#[cfg(unix)]
+fn net_open_pd_listener(sock: &TcpListener) -> *mut gost_poll_desc {
+    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+}
+
+#[cfg(windows)]
+fn net_open_pd_listener(sock: &TcpListener) -> *mut gost_poll_desc {
+    __gost_poll_open_socket(sock.as_raw_socket() as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn net_open_pd_listener(_sock: &TcpListener) -> *mut gost_poll_desc {
+    ptr::null_mut()
+}
+
+#[cfg(unix)]
+fn net_open_pd_stream(sock: &TcpStream) -> *mut gost_poll_desc {
+    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+}
+
+#[cfg(windows)]
+fn net_open_pd_stream(sock: &TcpStream) -> *mut gost_poll_desc {
+    __gost_poll_open_socket(sock.as_raw_socket() as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn net_open_pd_stream(_sock: &TcpStream) -> *mut gost_poll_desc {
+    ptr::null_mut()
+}
+
+#[cfg(unix)]
+fn net_open_pd_udp(sock: &UdpSocket) -> *mut gost_poll_desc {
+    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+}
+
+#[cfg(windows)]
+fn net_open_pd_udp(sock: &UdpSocket) -> *mut gost_poll_desc {
+    __gost_poll_open_socket(sock.as_raw_socket() as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn net_open_pd_udp(_sock: &UdpSocket) -> *mut gost_poll_desc {
+    ptr::null_mut()
+}
+
+fn net_get_tcp_listener(id: i64) -> Result<(Arc<TcpListener>, *mut gost_poll_desc), String> {
+    let table = net_table_lock();
+    match table.get(&id) {
+        Some(NetHandle::TcpListener { sock, pd }) => Ok((sock.clone(), *pd as *mut gost_poll_desc)),
+        Some(_) => Err("handle is not tcp listener".to_string()),
+        None => Err("invalid handle".to_string()),
+    }
+}
+
+fn net_get_tcp_stream(id: i64) -> Result<(Arc<TcpStream>, *mut gost_poll_desc), String> {
+    let table = net_table_lock();
+    match table.get(&id) {
+        Some(NetHandle::TcpStream { sock, pd }) => Ok((sock.clone(), *pd as *mut gost_poll_desc)),
+        Some(_) => Err("handle is not tcp connection".to_string()),
+        None => Err("invalid handle".to_string()),
+    }
+}
+
+fn net_get_udp_socket(id: i64) -> Result<(Arc<UdpSocket>, *mut gost_poll_desc), String> {
+    let table = net_table_lock();
+    match table.get(&id) {
+        Some(NetHandle::UdpSocket { sock, pd }) => Ok((sock.clone(), *pd as *mut gost_poll_desc)),
+        Some(_) => Err("handle is not udp socket".to_string()),
+        None => Err("invalid handle".to_string()),
+    }
+}
+
+fn net_get_ws(id: i64) -> Result<(Arc<Mutex<GostWs>>, *mut gost_poll_desc), String> {
+    let table = net_table_lock();
+    match table.get(&id) {
+        Some(NetHandle::WsSocket { ws, pd }) => Ok((ws.clone(), *pd as *mut gost_poll_desc)),
+        Some(_) => Err("handle is not websocket".to_string()),
+        None => Err("invalid handle".to_string()),
+    }
+}
+
+fn ws_set_nonblocking(ws: &mut GostWs, on: bool) -> Result<(), String> {
+    match ws.get_mut() {
+        MaybeTlsStream::Plain(s) => s
+            .set_nonblocking(on)
+            .map_err(|e| format!("ws set nonblocking failed: {}", e)),
+        #[cfg(windows)]
+        MaybeTlsStream::NativeTls(s) => s
+            .get_mut()
+            .set_nonblocking(on)
+            .map_err(|e| format!("ws set nonblocking failed: {}", e)),
+        #[cfg(not(windows))]
+        MaybeTlsStream::Rustls(s) => s
+            .get_mut()
+            .set_nonblocking(on)
+            .map_err(|e| format!("ws set nonblocking failed: {}", e)),
+        #[allow(unreachable_patterns)]
+        _ => Err("unsupported websocket stream".to_string()),
+    }
+}
+
+fn ws_open_pd(ws: &mut GostWs) -> *mut gost_poll_desc {
+    match ws.get_mut() {
+        MaybeTlsStream::Plain(s) => net_open_pd_stream(s),
+        #[cfg(windows)]
+        MaybeTlsStream::NativeTls(s) => net_open_pd_stream(s.get_mut()),
+        #[cfg(not(windows))]
+        MaybeTlsStream::Rustls(s) => net_open_pd_stream(s.get_mut()),
+        #[allow(unreachable_patterns)]
+        _ => ptr::null_mut(),
+    }
+}
+
+fn net_http_client() -> Result<&'static Client, String> {
+    match NET_HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .build()
+            .map_err(|e| format!("http client build failed: {}", e))
+    }) {
+        Ok(c) => Ok(c),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+#[inline(always)]
+fn net_tune_tcp_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
+fn net_is_connect_in_progress(err: &std::io::Error) -> bool {
+    if err.kind() == ErrorKind::WouldBlock {
+        return true;
+    }
+    match err.raw_os_error() {
+        #[cfg(unix)]
+        Some(libc::EINPROGRESS) | Some(libc::EALREADY) | Some(libc::EWOULDBLOCK) => true,
+        #[cfg(windows)]
+        Some(WSA_EWOULDBLOCK) | Some(WSA_EINPROGRESS) | Some(WSA_EALREADY) => true,
+        _ => false,
+    }
+}
+
+fn net_tcp_connect_blocking(addr: &str) -> Result<(TcpStream, *mut gost_poll_desc), String> {
+    let stream = TcpStream::connect(addr).map_err(|e| format!("tcp connect failed: {}", e))?;
+    net_tune_tcp_stream(&stream);
+    let pd = net_open_pd_stream(&stream);
+    Ok((stream, pd))
+}
+
+fn net_tcp_connect_nonblocking(addr: &str) -> Result<(TcpStream, *mut gost_poll_desc), String> {
+    let addrs: Vec<std::net::SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("tcp resolve failed: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("tcp connect failed: no resolved address".to_string());
+    }
+
+    let mut last_err: Option<String> = None;
+    for sa in addrs {
+        let domain = Domain::for_address(sa);
+        let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("tcp socket create failed: {}", e));
+                continue;
+            }
+        };
+        if let Err(e) = socket.set_nonblocking(true) {
+            last_err = Some(format!("tcp set nonblocking failed: {}", e));
+            continue;
+        }
+        let sa = SockAddr::from(sa);
+        match socket.connect(&sa) {
+            Ok(()) => {
+                let stream: TcpStream = socket.into();
+                net_tune_tcp_stream(&stream);
+                let pd = net_open_pd_stream(&stream);
+                return Ok((stream, pd));
+            }
+            Err(e) if net_is_connect_in_progress(&e) => {
+                let stream: TcpStream = socket.into();
+                net_tune_tcp_stream(&stream);
+                let pd = net_open_pd_stream(&stream);
+                if pd.is_null() {
+                    last_err = Some("tcp connect failed: netpoll unavailable".to_string());
+                    continue;
+                }
+                loop {
+                    match unsafe { net_wait_write(pd) } {
+                        Ok(()) => {}
+                        Err(msg) => {
+                            __gost_poll_close(pd);
+                            return Err(msg);
+                        }
+                    }
+                    match stream.take_error() {
+                        Ok(None) => return Ok((stream, pd)),
+                        Ok(Some(se)) if net_is_connect_in_progress(&se) => continue,
+                        Ok(Some(se)) => {
+                            __gost_poll_close(pd);
+                            last_err = Some(format!("tcp connect failed: {}", se));
+                            break;
+                        }
+                        Err(se) => {
+                            __gost_poll_close(pd);
+                            last_err = Some(format!("tcp connect failed: {}", se));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = Some(format!("tcp connect failed: {}", e));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "tcp connect failed".to_string()))
+}
+
+fn net_http_request_impl(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    headers: &str,
+) -> Result<(i32, Vec<u8>), String> {
+    let m = if method.is_empty() { "GET" } else { method };
+    let method = Method::from_bytes(m.as_bytes())
+        .map_err(|e| format!("invalid http method '{}': {}", m, e))?;
+    let client = net_http_client()?;
+    let mut req = client.request(method.clone(), url);
+    if !content_type.is_empty() {
+        req = req.header("Content-Type", content_type);
+    }
+    if !headers.is_empty() {
+        for raw in headers.split('\n') {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, ':');
+            let key = parts.next().unwrap_or("").trim();
+            let val = parts.next().unwrap_or("").trim();
+            if key.is_empty() {
+                return Err("http header name is empty".to_string());
+            }
+            if val.is_empty() {
+                return Err(format!("http header '{}' has empty value", key));
+            }
+            let hn = HeaderName::from_bytes(key.as_bytes())
+                .map_err(|e| format!("invalid http header name '{}': {}", key, e))?;
+            let hv = HeaderValue::from_str(val)
+                .map_err(|e| format!("invalid http header value for '{}': {}", key, e))?;
+            req = req.header(hn, hv);
+        }
+    }
+
+    let send_body = !body.is_empty() || !(method == Method::GET || method == Method::HEAD);
+    let resp = if send_body {
+        req.body(body.to_vec())
+            .send()
+            .map_err(|e| format!("http transport error: {}", e))?
+    } else {
+        req.send().map_err(|e| format!("http transport error: {}", e))?
+    };
+
+    let status = resp.status().as_u16() as i32;
+    let payload = resp
+        .bytes()
+        .map_err(|e| format!("http read failed: {}", e))?
+        .to_vec();
+    Ok((status, payload))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[inline(always)]
+fn netpoll_enabled() -> bool {
+    NETPOLL_ENABLED.load(Ordering::Acquire) != 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[inline(always)]
+fn netpoll_enabled() -> bool {
+    false
+}
+
+#[cfg(unix)]
+unsafe fn netpoll_set_nonblock(fd: i32) -> i32 {
+    if fd < 0 {
+        return -1;
+    }
+    let flags = fcntl(fd, F_GETFL);
+    if flags < 0 {
+        return -1;
+    }
+    if (flags & O_NONBLOCK) != 0 {
+        return 0;
+    }
+    if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+        return -1;
+    }
+    0
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_set_nonblock_socket(sock: usize) -> i32 {
+    if sock == 0 || sock == usize::MAX {
+        return -1;
+    }
+    let mut on: u32 = 1;
+    if ioctlsocket(sock, FIONBIO, &mut on as *mut u32) != 0 {
+        return -1;
+    }
+    0
+}
+
+#[cfg(not(any(unix, windows)))]
+unsafe fn netpoll_set_nonblock(_fd: i32) -> i32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_init() {
+    NETPOLL_INIT_ONCE.call_once(|| unsafe {
+        let epfd = epoll_create1(EPOLL_CLOEXEC);
+        if epfd < 0 {
+            return;
+        }
+
+        let breakfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if breakfd < 0 {
+            let _ = close(epfd);
+            return;
+        }
+
+        let mut ev: epoll_event = mem::zeroed();
+        ev.events = (EPOLLIN | EPOLLERR | EPOLLHUP) as u32;
+        ev.u64 = NETPOLL_BREAK_TAG;
+        if epoll_ctl(epfd, EPOLL_CTL_ADD, breakfd, &mut ev as *mut epoll_event) != 0 {
+            let _ = close(breakfd);
+            let _ = close(epfd);
+            return;
+        }
+
+        NETPOLL_EPFD = epfd;
+        NETPOLL_BREAKFD = breakfd;
+        NETPOLL_ENABLED.store(1, Ordering::Release);
+    });
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_init() {
+    NETPOLL_INIT_ONCE.call_once(|| unsafe {
+        let mut fds: [i32; 2] = [0; 2];
+        if pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        if netpoll_set_nonblock(fds[0]) != 0 || netpoll_set_nonblock(fds[1]) != 0 {
+            let _ = close(fds[0]);
+            let _ = close(fds[1]);
+            return;
+        }
+        NETPOLL_BREAK_RFD = fds[0];
+        NETPOLL_BREAK_WFD = fds[1];
+        {
+            let mut reg = netpoll_reg_lock();
+            reg.clear();
+        }
+        NETPOLL_ENABLED.store(1, Ordering::Release);
+    });
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_make_break_pair() -> Option<(usize, usize)> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let addr = listener.local_addr().ok()?;
+    let writer = TcpStream::connect(addr).ok()?;
+    let (reader, _) = listener.accept().ok()?;
+    let rsock = reader.into_raw_socket() as usize;
+    let wsock = writer.into_raw_socket() as usize;
+    Some((rsock, wsock))
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_init() {
+    NETPOLL_INIT_ONCE.call_once(|| unsafe {
+        let Some((rsock, wsock)) = netpoll_make_break_pair() else {
+            return;
+        };
+        if netpoll_set_nonblock_socket(rsock) != 0 || netpoll_set_nonblock_socket(wsock) != 0 {
+            let _ = closesocket(rsock);
+            let _ = closesocket(wsock);
+            return;
+        }
+        NETPOLL_BREAK_RSOCK = rsock;
+        NETPOLL_BREAK_WSOCK = wsock;
+        {
+            let mut reg = netpoll_reg_lock();
+            reg.clear();
+        }
+        NETPOLL_ENABLED.store(1, Ordering::Release);
+    });
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn netpoll_init() {}
+
+#[cfg(target_os = "linux")]
+#[inline(always)]
+unsafe fn netpoll_wake_readable(flags: i32) -> bool {
+    (flags & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0
+}
+
+#[cfg(target_os = "linux")]
+#[inline(always)]
+unsafe fn netpoll_wake_writable(flags: i32) -> bool {
+    (flags & (EPOLLOUT | EPOLLERR | EPOLLHUP)) != 0
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_drain_breakfd() {
+    if NETPOLL_BREAKFD < 0 {
+        return;
+    }
+    let mut val: u64 = 0;
+    loop {
+        let n = read(
+            NETPOLL_BREAKFD,
+            (&mut val as *mut u64).cast::<c_void>(),
+            mem::size_of::<u64>(),
+        );
+        if n < mem::size_of::<u64>() as isize {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_drain_breakfd() {
+    if NETPOLL_BREAK_RFD < 0 {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    loop {
+        let n = read(
+            NETPOLL_BREAK_RFD,
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        );
+        if n <= 0 || (n as usize) < buf.len() {
+            break;
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_drain_breakfd() {
+    if NETPOLL_BREAK_RSOCK == 0 {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    loop {
+        let n = recv(NETPOLL_BREAK_RSOCK, buf.as_mut_ptr(), buf.len() as i32, 0);
+        if n > 0 {
+            if (n as usize) < buf.len() {
+                break;
+            }
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        let err = WSAGetLastError();
+        if err == WSA_EWOULDBLOCK {
+            break;
+        }
+        break;
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_break() {
+    if !netpoll_enabled() || NETPOLL_BREAKFD < 0 {
+        return;
+    }
+    let one: u64 = 1;
+    let _ = write(
+        NETPOLL_BREAKFD,
+        (&one as *const u64).cast::<c_void>(),
+        mem::size_of::<u64>(),
+    );
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_break() {
+    if !netpoll_enabled() || NETPOLL_BREAK_WFD < 0 {
+        return;
+    }
+    let one: [u8; 1] = [1];
+    let _ = write(
+        NETPOLL_BREAK_WFD,
+        one.as_ptr().cast::<c_void>(),
+        one.len(),
+    );
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_break() {
+    if !netpoll_enabled() || NETPOLL_BREAK_WSOCK == 0 {
+        return;
+    }
+    let one = [1u8; 1];
+    let _ = send(NETPOLL_BREAK_WSOCK, one.as_ptr(), 1, 0);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn netpoll_break() {}
+
+#[cfg(target_os = "linux")]
+#[inline(always)]
+unsafe fn netpoll_epoll_events(want: u32) -> u32 {
+    let mut events = (EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLONESHOT) as u32;
+    if (want & PD_WANT_READ) != 0 {
+        events |= EPOLLIN as u32;
+    }
+    if (want & PD_WANT_WRITE) != 0 {
+        events |= EPOLLOUT as u32;
+    }
+    events
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_arm(pd: *mut gost_poll_desc, want: u32) -> i32 {
+    if pd.is_null() {
+        return -1;
+    }
+    if !netpoll_enabled() {
+        return -1;
+    }
+    let fd = (*pd).fd;
+    if fd < 0 {
+        return -1;
+    }
+    if want == 0 {
+        (*pd).state.store(0, Ordering::Release);
+        return 0;
+    }
+
+    let mut ev: epoll_event = mem::zeroed();
+    ev.events = netpoll_epoll_events(want);
+    ev.u64 = pd as u64;
+
+    let epfd = NETPOLL_EPFD;
+    if epfd < 0 {
+        return -1;
+    }
+
+    let mut rc = epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &mut ev as *mut epoll_event);
+    if rc != 0 {
+        rc = epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev as *mut epoll_event);
+        if rc != 0 {
+            return -1;
+        }
+    }
+
+    let mut state = want;
+    if (want & PD_WANT_READ) != 0 {
+        state |= PD_ARMED_READ;
+    }
+    if (want & PD_WANT_WRITE) != 0 {
+        state |= PD_ARMED_WRITE;
+    }
+    (*pd).state.store(state, Ordering::Release);
+    0
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_arm(pd: *mut gost_poll_desc, want: u32) -> i32 {
+    if pd.is_null() || !netpoll_enabled() {
+        return -1;
+    }
+    let fd = (*pd).handle as i32;
+    if fd < 0 {
+        return -1;
+    }
+    if want == 0 {
+        (*pd).state.store(0, Ordering::Release);
+        netpoll_reg_remove(pd);
+        return 0;
+    }
+    let mut state = want;
+    if (want & PD_WANT_READ) != 0 {
+        state |= PD_ARMED_READ;
+    }
+    if (want & PD_WANT_WRITE) != 0 {
+        state |= PD_ARMED_WRITE;
+    }
+    (*pd).state.store(state, Ordering::Release);
+    netpoll_reg_add(pd);
+    0
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_arm(pd: *mut gost_poll_desc, want: u32) -> i32 {
+    if pd.is_null() || !netpoll_enabled() {
+        return -1;
+    }
+    let sock = (*pd).handle;
+    if sock == 0 || sock == usize::MAX {
+        return -1;
+    }
+    if want == 0 {
+        (*pd).state.store(0, Ordering::Release);
+        netpoll_reg_remove(pd);
+        return 0;
+    }
+    let mut state = want;
+    if (want & PD_WANT_READ) != 0 {
+        state |= PD_ARMED_READ;
+    }
+    if (want & PD_WANT_WRITE) != 0 {
+        state |= PD_ARMED_WRITE;
+    }
+    (*pd).state.store(state, Ordering::Release);
+    netpoll_reg_add(pd);
+    0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn netpoll_arm(_pd: *mut gost_poll_desc, _want: u32) -> i32 {
+    -1
+}
+
+unsafe fn netpoll_waiters_want(pd: *mut gost_poll_desc) -> u32 {
+    if pd.is_null() {
+        return 0;
+    }
+    let mut want = 0u32;
+    if !(*pd).r_wait.load(Ordering::Acquire).is_null() {
+        want |= PD_WANT_READ;
+    }
+    if !(*pd).w_wait.load(Ordering::Acquire).is_null() {
+        want |= PD_WANT_WRITE;
+    }
+    want
+}
+
+unsafe fn netpoll_wait_slot(
+    pd: *mut gost_poll_desc,
+    slot: &AtomicPtr<gost_g>,
+    want: u32,
+) -> Result<(), String> {
+    if pd.is_null() {
+        return Err("poll descriptor is null".to_string());
+    }
+    let g = tls_g_get();
+    if g.is_null() {
+        return Err("netpoll wait requires runtime goroutine context".to_string());
+    }
+    if slot
+        .compare_exchange(ptr::null_mut(), g, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("concurrent waiters for same fd direction are not supported".to_string());
+    }
+
+    // Commit parking state before arming so an immediate wake cannot be lost.
+    let sched = g_sched_mut();
+    os_mutex_lock(&mut sched.mu);
+    (*g).park_ready = 0;
+    (*g).state = G_PARKING;
+    os_mutex_unlock(&mut sched.mu);
+
+    let arm_want = netpoll_waiters_want(pd) | want;
+    if netpoll_arm(pd, arm_want) != 0 {
+        slot.store(ptr::null_mut(), Ordering::Release);
+        let sched = g_sched_mut();
+        os_mutex_lock(&mut sched.mu);
+        if (*g).state == G_PARKING && (*g).park_ready == 0 {
+            (*g).state = G_RUNNING;
+        }
+        os_mutex_unlock(&mut sched.mu);
+        return Err("netpoll arm failed".to_string());
+    }
+
+    gopark_committed();
+    let _ = slot.compare_exchange(g, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
+    Ok(())
+}
+
+unsafe fn netpoll_wait_read(pd: *mut gost_poll_desc) -> Result<(), String> {
+    if pd.is_null() {
+        return Err("netpoll unavailable".to_string());
+    }
+    netpoll_wait_slot(pd, &(*pd).r_wait, PD_WANT_READ)
+}
+
+unsafe fn netpoll_wait_write(pd: *mut gost_poll_desc) -> Result<(), String> {
+    if pd.is_null() {
+        return Err("netpoll unavailable".to_string());
+    }
+    netpoll_wait_slot(pd, &(*pd).w_wait, PD_WANT_WRITE)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+unsafe fn net_wait_read(pd: *mut gost_poll_desc) -> Result<(), String> {
+    if pd.is_null() {
+        std::thread::yield_now();
+        return Ok(());
+    }
+    netpoll_wait_read(pd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn net_wait_read(_pd: *mut gost_poll_desc) -> Result<(), String> {
+    std::thread::yield_now();
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+unsafe fn net_wait_write(pd: *mut gost_poll_desc) -> Result<(), String> {
+    if pd.is_null() {
+        std::thread::yield_now();
+        return Ok(());
+    }
+    netpoll_wait_write(pd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn net_wait_write(_pd: *mut gost_poll_desc) -> Result<(), String> {
+    std::thread::yield_now();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_wait_collect(ready: &mut Vec<*mut gost_g>, wait_ms: i64) {
+    if !netpoll_enabled() || NETPOLL_EPFD < 0 {
+        return;
+    }
+    let timeout = if wait_ms < 0 {
+        -1
+    } else if wait_ms > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        wait_ms as i32
+    };
+
+    let mut events: [epoll_event; NETPOLL_MAX_EVENTS] = mem::zeroed();
+    let n = epoll_wait(
+        NETPOLL_EPFD,
+        events.as_mut_ptr(),
+        NETPOLL_MAX_EVENTS as i32,
+        timeout,
+    );
+    if n <= 0 {
+        return;
+    }
+    for i in 0..(n as usize) {
+        let ev = events[i];
+        if ev.u64 == NETPOLL_BREAK_TAG {
+            netpoll_drain_breakfd();
+            continue;
+        }
+        let pd = ev.u64 as *mut gost_poll_desc;
+        if pd.is_null() {
+            continue;
+        }
+        let flags = ev.events as i32;
+        let mut clear_mask = 0u32;
+        if netpoll_wake_readable(flags) {
+            clear_mask |= PD_ARMED_READ;
+            let g = (*pd).r_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if netpoll_wake_writable(flags) {
+            clear_mask |= PD_ARMED_WRITE;
+            let g = (*pd).w_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if clear_mask != 0 {
+            (*pd).state.fetch_and(!clear_mask, Ordering::AcqRel);
+        }
+        let rearm_want = netpoll_waiters_want(pd);
+        if rearm_want != 0 {
+            let _ = netpoll_arm(pd, rearm_want);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_wait_collect(ready: &mut Vec<*mut gost_g>, wait_ms: i64) {
+    if !netpoll_enabled() {
+        return;
+    }
+    let timeout = if wait_ms < 0 {
+        -1
+    } else if wait_ms > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        wait_ms as i32
+    };
+
+    let regs = {
+        let reg = netpoll_reg_lock();
+        reg.clone()
+    };
+    let mut fds: Vec<pollfd> = Vec::with_capacity(regs.len() + 1);
+    let mut pds: Vec<*mut gost_poll_desc> = Vec::with_capacity(regs.len() + 1);
+
+    if NETPOLL_BREAK_RFD >= 0 {
+        fds.push(pollfd {
+            fd: NETPOLL_BREAK_RFD,
+            events: POLLIN as i16,
+            revents: 0,
+        });
+        pds.push(ptr::null_mut());
+    }
+
+    for key in regs {
+        let pd = key as *mut gost_poll_desc;
+        if pd.is_null() || !netpoll_reg_contains(pd) {
+            continue;
+        }
+        let fd = (*pd).handle as i32;
+        if fd < 0 {
+            continue;
+        }
+        let want = netpoll_waiters_want(pd);
+        if want == 0 {
+            continue;
+        }
+        let mut events: i16 = 0;
+        if (want & PD_WANT_READ) != 0 {
+            events |= POLLIN as i16;
+        }
+        if (want & PD_WANT_WRITE) != 0 {
+            events |= POLLOUT as i16;
+        }
+        if events == 0 {
+            continue;
+        }
+        fds.push(pollfd { fd, events, revents: 0 });
+        pds.push(pd);
+    }
+    if fds.is_empty() {
+        return;
+    }
+
+    let n = poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
+    if n <= 0 {
+        return;
+    }
+    for i in 0..fds.len() {
+        let revents = fds[i].revents as i32;
+        if revents == 0 {
+            continue;
+        }
+        let pd = pds[i];
+        if pd.is_null() {
+            netpoll_drain_breakfd();
+            continue;
+        }
+        if !netpoll_reg_contains(pd) {
+            continue;
+        }
+        if (*pd).handle as i32 != fds[i].fd {
+            continue;
+        }
+        let mut clear_mask = 0u32;
+        if (revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0 {
+            clear_mask |= PD_ARMED_READ;
+            let g = (*pd).r_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if (revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0 {
+            clear_mask |= PD_ARMED_WRITE;
+            let g = (*pd).w_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if clear_mask != 0 {
+            (*pd).state.fetch_and(!clear_mask, Ordering::AcqRel);
+        }
+        let rearm_want = netpoll_waiters_want(pd);
+        if rearm_want != 0 {
+            let _ = netpoll_arm(pd, rearm_want);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_wait_collect(ready: &mut Vec<*mut gost_g>, wait_ms: i64) {
+    if !netpoll_enabled() {
+        return;
+    }
+    let timeout = if wait_ms < 0 {
+        -1
+    } else if wait_ms > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        wait_ms as i32
+    };
+
+    let regs = {
+        let reg = netpoll_reg_lock();
+        reg.clone()
+    };
+    let mut fds: Vec<WSAPOLLFD> = Vec::with_capacity(regs.len() + 1);
+    let mut pds: Vec<*mut gost_poll_desc> = Vec::with_capacity(regs.len() + 1);
+
+    if NETPOLL_BREAK_RSOCK != 0 {
+        fds.push(WSAPOLLFD {
+            fd: NETPOLL_BREAK_RSOCK,
+            events: WS_POLLIN,
+            revents: 0,
+        });
+        pds.push(ptr::null_mut());
+    }
+
+    for key in regs {
+        let pd = key as *mut gost_poll_desc;
+        if pd.is_null() || !netpoll_reg_contains(pd) {
+            continue;
+        }
+        let sock = (*pd).handle;
+        if sock == 0 {
+            continue;
+        }
+        let want = netpoll_waiters_want(pd);
+        if want == 0 {
+            continue;
+        }
+        let mut events: i16 = 0;
+        if (want & PD_WANT_READ) != 0 {
+            events |= WS_POLLIN;
+        }
+        if (want & PD_WANT_WRITE) != 0 {
+            events |= WS_POLLOUT;
+        }
+        if events == 0 {
+            continue;
+        }
+        fds.push(WSAPOLLFD {
+            fd: sock,
+            events,
+            revents: 0,
+        });
+        pds.push(pd);
+    }
+    if fds.is_empty() {
+        return;
+    }
+
+    let n = WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout);
+    if n <= 0 {
+        return;
+    }
+    for i in 0..fds.len() {
+        let revents = fds[i].revents;
+        if revents == 0 {
+            continue;
+        }
+        let pd = pds[i];
+        if pd.is_null() {
+            netpoll_drain_breakfd();
+            continue;
+        }
+        if !netpoll_reg_contains(pd) {
+            continue;
+        }
+        if (*pd).handle != fds[i].fd {
+            continue;
+        }
+        let mut clear_mask = 0u32;
+        if (revents & (WS_POLLIN | WS_POLLERR | WS_POLLHUP | WS_POLLNVAL)) != 0 {
+            clear_mask |= PD_ARMED_READ;
+            let g = (*pd).r_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if (revents & (WS_POLLOUT | WS_POLLERR | WS_POLLHUP | WS_POLLNVAL)) != 0 {
+            clear_mask |= PD_ARMED_WRITE;
+            let g = (*pd).w_wait.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !g.is_null() {
+                ready.push(g);
+            }
+        }
+        if clear_mask != 0 {
+            (*pd).state.fetch_and(!clear_mask, Ordering::AcqRel);
+        }
+        let rearm_want = netpoll_waiters_want(pd);
+        if rearm_want != 0 {
+            let _ = netpoll_arm(pd, rearm_want);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+unsafe fn netpoll_wait_idle_locked(wait_ms: i64) -> bool {
+    if !netpoll_enabled() {
+        return false;
+    }
+    if NETPOLL_WAITER
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+
+    let sched = g_sched_mut();
+    os_mutex_unlock(&mut sched.mu);
+
+    let mut ready: Vec<*mut gost_g> = Vec::with_capacity(32);
+    netpoll_wait_collect(&mut ready, wait_ms);
+
+    NETPOLL_WAITER.store(0, Ordering::Release);
+
+    if !ready.is_empty() {
+        goready_batch(&mut ready);
+    }
+
+    os_mutex_lock(&mut sched.mu);
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn netpoll_wait_idle_locked(_wait_ms: i64) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn netpoll_del(pd: *mut gost_poll_desc) {
+    if pd.is_null() || !netpoll_enabled() || NETPOLL_EPFD < 0 {
+        return;
+    }
+    let fd = (*pd).fd;
+    if fd >= 0 {
+        let _ = epoll_ctl(NETPOLL_EPFD, EPOLL_CTL_DEL, fd, ptr::null_mut());
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn netpoll_del(pd: *mut gost_poll_desc) {
+    if pd.is_null() {
+        return;
+    }
+    netpoll_reg_remove(pd);
+}
+
+#[cfg(windows)]
+unsafe fn netpoll_del(pd: *mut gost_poll_desc) {
+    if pd.is_null() {
+        return;
+    }
+    netpoll_reg_remove(pd);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+unsafe fn netpoll_del(_pd: *mut gost_poll_desc) {}
+
+unsafe fn poll_desc_new_with(fd: i32, handle: usize) -> *mut gost_poll_desc {
+    let pd = libc::malloc(mem::size_of::<gost_poll_desc>()) as *mut gost_poll_desc;
+    if pd.is_null() {
+        return ptr::null_mut();
+    }
+    ptr::write(
+        pd,
+        gost_poll_desc {
+            fd,
+            handle,
+            r_wait: AtomicPtr::new(ptr::null_mut()),
+            w_wait: AtomicPtr::new(ptr::null_mut()),
+            state: AtomicU32::new(0),
+        },
+    );
+    pd
+}
+
+unsafe fn poll_desc_new(fd: i32) -> *mut gost_poll_desc {
+    if fd < 0 {
+        return ptr::null_mut();
+    }
+    poll_desc_new_with(fd, fd as usize)
+}
+
+#[cfg(windows)]
+unsafe fn poll_desc_new_socket(sock: usize) -> *mut gost_poll_desc {
+    poll_desc_new_with(-1, sock)
+}
+
+unsafe fn poll_desc_free(pd: *mut gost_poll_desc) {
+    if pd.is_null() {
+        return;
+    }
+    libc::free(pd.cast::<c_void>());
+}
+
+#[cfg(not(windows))]
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_poll_open(fd: i32) -> *mut gost_poll_desc {
+    unsafe {
+        if fd < 0 {
+            return ptr::null_mut();
+        }
+        netpoll_init();
+        if !netpoll_enabled() {
+            return ptr::null_mut();
+        }
+        if netpoll_set_nonblock(fd) != 0 {
+            return ptr::null_mut();
+        }
+        poll_desc_new(fd)
+    }
+}
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_poll_open(fd: i32) -> *mut gost_poll_desc {
+    let _ = fd;
+    ptr::null_mut()
+}
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_poll_open_socket(sock: u64) -> *mut gost_poll_desc {
+    unsafe {
+        if sock == 0 || sock == u64::MAX {
+            return ptr::null_mut();
+        }
+        let sock = sock as usize;
+        netpoll_init();
+        if !netpoll_enabled() {
+            return ptr::null_mut();
+        }
+        if netpoll_set_nonblock_socket(sock) != 0 {
+            return ptr::null_mut();
+        }
+        poll_desc_new_socket(sock)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_poll_close(pd: *mut gost_poll_desc) {
+    unsafe {
+        if pd.is_null() {
+            return;
+        }
+        netpoll_del(pd);
+        poll_desc_free(pd);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_poll_arm(pd: *mut gost_poll_desc, want: i32) -> i32 {
+    unsafe {
+        if pd.is_null() {
+            return -1;
+        }
+        let mut w = 0u32;
+        if (want & (PD_WANT_READ as i32)) != 0 {
+            w |= PD_WANT_READ;
+        }
+        if (want & (PD_WANT_WRITE as i32)) != 0 {
+            w |= PD_WANT_WRITE;
+        }
+        netpoll_arm(pd, w)
+    }
 }
 
 #[inline(always)]
@@ -983,10 +2522,15 @@ unsafe fn timer_add(ch: *mut __gost_chan, ms: i64) {
     let old_earliest = th_peek_when(sched.timers_heap);
     th_push(sched.timers_heap, t);
     let new_earliest = th_peek_when(sched.timers_heap);
+    let mut wake_netpoll = false;
     if old_earliest == i64::MAX || new_earliest < old_earliest {
         os_cond_signal(&mut sched.cv);
+        wake_netpoll = true;
     }
     os_mutex_unlock(&mut sched.mu);
+    if wake_netpoll {
+        netpoll_break();
+    }
 }
 
 unsafe fn timer_pop_due_batch(now: i64, limit: usize) -> *mut gost_timer {
@@ -1219,6 +2763,7 @@ unsafe extern "C" fn sched_init_once() {
     sched.ps = ptr::null_mut();
     sched.ms = ptr::null_mut();
     sched.mthreads = ptr::null_mut();
+    netpoll_init();
 }
 
 unsafe fn goready_locked_one(sched: &mut gost_sched, g: *mut gost_g, enq: &mut bool) {
@@ -1276,6 +2821,9 @@ unsafe fn goready_batch(gs: &mut Vec<*mut gost_g>) {
         }
     }
     os_mutex_unlock(&mut sched.mu);
+    if enq {
+        netpoll_break();
+    }
     gs.clear();
 }
 
@@ -1304,6 +2852,9 @@ unsafe fn goready_batch_rr(gs: &mut Vec<*mut gost_g>) {
         }
     }
     os_mutex_unlock(&mut sched.mu);
+    if enq {
+        netpoll_break();
+    }
     gs.clear();
 }
 
@@ -1318,6 +2869,9 @@ unsafe fn goready(g: *mut gost_g) {
         os_cond_signal(&mut sched.cv);
     }
     os_mutex_unlock(&mut sched.mu);
+    if enq {
+        netpoll_break();
+    }
 }
 
 unsafe fn gopark() {
@@ -1330,6 +2884,16 @@ unsafe fn gopark() {
     (*g).park_ready = 0;
     (*g).state = G_PARKING;
     os_mutex_unlock(&mut sched.mu);
+    park_fuzz_point();
+    gost_ctx_swap(&mut (*g).ctx, &mut (*m).sched_ctx);
+}
+
+unsafe fn gopark_committed() {
+    let g = tls_g_get();
+    let m = tls_m_get();
+    if g.is_null() || m.is_null() {
+        return;
+    }
     park_fuzz_point();
     gost_ctx_swap(&mut (*g).ctx, &mut (*m).sched_ctx);
 }
@@ -1350,6 +2914,7 @@ unsafe fn sched_loop(m: *mut gost_m) {
             if sched.main_done != 0 && G_LIVE.load(Ordering::Relaxed) == 0 {
                 sched.shutting_down = 1;
                 os_cond_broadcast(&mut sched.cv);
+                netpoll_break();
             }
             if sched.shutting_down != 0 { break; }
             if !(*m).p.is_null() && !(*(*m).p).runq_head.is_null() { break; }
@@ -1363,9 +2928,15 @@ unsafe fn sched_loop(m: *mut gost_m) {
             let now = now_ms();
             let next_when = th_peek_when(sched.timers_heap);
             if next_when <= now { break; }
+            let mut wait_ms = -1i64;
             if next_when != i64::MAX {
-                let mut wait_ms = next_when - now;
+                wait_ms = next_when - now;
                 if wait_ms < 0 { wait_ms = 0; }
+            }
+            if netpoll_wait_idle_locked(wait_ms) {
+                continue;
+            }
+            if next_when != i64::MAX {
                 #[cfg(windows)]
                 {
                     if wait_ms > 50 { wait_ms = 50; }
@@ -1461,21 +3032,25 @@ unsafe fn selq_unlink_locked(ch: *mut __gost_chan, n: *mut gost_selnode) {
     (*n).next_ch = ptr::null_mut();
 }
 
-unsafe fn __gost_chan_retain(ch: *mut __gost_chan) {
-    if ch.is_null() { return; }
-    (*ch).refcount.fetch_add(1, Ordering::Relaxed);
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_chan_retain(ch: *mut __gost_chan) {
+    unsafe {
+        if !chan_is_registered(ch) { return; }
+        (*ch).refcount.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 unsafe fn __gost_chan_release(ch: *mut __gost_chan) {
-    if ch.is_null() { return; }
+    if !chan_is_registered(ch) { return; }
     if (*ch).refcount.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
+    chan_unregister(ch);
     os_mutex_destroy(&mut (*ch).mu);
     if !(*ch).buf.is_null() { __gost_free((*ch).buf as *mut c_void, 0, 1); }
     libc::free(ch as *mut c_void);
 }
 
 unsafe fn chan_send_nowait_collect(ch: *mut __gost_chan, wake: &mut Vec<*mut gost_g>) {
-    if ch.is_null() { return; }
+    if !chan_is_registered(ch) { return; }
     os_mutex_lock(&mut (*ch).mu);
     if (*ch).closed != 0 {
         os_mutex_unlock(&mut (*ch).mu);
@@ -1568,6 +3143,9 @@ unsafe fn select_notify_chan(ch: *mut __gost_chan) {
         }
     }
     os_mutex_unlock(&mut sched.mu);
+    if enq {
+        netpoll_break();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1578,6 +3156,7 @@ pub extern "C" fn __gost_rt_init() {
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
     unsafe {
+        os_console_utf8_init();
         __gost_rt_init();
         let main_fn = match main_fn { Some(f) => f, None => return 0 };
         let sched = g_sched_mut();
@@ -1680,6 +3259,955 @@ pub extern "C" fn __gost_error_new(_msg: *const u8, _len: usize) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __gost_singleton_acquire(name_ptr: *const u8, name_len: i64) -> i32 {
+    #[cfg(windows)]
+    unsafe {
+        const ERROR_ALREADY_EXISTS: u32 = 183;
+        let name = match raw_utf8_from(name_ptr, name_len) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        wide.push(0);
+        let h = CreateMutexW(ptr::null_mut(), 1, wide.as_ptr());
+        if h.is_null() {
+            return 0;
+        }
+        let err = GetLastError();
+        if err == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(h);
+            return 0;
+        }
+        G_SINGLETON_MUTEX = h;
+        return 1;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name_ptr, name_len);
+        1
+    }
+}
+
+#[repr(C)]
+pub struct gost_string {
+    pub ptr: *const u8,
+    pub len: i64,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_string_len(ptr: *const u8, len: i64) -> i64 {
+    if std::env::var_os("GOST_DEBUG_STRING").is_some() {
+        eprintln!("string_len: ptr={:?} len={}", ptr, len);
+    }
+    if ptr.is_null() && len != 0 {
+        __gost_panic(b"string is null\0".as_ptr(), 14);
+    }
+    len
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_string_get(ptr: *const u8, len: i64, idx: i64) -> i32 {
+    unsafe {
+        if ptr.is_null() {
+            __gost_panic(b"string is null\0".as_ptr(), 14);
+        }
+        if idx < 0 || idx >= len {
+            __gost_panic(b"string index out of bounds\0".as_ptr(), 27);
+        }
+        let b = *ptr.add(idx as usize);
+        b as i32
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_string_slice(out: *mut gost_string, ptr: *const u8, slen: i64, start: i64, len: i64) {
+    unsafe {
+        if out.is_null() {
+            __gost_panic(b"string out is null\0".as_ptr(), 18);
+        }
+        if std::env::var_os("GOST_DEBUG_STRING").is_some() {
+            eprintln!("string_slice: slen={} start={} len={}", slen, start, len);
+        }
+        if slen < 0 {
+            __gost_panic(b"string length invalid\0".as_ptr(), 22);
+        }
+        if ptr.is_null() && slen != 0 {
+            __gost_panic(b"string is null\0".as_ptr(), 14);
+        }
+        if start < 0 || len < 0 {
+            __gost_panic(b"string slice out of bounds\0".as_ptr(), 29);
+        }
+        if start > slen || slen - start < len {
+            __gost_panic(b"string slice out of bounds\0".as_ptr(), 29);
+        }
+        if len == 0 {
+            (*out).ptr = ptr::null();
+            (*out).len = 0;
+            return;
+        }
+        let n = len as usize;
+        let dst = __gost_alloc(n, 1) as *mut u8;
+        ptr::copy_nonoverlapping(ptr.add(start as usize), dst, n);
+        (*out).ptr = dst as *const u8;
+        (*out).len = len;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_string_concat(out: *mut gost_string, a_ptr: *const u8, a_len: i64, b_ptr: *const u8, b_len: i64) {
+    unsafe {
+        if out.is_null() {
+            __gost_panic(b"string out is null\0".as_ptr(), 18);
+        }
+        if a_len < 0 || b_len < 0 {
+            __gost_panic(b"string length invalid\0".as_ptr(), 22);
+        }
+        if (a_ptr.is_null() && a_len != 0) || (b_ptr.is_null() && b_len != 0) {
+            __gost_panic(b"string is null\0".as_ptr(), 14);
+        }
+        let total = a_len.checked_add(b_len).unwrap_or(-1);
+        if total < 0 {
+            __gost_panic(b"string length overflow\0".as_ptr(), 24);
+        }
+        if total == 0 {
+            (*out).ptr = ptr::null();
+            (*out).len = 0;
+            return;
+        }
+        let n = total as usize;
+        let dst = __gost_alloc(n, 1) as *mut u8;
+        if a_len > 0 {
+            ptr::copy_nonoverlapping(a_ptr, dst, a_len as usize);
+        }
+        if b_len > 0 {
+            ptr::copy_nonoverlapping(b_ptr, dst.add(a_len as usize), b_len as usize);
+        }
+        (*out).ptr = dst as *const u8;
+        (*out).len = total;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_string_from_byte(out: *mut gost_string, b: i32) {
+    unsafe {
+        if out.is_null() {
+            __gost_panic(b"string out is null\0".as_ptr(), 18);
+        }
+        if b < 0 || b > 255 {
+            __gost_panic(b"byte out of range\0".as_ptr(), 17);
+        }
+        let dst = __gost_alloc(1, 1) as *mut u8;
+        *dst = b as u8;
+        (*out).ptr = dst as *const u8;
+        (*out).len = 1;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_last_status() -> i32 {
+    NET_LAST_STATUS.with(|v| v.get())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_last_http_status() -> i32 {
+    NET_LAST_HTTP_STATUS.with(|v| v.get())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_last_error(out: *mut gost_string) {
+    unsafe {
+        if out.is_null() {
+            return;
+        }
+        NET_LAST_ERR.with(|v| gost_string_set_bytes(out, v.borrow().as_bytes()));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_last_peer(out: *mut gost_string) {
+    unsafe {
+        if out.is_null() {
+            return;
+        }
+        NET_LAST_PEER.with(|v| gost_string_set_bytes(out, v.borrow().as_bytes()));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_listen(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    unsafe {
+        let addr = match raw_utf8_from(addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return 0;
+            }
+        };
+        match TcpListener::bind(addr.as_str()) {
+            Ok(listener) => {
+                net_clear_last_peer();
+                net_set_ok();
+                let pd = net_open_pd_listener(&listener);
+                net_insert_handle(NetHandle::TcpListener {
+                    sock: Arc::new(listener),
+                    pd: pd as usize,
+                })
+            }
+            Err(e) => {
+                net_set_err(format!("tcp listen failed: {}", e));
+                0
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
+    let (listener, pd) = match net_get_tcp_listener(listener_handle) {
+        Ok(v) => v,
+        Err(e) => {
+            net_set_err(e);
+            return 0;
+        }
+    };
+    loop {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                net_tune_tcp_stream(&stream);
+                net_set_last_peer(peer.to_string());
+                net_set_ok();
+                let child_pd = net_open_pd_stream(&stream);
+                return net_insert_handle(NetHandle::TcpStream {
+                    sock: Arc::new(stream),
+                    pd: child_pd as usize,
+                });
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                match unsafe { net_wait_read(pd) } {
+                    Ok(()) => continue,
+                    Err(msg) => {
+                        net_set_err(msg);
+                        return 0;
+                    }
+                }
+            }
+            Err(e) => {
+                net_set_err(format!("tcp accept failed: {}", e));
+                return 0;
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_connect(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    unsafe {
+        let addr = match raw_utf8_from(addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return 0;
+            }
+        };
+        netpoll_init();
+        let conn = if netpoll_enabled() {
+            net_tcp_connect_nonblocking(addr.as_str())
+        } else {
+            net_tcp_connect_blocking(addr.as_str())
+        };
+        match conn {
+            Ok((stream, pd)) => {
+                net_clear_last_peer();
+                net_set_ok();
+                net_insert_handle(NetHandle::TcpStream {
+                    sock: Arc::new(stream),
+                    pd: pd as usize,
+                })
+            }
+            Err(e) => {
+                net_set_err(e);
+                0
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_close(handle: i64) -> i32 {
+    if net_remove_handle(handle) {
+        net_set_ok();
+        0
+    } else {
+        net_set_err("invalid handle".to_string());
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_write(handle: i64, data_ptr: *const u8, data_len: i64) -> i64 {
+    unsafe {
+        let (stream, pd) = match net_get_tcp_stream(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        let payload = match raw_bytes_from(data_ptr, data_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        if payload.is_empty() {
+            net_set_ok();
+            return 0;
+        }
+
+        let mut off = 0usize;
+        loop {
+            let mut sref = &*stream;
+            match sref.write(&payload[off..]) {
+                Ok(0) => {
+                    if off == 0 {
+                        net_set_eof();
+                        return 0;
+                    }
+                    net_set_ok();
+                    return off as i64;
+                }
+                Ok(n) => {
+                    off += n;
+                    net_set_ok();
+                    return off as i64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_write(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            if off > 0 {
+                                net_set_ok();
+                                return off as i64;
+                            }
+                            net_set_err(msg);
+                            return -1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if off > 0 {
+                        net_set_ok();
+                        return off as i64;
+                    }
+                    net_set_err(format!("tcp write failed: {}", e));
+                    return -1;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_tcp_read(out: *mut gost_string, handle: i64, max_len: i32) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        let (stream, pd) = match net_get_tcp_stream(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let cap = if max_len <= 0 { 4096usize } else { max_len as usize };
+        let mut buf = vec![0u8; cap];
+        loop {
+            let mut sref = &*stream;
+            match sref.read(&mut buf) {
+                Ok(0) => {
+                    net_set_eof();
+                    return;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    gost_string_set_bytes(out, &buf);
+                    net_set_ok();
+                    return;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_read(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    net_set_err(format!("tcp read failed: {}", e));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_bind(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    unsafe {
+        let addr = match raw_utf8_from(addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return 0;
+            }
+        };
+        match UdpSocket::bind(addr.as_str()) {
+            Ok(sock) => {
+                net_set_ok();
+                let pd = net_open_pd_udp(&sock);
+                net_insert_handle(NetHandle::UdpSocket {
+                    sock: Arc::new(sock),
+                    pd: pd as usize,
+                })
+            }
+            Err(e) => {
+                net_set_err(format!("udp bind failed: {}", e));
+                0
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_connect(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    unsafe {
+        let addr = match raw_utf8_from(addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return 0;
+            }
+        };
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(sock) => {
+                if let Err(e) = sock.connect(addr.as_str()) {
+                    net_set_err(format!("udp connect failed: {}", e));
+                    return 0;
+                }
+                net_set_ok();
+                let pd = net_open_pd_udp(&sock);
+                net_insert_handle(NetHandle::UdpSocket {
+                    sock: Arc::new(sock),
+                    pd: pd as usize,
+                })
+            }
+            Err(e) => {
+                net_set_err(format!("udp socket create failed: {}", e));
+                0
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_close(handle: i64) -> i32 {
+    if net_remove_handle(handle) {
+        net_set_ok();
+        0
+    } else {
+        net_set_err("invalid handle".to_string());
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_send(handle: i64, data_ptr: *const u8, data_len: i64) -> i64 {
+    unsafe {
+        let (sock, pd) = match net_get_udp_socket(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        let payload = match raw_bytes_from(data_ptr, data_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        if payload.is_empty() {
+            net_set_ok();
+            return 0;
+        }
+        loop {
+            match sock.send(payload) {
+                Ok(n) => {
+                    net_set_ok();
+                    return n as i64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_write(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return -1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    net_set_err(format!("udp send failed: {}", e));
+                    return -1;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_send_to(
+    handle: i64,
+    addr_ptr: *const u8,
+    addr_len: i64,
+    data_ptr: *const u8,
+    data_len: i64,
+) -> i64 {
+    unsafe {
+        let (sock, pd) = match net_get_udp_socket(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        let addr = match raw_utf8_from(addr_ptr, addr_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        let payload = match raw_bytes_from(data_ptr, data_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        loop {
+            match sock.send_to(payload, addr.as_str()) {
+                Ok(n) => {
+                    net_set_ok();
+                    return n as i64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_write(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return -1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    net_set_err(format!("udp send_to failed: {}", e));
+                    return -1;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_recv(out: *mut gost_string, handle: i64, max_len: i32) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        net_clear_last_peer();
+        let (sock, pd) = match net_get_udp_socket(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let cap = if max_len <= 0 { 65535usize } else { max_len as usize };
+        let mut buf = vec![0u8; cap];
+        loop {
+            match sock.recv(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    gost_string_set_bytes(out, &buf);
+                    net_set_ok();
+                    return;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_read(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    net_set_err(format!("udp recv failed: {}", e));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_udp_recv_from(out: *mut gost_string, handle: i64, max_len: i32) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        net_clear_last_peer();
+        let (sock, pd) = match net_get_udp_socket(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let cap = if max_len <= 0 { 65535usize } else { max_len as usize };
+        let mut buf = vec![0u8; cap];
+        loop {
+            match sock.recv_from(&mut buf) {
+                Ok((n, peer)) => {
+                    buf.truncate(n);
+                    gost_string_set_bytes(out, &buf);
+                    net_set_last_peer(peer.to_string());
+                    net_set_ok();
+                    return;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    match net_wait_read(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    net_set_err(format!("udp recv_from failed: {}", e));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_ws_connect(url_ptr: *const u8, url_len: i64) -> i64 {
+    unsafe {
+        let url = match raw_utf8_from(url_ptr, url_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return 0;
+            }
+        };
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+            net_set_err("websocket url must start with ws:// or wss://".to_string());
+            return 0;
+        }
+        match ws_connect(url.as_str()) {
+            Ok((mut ws, _)) => {
+                if let Err(e) = ws_set_nonblocking(&mut ws, true) {
+                    net_set_err(e);
+                    return 0;
+                }
+                let pd = ws_open_pd(&mut ws);
+                net_set_ok();
+                net_insert_handle(NetHandle::WsSocket {
+                    ws: Arc::new(Mutex::new(ws)),
+                    pd: pd as usize,
+                })
+            }
+            Err(e) => {
+                net_set_err(format!("ws connect failed: {}", e));
+                0
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_ws_close(handle: i64) -> i32 {
+    let (ws, _pd) = match net_get_ws(handle) {
+        Ok(v) => v,
+        Err(e) => {
+            net_set_err(e);
+            return -1;
+        }
+    };
+    {
+        let mut guard = match ws.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let _ = guard.close(None);
+    }
+    if net_remove_handle(handle) {
+        net_set_ok();
+        0
+    } else {
+        net_set_err("invalid handle".to_string());
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_ws_send_text(handle: i64, data_ptr: *const u8, data_len: i64) -> i32 {
+    unsafe {
+        let (ws, pd) = match net_get_ws(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        let payload = match raw_utf8_from(data_ptr, data_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return -1;
+            }
+        };
+        loop {
+            let mut guard = match ws.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            match guard.send(WsMessage::Text(payload.clone().into())) {
+                Ok(()) => {
+                    net_set_ok();
+                    return 0;
+                }
+                Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    drop(guard);
+                    match net_wait_write(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return -1;
+                        }
+                    }
+                }
+                Err(WsError::ConnectionClosed) | Err(WsError::AlreadyClosed) => {
+                    net_set_eof();
+                    return 1;
+                }
+                Err(e) => {
+                    net_set_err(format!("ws send failed: {}", e));
+                    return -1;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_ws_recv_text(out: *mut gost_string, handle: i64) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        let (ws, pd) = match net_get_ws(handle) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        loop {
+            let mut guard = match ws.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            match guard.read() {
+                Ok(WsMessage::Text(txt)) => {
+                    gost_string_set_bytes(out, txt.as_bytes());
+                    net_set_ok();
+                    return;
+                }
+                Ok(WsMessage::Close(_)) => {
+                    net_set_eof();
+                    return;
+                }
+                Ok(_) => continue,
+                Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    drop(guard);
+                    match net_wait_read(pd) {
+                        Ok(()) => continue,
+                        Err(msg) => {
+                            net_set_err(msg);
+                            return;
+                        }
+                    }
+                }
+                Err(WsError::ConnectionClosed) | Err(WsError::AlreadyClosed) => {
+                    net_set_eof();
+                    return;
+                }
+                Err(e) => {
+                    net_set_err(format!("ws recv failed: {}", e));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_http_request(
+    out: *mut gost_string,
+    method_ptr: *const u8,
+    method_len: i64,
+    url_ptr: *const u8,
+    url_len: i64,
+    body_ptr: *const u8,
+    body_len: i64,
+    content_type_ptr: *const u8,
+    content_type_len: i64,
+) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        net_set_http_status(0);
+
+        let method = match raw_utf8_from(method_ptr, method_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let url = match raw_utf8_from(url_ptr, url_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let body = match raw_bytes_from(body_ptr, body_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let content_type = match raw_utf8_from(content_type_ptr, content_type_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+
+        match net_http_request_impl(
+            method.as_str(),
+            url.as_str(),
+            body,
+            content_type.as_str(),
+            "",
+        ) {
+            Ok((status, payload)) => {
+                net_set_http_status(status);
+                gost_string_set_bytes(out, &payload);
+                net_set_ok();
+            }
+            Err(e) => {
+                net_set_http_status(0);
+                net_set_err(e);
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __gost_net_http_request_headers(
+    out: *mut gost_string,
+    method_ptr: *const u8,
+    method_len: i64,
+    url_ptr: *const u8,
+    url_len: i64,
+    body_ptr: *const u8,
+    body_len: i64,
+    content_type_ptr: *const u8,
+    content_type_len: i64,
+    headers_ptr: *const u8,
+    headers_len: i64,
+) {
+    unsafe {
+        gost_string_set_bytes(out, &[]);
+        net_set_http_status(0);
+
+        let method = match raw_utf8_from(method_ptr, method_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let url = match raw_utf8_from(url_ptr, url_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let body = match raw_bytes_from(body_ptr, body_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let content_type = match raw_utf8_from(content_type_ptr, content_type_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+        let headers = match raw_utf8_from(headers_ptr, headers_len) {
+            Ok(v) => v,
+            Err(e) => {
+                net_set_err(e);
+                return;
+            }
+        };
+
+        match net_http_request_impl(
+            method.as_str(),
+            url.as_str(),
+            body,
+            content_type.as_str(),
+            headers.as_str(),
+        ) {
+            Ok((status, payload)) => {
+                net_set_http_status(status);
+                gost_string_set_bytes(out, &payload);
+                net_set_ok();
+            }
+            Err(e) => {
+                net_set_http_status(0);
+                net_set_err(e);
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __gost_alloc(size: usize, _align: usize) -> *mut c_void {
     unsafe {
         let size = if size == 0 { 1 } else { size };
@@ -1763,6 +4291,7 @@ pub extern "C" fn __gost_chan_new(elem_size: usize, cap: i32) -> *mut __gost_cha
             let total = elem_size * cap as usize;
             (*ch).buf = __gost_alloc(total, 1) as *mut u8;
         }
+        chan_register(ch);
         ch
     }
 }
@@ -1770,7 +4299,7 @@ pub extern "C" fn __gost_chan_new(elem_size: usize, cap: i32) -> *mut __gost_cha
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_send(ch: *mut __gost_chan, elem: *const c_void) -> i32 {
     unsafe {
-        if ch.is_null() { return 1; }
+        if !chan_is_registered(ch) { return 1; }
         os_mutex_lock(&mut (*ch).mu);
         if (*ch).closed != 0 {
             os_mutex_unlock(&mut (*ch).mu);
@@ -1820,7 +4349,7 @@ pub extern "C" fn __gost_chan_send(ch: *mut __gost_chan, elem: *const c_void) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_recv(ch: *mut __gost_chan, out_elem: *mut c_void) -> i32 {
     unsafe {
-        if ch.is_null() { return 1; }
+        if !chan_is_registered(ch) { return 1; }
         os_mutex_lock(&mut (*ch).mu);
         if (*ch).cap > 0 && (*ch).len > 0 {
             stat_inc(&ST_CHAN_RECV_BUF);
@@ -1886,7 +4415,7 @@ pub extern "C" fn __gost_chan_recv(ch: *mut __gost_chan, out_elem: *mut c_void) 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_close(ch: *mut __gost_chan) -> i32 {
     unsafe {
-        if ch.is_null() { return 1; }
+        if !chan_is_registered(ch) { return 1; }
         os_mutex_lock(&mut (*ch).mu);
         if (*ch).closed != 0 {
             os_mutex_unlock(&mut (*ch).mu);
@@ -1926,7 +4455,7 @@ pub extern "C" fn __gost_chan_close(ch: *mut __gost_chan) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_drop(ch: *mut __gost_chan) {
     unsafe {
-        if ch.is_null() { return; }
+        if !chan_is_registered(ch) { return; }
         __gost_chan_close(ch);
         __gost_chan_release(ch);
     }
@@ -1935,7 +4464,7 @@ pub extern "C" fn __gost_chan_drop(ch: *mut __gost_chan) {
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_can_send(ch: *mut __gost_chan) -> i32 {
     unsafe {
-        if ch.is_null() { return 0; }
+        if !chan_is_registered(ch) { return 0; }
         os_mutex_lock(&mut (*ch).mu);
         let mut ready = 0;
         if (*ch).closed == 0 {
@@ -1955,7 +4484,7 @@ pub extern "C" fn __gost_chan_can_send(ch: *mut __gost_chan) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_can_recv(ch: *mut __gost_chan) -> i32 {
     unsafe {
-        if ch.is_null() { return 0; }
+        if !chan_is_registered(ch) { return 0; }
         os_mutex_lock(&mut (*ch).mu);
         let mut ready = 0;
         if (*ch).cap == 0 {
@@ -1971,7 +4500,7 @@ pub extern "C" fn __gost_chan_can_recv(ch: *mut __gost_chan) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, n: u32) -> i32 {
+pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, ops: *const i32, n: u32) -> i32 {
     unsafe {
         if chans.is_null() || n == 0 || tls_g_get().is_null() {
             return 0;
@@ -1987,7 +4516,7 @@ pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, n: u32) -> i3
         let mut node_count: u32 = 0;
         for i in 0..n {
             let ch = *chans.add(i as usize);
-            if ch.is_null() { continue; }
+            if !chan_is_registered(ch) { continue; }
             let mut dup = false;
             for j in 0..i {
                 if *chans.add(j as usize) == ch { dup = true; break; }
@@ -2013,12 +4542,50 @@ pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, n: u32) -> i3
             return 0;
         }
 
+        // Re-check readiness after enqueue to avoid missing a close/send/recv
+        let mut ready = false;
+        for i in 0..n {
+            let ch = *chans.add(i as usize);
+            if !chan_is_registered(ch) { continue; }
+            let op = if ops.is_null() { 0 } else { *ops.add(i as usize) };
+            let r = if op != 0 {
+                __gost_chan_can_send(ch)
+            } else {
+                __gost_chan_can_recv(ch)
+            };
+            if r != 0 {
+                ready = true;
+                break;
+            }
+        }
+
+        if ready {
+            (*w).fired.store(1, Ordering::Relaxed);
+            let mut node = (*w).nodes;
+            while !node.is_null() {
+                let next = (*node).next_w;
+                if chan_is_registered((*node).ch) {
+                    os_mutex_lock(&mut (*(*node).ch).mu);
+                    if (*node).detached == 0 {
+                        selq_unlink_locked((*node).ch, node);
+                    }
+                    os_mutex_unlock(&mut (*(*node).ch).mu);
+                }
+                libc::free(node as *mut c_void);
+                stat_inc(&ST_SELECT_NODE_FREE);
+                node = next;
+            }
+            libc::free(w as *mut c_void);
+            stat_inc(&ST_SELECT_WAITER_FREE);
+            return 0;
+        }
+
         gopark();
 
         let mut node = (*w).nodes;
         while !node.is_null() {
             let next = (*node).next_w;
-            if !(*node).ch.is_null() {
+            if chan_is_registered((*node).ch) {
                 os_mutex_lock(&mut (*(*node).ch).mu);
                 if (*node).detached == 0 {
                     selq_unlink_locked((*node).ch, node);
@@ -2100,13 +4667,17 @@ pub extern "C" fn __gost_slice_push(s: *mut __gost_slice, elem_bytes: *const c_v
             let total = (*s).elem_size * new_cap as usize;
             let new_data = __gost_alloc(total, 1) as *mut u8;
             if !(*s).data.is_null() && (*s).elem_size > 0 && (*s).len > 0 {
-                ptr::copy_nonoverlapping((*s).data, new_data, (*s).elem_size * (*s).len as usize);
+                // Use memmove semantics to tolerate allocator-level aliasing edge cases.
+                ptr::copy((*s).data, new_data, (*s).elem_size * (*s).len as usize);
             }
             if !(*s).data.is_null() { __gost_free((*s).data as *mut c_void, 0, 1); }
             (*s).data = new_data;
             (*s).cap = new_cap;
         }
         if (*s).elem_size > 0 {
+            if elem_bytes.is_null() {
+                __gost_panic(b"slice push elem is null\0".as_ptr(), 24);
+            }
             ptr::copy_nonoverlapping(elem_bytes as *const u8, (*s).data.add((*s).len as usize * (*s).elem_size), (*s).elem_size);
         }
         (*s).len += 1;

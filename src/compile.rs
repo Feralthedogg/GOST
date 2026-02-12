@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::frontend::diagnostic::{format_diagnostic, Diagnostic, Diagnostics};
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
-use crate::frontend::ast::{FileAst, Item};
+use crate::frontend::ast::{Block, Expr, ExprKind, FileAst, Item, Stmt};
 use crate::sema::analyze;
 use crate::pkg::resolve::{self, ModMode};
 
@@ -64,6 +64,10 @@ pub fn compile_to_llvm(
         Ok(program) => program,
         Err(diags) => return Err(render_diags(&diags, &source, Some(path))),
     };
+    if file_contains_asm_labels_or_goto(&program.file) {
+        let module = crate::codegen::emit_llvm(&program).map_err(|e| e.to_string())?;
+        return Ok(module.text);
+    }
     let mut mir = crate::mir::lower::lower_program(&program).map_err(|e| e.to_string())?;
     for func in &mut mir.functions {
         crate::mir::passes::build_cleanup_chains(func).map_err(|e| e.to_string())?;
@@ -73,6 +77,164 @@ pub fn compile_to_llvm(
     let module =
         crate::codegen::emit_llvm_from_mir(&program, &mir).map_err(|e| e.to_string())?;
     Ok(module.text)
+}
+
+fn file_contains_asm_labels_or_goto(file: &FileAst) -> bool {
+    for item in &file.items {
+        if let Item::Function(func) = item {
+            if block_contains_asm_labels_or_goto(&func.body) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn block_contains_asm_labels_or_goto(block: &Block) -> bool {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let { init, .. } => {
+                if expr_contains_asm_labels_or_goto(init) {
+                    return true;
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                if expr_contains_asm_labels_or_goto(target)
+                    || expr_contains_asm_labels_or_goto(value)
+                {
+                    return true;
+                }
+            }
+            Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+                if expr_contains_asm_labels_or_goto(expr) {
+                    return true;
+                }
+            }
+            Stmt::Return { expr, .. } => {
+                if let Some(expr) = expr {
+                    if expr_contains_asm_labels_or_goto(expr) {
+                        return true;
+                    }
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                if expr_contains_asm_labels_or_goto(cond)
+                    || block_contains_asm_labels_or_goto(body)
+                {
+                    return true;
+                }
+            }
+            Stmt::Loop { body, .. } => {
+                if block_contains_asm_labels_or_goto(body) {
+                    return true;
+                }
+            }
+            Stmt::ForIn { iter, body, .. } => {
+                if expr_contains_asm_labels_or_goto(iter)
+                    || block_contains_asm_labels_or_goto(body)
+                {
+                    return true;
+                }
+            }
+            Stmt::Select { arms, .. } => {
+                for arm in arms {
+                    use crate::frontend::ast::BlockOrExpr;
+                    let body_hit = match &arm.body {
+                        BlockOrExpr::Block(block) => block_contains_asm_labels_or_goto(block),
+                        BlockOrExpr::Expr(expr) => expr_contains_asm_labels_or_goto(expr),
+                    };
+                    if body_hit {
+                        return true;
+                    }
+                }
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+    }
+    if let Some(tail) = &block.tail {
+        if expr_contains_asm_labels_or_goto(tail) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_contains_asm_labels_or_goto(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call { callee, args, .. } => {
+            if matches!(&callee.kind, ExprKind::Ident(name) if name == "asm_label" || name == "asm_goto")
+            {
+                return true;
+            }
+            if expr_contains_asm_labels_or_goto(callee) {
+                return true;
+            }
+            for arg in args {
+                if expr_contains_asm_labels_or_goto(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        ExprKind::StructLit { fields, .. } => fields
+            .iter()
+            .any(|(_, e)| expr_contains_asm_labels_or_goto(e)),
+        ExprKind::Tuple(items) => items.iter().any(expr_contains_asm_labels_or_goto),
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            block_contains_asm_labels_or_goto(block)
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            expr_contains_asm_labels_or_goto(cond)
+                || block_contains_asm_labels_or_goto(then_block)
+                || else_block
+                    .as_ref()
+                    .map(|b| block_contains_asm_labels_or_goto(b))
+                    .unwrap_or(false)
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            if expr_contains_asm_labels_or_goto(scrutinee) {
+                return true;
+            }
+            for arm in arms {
+                use crate::frontend::ast::BlockOrExpr;
+                let hit = match &arm.body {
+                    BlockOrExpr::Block(block) => block_contains_asm_labels_or_goto(block),
+                    BlockOrExpr::Expr(expr) => expr_contains_asm_labels_or_goto(expr),
+                };
+                if hit {
+                    return true;
+                }
+            }
+            false
+        }
+        ExprKind::Field { base, .. } => expr_contains_asm_labels_or_goto(base),
+        ExprKind::Index { base, index } => {
+            expr_contains_asm_labels_or_goto(base) || expr_contains_asm_labels_or_goto(index)
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Borrow { expr, .. }
+        | ExprKind::Deref { expr }
+        | ExprKind::Try { expr } => expr_contains_asm_labels_or_goto(expr),
+        ExprKind::Binary { left, right, .. } => {
+            expr_contains_asm_labels_or_goto(left) || expr_contains_asm_labels_or_goto(right)
+        }
+        ExprKind::Send { chan, value } => {
+            expr_contains_asm_labels_or_goto(chan) || expr_contains_asm_labels_or_goto(value)
+        }
+        ExprKind::Recv { chan } | ExprKind::Close { chan } => expr_contains_asm_labels_or_goto(chan),
+        ExprKind::After { ms } => expr_contains_asm_labels_or_goto(ms),
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => false,
+    }
 }
 
 fn parse_source_with_ids(

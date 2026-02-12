@@ -16,6 +16,7 @@ pub struct FileAst {
 #[derive(Clone, Debug)]
 pub enum Item {
     Function(Function),
+    ExternGlobal(ExternGlobal),
     Struct(StructDef),
     Enum(EnumDef),
 }
@@ -24,8 +25,20 @@ pub enum Item {
 pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
+    pub is_variadic: bool,
     pub ret_type: Option<TypeAst>,
+    pub is_extern: bool,
+    pub is_unsafe: bool,
+    pub extern_abi: Option<String>,
     pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternGlobal {
+    pub name: String,
+    pub ty: TypeAst,
+    pub extern_abi: Option<String>,
     pub span: Span,
 }
 
@@ -41,6 +54,7 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
     pub is_copy: bool,
+    pub layout: LayoutAttr,
     pub span: Span,
 }
 
@@ -56,7 +70,15 @@ pub struct EnumDef {
     pub name: String,
     pub variants: Vec<Variant>,
     pub is_copy: bool,
+    pub layout: LayoutAttr,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LayoutAttr {
+    pub repr_c: bool,
+    pub pack: Option<u32>,
+    pub bitfield: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +122,15 @@ pub enum Stmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+        span: Span,
+    },
+    Loop {
+        body: Block,
         span: Span,
     },
     ForIn {
@@ -159,8 +190,13 @@ pub enum ExprKind {
     String(String),
     Nil,
     Ident(String),
+    StructLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+    },
     Tuple(Vec<Expr>),
     Block(Box<Block>),
+    UnsafeBlock(Box<Block>),
     If {
         cond: Box<Expr>,
         then_block: Box<Block>,
@@ -278,4 +314,9 @@ pub enum TypeAstKind {
     Shared(Box<TypeAst>),
     Interface,
     Tuple(Vec<TypeAst>),
+    FnPtr {
+        params: Vec<TypeAst>,
+        ret: Box<TypeAst>,
+        is_variadic: bool,
+    },
 }

@@ -16,6 +16,9 @@ pub fn lower_program(program: &Program) -> Result<MirModule, String> {
     let mut next_expr_id = max_expr_id(&program.file) + 1;
     for item in &program.file.items {
         if let Item::Function(func) = item {
+            if func.is_extern {
+                continue;
+            }
             let sig = program
                 .functions
                 .get(&func.name)
@@ -508,6 +511,12 @@ impl Lowerer {
                     case.span.clone(),
                     chan_ty.clone(),
                 ));
+                // op flag: 0 = recv/after, 1 = send
+                let op = match case.kind {
+                    crate::frontend::ast::SelectArmKind::Send { .. } => 1,
+                    _ => 0,
+                };
+                wait_args.push(self.int_expr(op, case.span.clone(), Type::Builtin(BuiltinType::I32)));
             }
             let wait_expr = self.new_expr(
                 ExprKind::Call {
@@ -860,6 +869,18 @@ impl Lowerer {
                 TypeAstKind::Named(name.to_string())
             }
             Type::Named(name) => TypeAstKind::Named(name.clone()),
+            Type::FnPtr {
+                params,
+                ret,
+                is_variadic,
+            } => TypeAstKind::FnPtr {
+                params: params
+                    .iter()
+                    .map(|p| self.type_to_ast(p, span.clone()))
+                    .collect(),
+                ret: Box::new(self.type_to_ast(ret, span.clone())),
+                is_variadic: *is_variadic,
+            },
             Type::Ref(inner) => TypeAstKind::Ref(Box::new(self.type_to_ast(inner, span.clone()))),
             Type::MutRef(inner) => {
                 TypeAstKind::MutRef(Box::new(self.type_to_ast(inner, span.clone())))
@@ -1083,6 +1104,12 @@ impl Lowerer {
             Stmt::ForIn { name, iter, body, .. } => {
                 self.lower_for_in(name, iter, body)
             }
+            Stmt::While { cond, body, .. } => {
+                self.lower_while(cond, body)
+            }
+            Stmt::Loop { body, .. } => {
+                self.lower_loop(body)
+            }
             Stmt::Select { arms, .. } => {
                 self.lower_select_stmt(arms)
             }
@@ -1223,6 +1250,53 @@ impl Lowerer {
                 Ok(())
             }
         }
+    }
+
+    fn lower_while(&mut self, cond: &Expr, body: &Block) -> Result<(), String> {
+        self.ensure_open_block();
+        let head_bb = self.new_block();
+        let body_bb = self.new_block();
+        let exit_bb = self.new_block();
+
+        self.set_terminator(Terminator::Goto(head_bb));
+        self.set_current(head_bb);
+
+        let cond_expr = self.lower_expr_value(cond)?;
+        self.set_terminator(Terminator::If {
+            cond: cond_expr,
+            then_bb: body_bb,
+            else_bb: exit_bb,
+        });
+
+        self.set_current(body_bb);
+        self.loop_stack.push((exit_bb, head_bb));
+        self.lower_block(body, false)?;
+        self.loop_stack.pop();
+        if !self.is_terminated(self.current) {
+            self.set_terminator(Terminator::Goto(head_bb));
+        }
+
+        self.set_current(exit_bb);
+        Ok(())
+    }
+
+    fn lower_loop(&mut self, body: &Block) -> Result<(), String> {
+        self.ensure_open_block();
+        let body_bb = self.new_block();
+        let exit_bb = self.new_block();
+
+        self.set_terminator(Terminator::Goto(body_bb));
+        self.set_current(body_bb);
+
+        self.loop_stack.push((exit_bb, body_bb));
+        self.lower_block(body, false)?;
+        self.loop_stack.pop();
+        if !self.is_terminated(self.current) {
+            self.set_terminator(Terminator::Goto(body_bb));
+        }
+
+        self.set_current(exit_bb);
+        Ok(())
     }
 
     fn lower_for_in(&mut self, name: &str, iter: &Expr, body: &Block) -> Result<(), String> {
@@ -1713,7 +1787,7 @@ impl Lowerer {
                     Ok(self.unit_expr(expr.span.clone()))
                 }
             }
-            ExprKind::Block(block) => {
+            ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
                 if !block_contains_try(block) {
                     return Ok(self.rewrite_expr_names(expr));
                 }
@@ -1726,9 +1800,6 @@ impl Lowerer {
                 Ok(self.ident_expr(local_name, expr.span.clone(), block_ty))
             }
             ExprKind::If { cond, then_block, else_block } => {
-                if !expr_contains_try(expr) {
-                    return Ok(self.rewrite_expr_names(expr));
-                }
                 let result_ty = self.expr_type(expr)?;
                 let (result_local, result_name) = self.new_temp_local(result_ty.clone())?;
                 let cond_expr = self.lower_expr_value(cond)?;
@@ -2023,6 +2094,21 @@ impl Lowerer {
                 }
                 Ok(expr.clone())
             }
+            ExprKind::StructLit { name, fields } => {
+                let mut new_fields = Vec::with_capacity(fields.len());
+                for (fname, fexpr) in fields {
+                    let lowered = self.lower_expr_value(fexpr)?;
+                    new_fields.push((fname.clone(), lowered));
+                }
+                Ok(Expr {
+                    id: expr.id,
+                    kind: ExprKind::StructLit {
+                        name: name.clone(),
+                        fields: new_fields,
+                    },
+                    span: expr.span.clone(),
+                })
+            }
             _ => Ok(expr.clone()),
         }
     }
@@ -2057,12 +2143,17 @@ impl Lowerer {
                 }
                 expr.clone()
             }
-            ExprKind::Block(block) => {
+            ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
                 let mut block_env = env.clone();
                 let new_block = self.rewrite_block_with_env(block, &mut block_env);
+                let kind = if matches!(&expr.kind, ExprKind::UnsafeBlock(_)) {
+                    ExprKind::UnsafeBlock(Box::new(new_block))
+                } else {
+                    ExprKind::Block(Box::new(new_block))
+                };
                 Expr {
                     id: expr.id,
-                    kind: ExprKind::Block(Box::new(new_block)),
+                    kind,
                     span: expr.span.clone(),
                 }
             }
@@ -2131,6 +2222,23 @@ impl Lowerer {
                 Expr {
                     id: expr.id,
                     kind: ExprKind::Tuple(new_items),
+                    span: expr.span.clone(),
+                }
+            }
+            ExprKind::StructLit { name, fields } => {
+                let mut new_fields = Vec::with_capacity(fields.len());
+                for (fname, fexpr) in fields {
+                    new_fields.push((
+                        fname.clone(),
+                        self.rewrite_expr_with_env(fexpr, env),
+                    ));
+                }
+                Expr {
+                    id: expr.id,
+                    kind: ExprKind::StructLit {
+                        name: name.clone(),
+                        fields: new_fields,
+                    },
                     span: expr.span.clone(),
                 }
             }
@@ -2297,6 +2405,22 @@ impl Lowerer {
                     span: span.clone(),
                 }
             }
+            Stmt::While { cond, body, span } => {
+                let cond_expr = self.rewrite_expr_with_env(cond, env);
+                let body_block = self.rewrite_block_with_env(body, env);
+                Stmt::While {
+                    cond: cond_expr,
+                    body: body_block,
+                    span: span.clone(),
+                }
+            }
+            Stmt::Loop { body, span } => {
+                let body_block = self.rewrite_block_with_env(body, env);
+                Stmt::Loop {
+                    body: body_block,
+                    span: span.clone(),
+                }
+            }
             Stmt::Select { arms, span } => {
                 let mut new_arms = Vec::with_capacity(arms.len());
                 for arm in arms {
@@ -2415,6 +2539,13 @@ fn visit_stmt(stmt: &Stmt, max_id: &mut ExprId) {
             visit_expr(iter, max_id);
             visit_block(body, max_id);
         }
+        Stmt::While { cond, body, .. } => {
+            visit_expr(cond, max_id);
+            visit_block(body, max_id);
+        }
+        Stmt::Loop { body, .. } => {
+            visit_block(body, max_id);
+        }
         Stmt::Select { arms, .. } => {
             for arm in arms {
                 match &arm.kind {
@@ -2451,7 +2582,12 @@ fn visit_expr(expr: &Expr, max_id: &mut ExprId) {
                 visit_expr(item, max_id);
             }
         }
-        ExprKind::Block(block) => visit_block(block, max_id),
+        ExprKind::StructLit { fields, .. } => {
+            for (_, expr) in fields {
+                visit_expr(expr, max_id);
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => visit_block(block, max_id),
         ExprKind::If { cond, then_block, else_block } => {
             visit_expr(cond, max_id);
             visit_block(then_block, max_id);
@@ -2509,7 +2645,7 @@ fn visit_expr(expr: &Expr, max_id: &mut ExprId) {
 fn expr_contains_try(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Try { .. } => true,
-        ExprKind::Block(block) => block_contains_try(block),
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => block_contains_try(block),
         ExprKind::If { cond, then_block, else_block } => {
             expr_contains_try(cond)
                 || block_contains_try(then_block)
@@ -2545,6 +2681,7 @@ fn expr_contains_try(expr: &Expr) -> bool {
             args.iter().any(expr_contains_try)
         }
         ExprKind::Tuple(items) => items.iter().any(expr_contains_try),
+        ExprKind::StructLit { fields, .. } => fields.iter().any(|(_, e)| expr_contains_try(e)),
         ExprKind::Field { base, .. }
         | ExprKind::Unary { expr: base, .. }
         | ExprKind::Borrow { expr: base, .. }
@@ -2590,10 +2727,14 @@ fn stmt_contains_try(stmt: &Stmt) -> bool {
             expr_contains_try(target) || expr_contains_try(value)
         }
         Stmt::Expr { expr, .. } => expr_contains_try(expr),
-        Stmt::Return { .. } => true,
+        Stmt::Return { .. } => false,
         Stmt::ForIn { iter, body, .. } => {
             expr_contains_try(iter) || block_contains_try(body)
         }
+        Stmt::While { cond, body, .. } => {
+            expr_contains_try(cond) || block_contains_try(body)
+        }
+        Stmt::Loop { body, .. } => block_contains_try(body),
         Stmt::Select { arms, .. } => {
             for arm in arms {
                 match &arm.kind {
@@ -2626,6 +2767,6 @@ fn stmt_contains_try(stmt: &Stmt) -> bool {
             false
         }
         Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => expr_contains_try(expr),
-        Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
     }
 }

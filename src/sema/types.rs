@@ -21,6 +21,11 @@ pub enum BuiltinType {
 pub enum Type {
     Builtin(BuiltinType),
     Named(String),
+    FnPtr {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        is_variadic: bool,
+    },
     Ref(Box<Type>),
     MutRef(Box<Type>),
     Slice(Box<Type>),
@@ -107,6 +112,27 @@ fn fmt_type_pretty(ty: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "&mut ")?;
             fmt_type_pretty(inner, f)
         }
+        Type::FnPtr {
+            params,
+            ret,
+            is_variadic,
+        } => {
+            write!(f, "fn(")?;
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                fmt_type_pretty(p, f)?;
+            }
+            if *is_variadic {
+                if !params.is_empty() {
+                    write!(f, ", ")?;
+                }
+                write!(f, "...")?;
+            }
+            write!(f, ") -> ")?;
+            fmt_type_pretty(ret, f)
+        }
         Type::Slice(inner) => {
             write!(f, "[]")?;
             fmt_type_pretty(inner, f)
@@ -185,12 +211,21 @@ pub enum TypeDefKind {
 pub struct StructDef {
     pub fields: Vec<(String, Type)>,
     pub is_copy: bool,
+    pub layout: LayoutInfo,
 }
 
 #[derive(Clone, Debug)]
 pub struct EnumDef {
     pub variants: Vec<(String, Vec<Type>)>,
     pub is_copy: bool,
+    pub layout: LayoutInfo,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LayoutInfo {
+    pub repr_c: bool,
+    pub pack: Option<u32>,
+    pub bitfield: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -230,8 +265,11 @@ impl TypeDefs {
                 | BuiltinType::Error => Some(TypeClass::Copy),
                 BuiltinType::Bytes => Some(TypeClass::Linear),
             },
+            Type::FnPtr { .. } => Some(TypeClass::Copy),
             Type::Shared(_) | Type::Interface => Some(TypeClass::Copy),
-            Type::Slice(_) | Type::Map(_, _) | Type::Chan(_) => Some(TypeClass::Linear),
+            // Channels are reference types; treat as Copy like Go.
+            Type::Slice(_) | Type::Map(_, _) => Some(TypeClass::Linear),
+            Type::Chan(_) => Some(TypeClass::Copy),
             Type::Tuple(items) => {
                 let mut class = TypeClass::Copy;
                 for item in items {

@@ -626,6 +626,14 @@ fn apply_stmt_effects(
                 linear_mask,
                 local_names,
             )?;
+            // Re-initialize moved linear locals on assignment to an identifier.
+            if let ExprKind::Ident(name) = &target.kind {
+                if let Some(local) = name_to_local.get(name).copied() {
+                    if linear_mask[local] {
+                        state[local] = LinState::Alive;
+                    }
+                }
+            }
             Ok(())
         }
         MirStmt::Expr { expr } => apply_expr_moves(
@@ -838,6 +846,18 @@ fn apply_ast_stmt_moves(
             )?;
             apply_block_moves(body, state, name_to_local, linear_mask, local_names)
         }
+        Stmt::While { cond, body, .. } => {
+            apply_expr_moves(
+                cond,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
+            apply_block_moves(body, state, name_to_local, linear_mask, local_names)
+        }
+        Stmt::Loop { body, .. } => apply_block_moves(body, state, name_to_local, linear_mask, local_names),
         Stmt::Select { arms, .. } => {
             for arm in arms {
                 match &arm.kind {
@@ -958,6 +978,12 @@ fn apply_expr_moves(
         ExprKind::Deref { expr: inner } => {
             apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, expr) in fields {
+                apply_expr_moves(expr, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
+            }
+            Ok(())
+        }
         ExprKind::Unary { expr: inner, .. } => {
             apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
@@ -1006,7 +1032,7 @@ fn apply_expr_moves(
             }
             Ok(())
         }
-        ExprKind::Block(block) => {
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
             apply_block_moves(block, state, name_to_local, linear_mask, local_names)
         }
         ExprKind::If { cond, then_block, else_block } => {
