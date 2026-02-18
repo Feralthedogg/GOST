@@ -1,5 +1,7 @@
 module time
 
+import "std/strings"
+
 copy struct Instant {
     ms: i64
 }
@@ -32,22 +34,6 @@ private fn time_error_new(msg: string) -> error {
     return __gost_error_new(msg)
 }
 
-private fn str_eq(a: string, b: string) -> bool {
-    let na: i64 = string_len(a)
-    let nb: i64 = string_len(b)
-    if na != nb {
-        return false
-    }
-    let i: i64 = 0
-    while i < na {
-        if string_get(a, i) != string_get(b, i) {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
 private fn i64_to_string(v: i64) -> string {
     if v == 0 {
         return "0"
@@ -78,7 +64,7 @@ private fn is_space(b: i32) -> bool {
     return false
 }
 
-private fn trim_space(s: string) -> string {
+private fn time_trim_space(s: string) -> string {
     let n: i64 = string_len(s)
     if n == 0 {
         return s
@@ -269,17 +255,17 @@ private fn parse_i64_ascii(s: string) -> Result[i64, error] {
 }
 
 private fn unit_ns(u: string) -> i64 {
-    if str_eq(u, "ns") { return 1 }
-    if str_eq(u, "us") { return ns_per_usec() }
-    if str_eq(u, "ms") { return ns_per_msec() }
-    if str_eq(u, "s") { return ns_per_sec() }
-    if str_eq(u, "m") { return ns_per_min() }
-    if str_eq(u, "h") { return ns_per_hour() }
+    if equal(u, "ns") { return 1 }
+    if equal(u, "us") { return ns_per_usec() }
+    if equal(u, "ms") { return ns_per_msec() }
+    if equal(u, "s") { return ns_per_sec() }
+    if equal(u, "m") { return ns_per_min() }
+    if equal(u, "h") { return ns_per_hour() }
     return 0
 }
 
 fn parse_duration(s: string) -> Result[Duration, error] {
-    let raw = trim_space(s)
+    let raw = time_trim_space(s)
     let n: i64 = string_len(raw)
     if n == 0 {
         return Result.Err[Duration, error](time_error_new("empty duration"))
@@ -310,7 +296,7 @@ fn parse_duration(s: string) -> Result[Duration, error] {
         let u: string = ""
         if i + 1 < n {
             let two = string_slice(raw, i, 2)
-            if str_eq(two, "ns") || str_eq(two, "us") || str_eq(two, "ms") {
+            if equal(two, "ns") || equal(two, "us") || equal(two, "ms") {
                 u = two
                 i = i + 2
             }

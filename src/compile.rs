@@ -8,10 +8,11 @@ use crate::frontend::diagnostic::{format_diagnostic, Diagnostic, Diagnostics};
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
 use crate::frontend::ast::{
-    AssignOp, Block, BlockOrExpr, ClosureParam, Expr, ExprKind, FileAst, Function, ImportSpec, Item,
-    Param, Pattern, Stmt, TraitMethod, TypeAst, TypeAstKind, TypeParam, Visibility,
+    AssignOp, BinaryOp, Block, BlockOrExpr, ClosureParam, Expr, ExprKind, FileAst, Function,
+    ImportSpec, Item, Param, Pattern, Stmt, TraitMethod, TypeAst, TypeAstKind, TypeParam,
+    UnaryOp, Visibility,
 };
-use crate::frontend::symbols::{is_impl_mangled, logical_method_name};
+use crate::frontend::symbols::{is_impl_mangled, logical_method_name, mangle_impl_method};
 use crate::sema::analyze;
 use crate::pkg::resolve::{self, ModMode};
 
@@ -89,8 +90,12 @@ pub fn compile_to_llvm(
     }
     let module = crate::codegen::emit_llvm_from_mir(&program, &mir).map_err(|e| match e {
         crate::codegen::CodegenError::FrontendDiagnostic(msg) => msg,
-        crate::codegen::CodegenError::InternalCompilerError(_) => {
-            "internal compiler error (codegen)".to_string()
+        crate::codegen::CodegenError::InternalCompilerError(msg) => {
+            if std::env::var("GOST_DEBUG_INTERNAL").ok().as_deref() == Some("1") {
+                format!("internal compiler error (codegen): {msg}")
+            } else {
+                "internal compiler error (codegen)".to_string()
+            }
         }
     })?;
     Ok(module.text)
@@ -154,6 +159,7 @@ fn load_imports(
             }
             *next_expr_id = next;
             let mut imported_items = file.items.clone();
+            let nested_imports = file.imports.clone();
             if import.only.is_some() {
                 imported_items.retain(|item| import_item_allowed(item, import));
             }
@@ -168,6 +174,7 @@ fn load_imports(
             *next_expr_id = next.max(*next_expr_id);
             items.extend(imported_items);
             items.extend(wrappers);
+            load_imports(root, &nested_imports, next_expr_id, items, visited, std_funcs)?;
         }
     }
     Ok(())
@@ -632,6 +639,14 @@ fn monomorphize_and_rewrite(file: &mut FileAst) -> Result<(), String> {
         known_functions.insert(name.clone(), func.clone());
     }
 
+    let closure_factory_names: HashSet<String> = regular_functions
+        .iter()
+        .filter_map(|func| match callable_return_source(func) {
+            Some(CallableReturnSource::Closure { .. }) => Some(func.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut queue: VecDeque<Function> = regular_functions.into_iter().collect();
     let mut lowered_functions = Vec::new();
     let mut instances: HashMap<String, String> = HashMap::new();
@@ -658,11 +673,316 @@ fn monomorphize_and_rewrite(file: &mut FileAst) -> Result<(), String> {
         lowered_functions.push(func);
     }
 
+    let called = collect_direct_called_functions(&lowered_functions);
+    lowered_functions.retain(|func| {
+        if is_impl_mangled(&func.name) {
+            return true;
+        }
+        if func.name == "main" || called.contains(&func.name) {
+            return true;
+        }
+        if closure_factory_names.contains(&func.name) {
+            return false;
+        }
+        let returns_callable = func.ret_type.as_ref().is_some_and(is_callable_type_ast);
+        !(returns_callable && function_contains_closure_expr(func))
+    });
     file.items = non_functions;
     for func in lowered_functions {
         file.items.push(Item::Function(func));
     }
     Ok(())
+}
+
+fn collect_direct_called_functions(functions: &[Function]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for func in functions {
+        collect_called_functions_in_block(&func.body, &mut out);
+    }
+    out
+}
+
+fn collect_called_functions_in_block(block: &Block, out: &mut HashSet<String>) {
+    for stmt in &block.stmts {
+        collect_called_functions_in_stmt(stmt, out);
+    }
+    if let Some(tail) = &block.tail {
+        collect_called_functions_in_expr(tail, out);
+    }
+}
+
+fn collect_called_functions_in_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => collect_called_functions_in_expr(init, out),
+        Stmt::Assign { target, value, .. } => {
+            collect_called_functions_in_expr(target, out);
+            collect_called_functions_in_expr(value, out);
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+            collect_called_functions_in_expr(expr, out);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                collect_called_functions_in_expr(expr, out);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_called_functions_in_expr(cond, out);
+            collect_called_functions_in_block(body, out);
+        }
+        Stmt::Loop { body, .. } => collect_called_functions_in_block(body, out),
+        Stmt::ForIn { iter, body, .. } => {
+            collect_called_functions_in_expr(iter, out);
+            collect_called_functions_in_block(body, out);
+        }
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
+            collect_called_functions_in_expr(start, out);
+            collect_called_functions_in_expr(end, out);
+            collect_called_functions_in_block(body, out);
+        }
+        Stmt::Select { arms, .. } => {
+            for arm in arms {
+                match &arm.kind {
+                    crate::frontend::ast::SelectArmKind::Send { chan, value } => {
+                        collect_called_functions_in_expr(chan, out);
+                        collect_called_functions_in_expr(value, out);
+                    }
+                    crate::frontend::ast::SelectArmKind::Recv { chan, .. } => {
+                        collect_called_functions_in_expr(chan, out);
+                    }
+                    crate::frontend::ast::SelectArmKind::After { ms } => {
+                        collect_called_functions_in_expr(ms, out);
+                    }
+                    crate::frontend::ast::SelectArmKind::Default => {}
+                }
+                match &arm.body {
+                    BlockOrExpr::Block(block) => collect_called_functions_in_block(block, out),
+                    BlockOrExpr::Expr(expr) => collect_called_functions_in_expr(expr, out),
+                }
+            }
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+}
+
+fn collect_called_functions_in_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Call { callee, args, .. } => {
+            match &callee.kind {
+                ExprKind::Ident(name) => {
+                    out.insert(name.clone());
+                }
+                ExprKind::Field { base, name } => {
+                    if let ExprKind::Ident(pkg) = &base.kind {
+                        out.insert(format!("{}.{}", pkg, name));
+                    }
+                }
+                _ => {}
+            }
+            collect_called_functions_in_expr(callee, out);
+            for arg in args {
+                collect_called_functions_in_expr(arg, out);
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, field_expr) in fields {
+                collect_called_functions_in_expr(field_expr, out);
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                collect_called_functions_in_expr(item, out);
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            collect_called_functions_in_block(block, out);
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            collect_called_functions_in_expr(cond, out);
+            collect_called_functions_in_block(then_block, out);
+            if let Some(block) = else_block {
+                collect_called_functions_in_block(block, out);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_called_functions_in_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_called_functions_in_expr(guard, out);
+                }
+                match &arm.body {
+                    BlockOrExpr::Block(block) => collect_called_functions_in_block(block, out),
+                    BlockOrExpr::Expr(expr) => collect_called_functions_in_expr(expr, out),
+                }
+            }
+        }
+        ExprKind::Closure { body, .. } => match body.as_ref() {
+            BlockOrExpr::Block(block) => collect_called_functions_in_block(block, out),
+            BlockOrExpr::Expr(expr) => collect_called_functions_in_expr(expr, out),
+        },
+        ExprKind::Field { base, .. }
+        | ExprKind::Unary { expr: base, .. }
+        | ExprKind::Cast { expr: base, .. }
+        | ExprKind::Borrow { expr: base, .. }
+        | ExprKind::Deref { expr: base }
+        | ExprKind::Try { expr: base }
+        | ExprKind::Recv { chan: base }
+        | ExprKind::Close { chan: base }
+        | ExprKind::After { ms: base } => collect_called_functions_in_expr(base, out),
+        ExprKind::Index { base, index } => {
+            collect_called_functions_in_expr(base, out);
+            collect_called_functions_in_expr(index, out);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_called_functions_in_expr(left, out);
+            collect_called_functions_in_expr(right, out);
+        }
+        ExprKind::Send { chan, value } => {
+            collect_called_functions_in_expr(chan, out);
+            collect_called_functions_in_expr(value, out);
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => {}
+    }
+}
+
+fn function_contains_closure_expr(func: &Function) -> bool {
+    block_contains_closure_expr(&func.body)
+}
+
+fn block_contains_closure_expr(block: &Block) -> bool {
+    for stmt in &block.stmts {
+        if stmt_contains_closure_expr(stmt) {
+            return true;
+        }
+    }
+    block
+        .tail
+        .as_ref()
+        .is_some_and(expr_contains_closure_expr)
+}
+
+fn stmt_contains_closure_expr(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => expr_contains_closure_expr(init),
+        Stmt::Assign { target, value, .. } => {
+            expr_contains_closure_expr(target) || expr_contains_closure_expr(value)
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+            expr_contains_closure_expr(expr)
+        }
+        Stmt::Return { expr, .. } => expr.as_ref().is_some_and(expr_contains_closure_expr),
+        Stmt::While { cond, body, .. } => {
+            expr_contains_closure_expr(cond) || block_contains_closure_expr(body)
+        }
+        Stmt::Loop { body, .. } => block_contains_closure_expr(body),
+        Stmt::ForIn { iter, body, .. } => {
+            expr_contains_closure_expr(iter) || block_contains_closure_expr(body)
+        }
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
+            expr_contains_closure_expr(start)
+                || expr_contains_closure_expr(end)
+                || block_contains_closure_expr(body)
+        }
+        Stmt::Select { arms, .. } => arms.iter().any(|arm| {
+            let kind_has = match &arm.kind {
+                crate::frontend::ast::SelectArmKind::Send { chan, value } => {
+                    expr_contains_closure_expr(chan) || expr_contains_closure_expr(value)
+                }
+                crate::frontend::ast::SelectArmKind::Recv { chan, .. } => {
+                    expr_contains_closure_expr(chan)
+                }
+                crate::frontend::ast::SelectArmKind::After { ms } => expr_contains_closure_expr(ms),
+                crate::frontend::ast::SelectArmKind::Default => false,
+            };
+            kind_has
+                || match &arm.body {
+                    BlockOrExpr::Block(block) => block_contains_closure_expr(block),
+                    BlockOrExpr::Expr(expr) => expr_contains_closure_expr(expr),
+                }
+        }),
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
+    }
+}
+
+fn expr_contains_closure_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Closure { .. } => true,
+        ExprKind::Call { callee, args, .. } => {
+            expr_contains_closure_expr(callee)
+                || args.iter().any(expr_contains_closure_expr)
+        }
+        ExprKind::StructLit { fields, .. } => {
+            fields
+                .iter()
+                .any(|(_, field_expr)| expr_contains_closure_expr(field_expr))
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            items.iter().any(expr_contains_closure_expr)
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => block_contains_closure_expr(block),
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            expr_contains_closure_expr(cond)
+                || block_contains_closure_expr(then_block)
+                || else_block
+                    .as_ref()
+                    .is_some_and(|block| block_contains_closure_expr(block))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            expr_contains_closure_expr(scrutinee)
+                || arms.iter().any(|arm| {
+                    arm.guard
+                        .as_ref()
+                        .is_some_and(expr_contains_closure_expr)
+                        || match &arm.body {
+                            BlockOrExpr::Block(block) => block_contains_closure_expr(block),
+                            BlockOrExpr::Expr(expr) => expr_contains_closure_expr(expr),
+                        }
+                })
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::Unary { expr: base, .. }
+        | ExprKind::Cast { expr: base, .. }
+        | ExprKind::Borrow { expr: base, .. }
+        | ExprKind::Deref { expr: base }
+        | ExprKind::Try { expr: base }
+        | ExprKind::Recv { chan: base }
+        | ExprKind::Close { chan: base }
+        | ExprKind::After { ms: base } => expr_contains_closure_expr(base),
+        ExprKind::Index { base, index } => {
+            expr_contains_closure_expr(base) || expr_contains_closure_expr(index)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_contains_closure_expr(left) || expr_contains_closure_expr(right)
+        }
+        ExprKind::Send { chan, value } => {
+            expr_contains_closure_expr(chan) || expr_contains_closure_expr(value)
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => false,
+    }
 }
 
 fn rewrite_block_high_level(
@@ -677,6 +997,7 @@ fn rewrite_block_high_level(
     ret_expected: Option<&TypeAst>,
 ) -> Result<(), String> {
     let closure_env = HashMap::new();
+    let fn_alias_env = HashMap::new();
     rewrite_block_high_level_in_env(
         block,
         templates,
@@ -685,6 +1006,7 @@ fn rewrite_block_high_level(
         queue,
         known_functions,
         &closure_env,
+        &fn_alias_env,
         inherited_locals,
         inherited_local_types,
         ret_expected,
@@ -708,11 +1030,13 @@ fn rewrite_block_high_level_in_env(
     queue: &mut VecDeque<Function>,
     known_functions: &HashMap<String, Function>,
     inherited_closures: &HashMap<String, ClosureBinding>,
+    inherited_fn_aliases: &HashMap<String, String>,
     inherited_locals: &HashSet<String>,
     inherited_local_types: &HashMap<String, TypeAst>,
     ret_expected: Option<&TypeAst>,
 ) -> Result<(), String> {
     let mut closure_env = inherited_closures.clone();
+    let mut fn_alias_env = inherited_fn_aliases.clone();
     let mut local_env = inherited_locals.clone();
     let mut local_type_env = inherited_local_types.clone();
     let mut rewritten_stmts = Vec::with_capacity(block.stmts.len());
@@ -725,11 +1049,27 @@ fn rewrite_block_high_level_in_env(
             queue,
             known_functions,
             &closure_env,
+            &fn_alias_env,
             &local_env,
             &local_type_env,
             ret_expected,
         )?;
+        if let Some(prelude) = extract_closure_init_prelude(&mut stmt) {
+            for prep_stmt in prelude {
+                rewritten_stmts.push(prep_stmt.clone());
+                let _ = update_closure_env_for_stmt(&prep_stmt, &mut closure_env, &local_env);
+                update_fn_alias_env_for_stmt(&prep_stmt, &mut fn_alias_env, known_functions);
+                update_local_env_for_stmt(&prep_stmt, &mut local_env);
+                update_local_types_for_stmt(
+                    &prep_stmt,
+                    &mut local_type_env,
+                    templates,
+                    known_functions,
+                );
+            }
+        }
         let keep_stmt = update_closure_env_for_stmt(&stmt, &mut closure_env, &local_env);
+        update_fn_alias_env_for_stmt(&stmt, &mut fn_alias_env, known_functions);
         update_local_env_for_stmt(&stmt, &mut local_env);
         update_local_types_for_stmt(
             &stmt,
@@ -751,13 +1091,721 @@ fn rewrite_block_high_level_in_env(
             queue,
             known_functions,
             &closure_env,
+            &fn_alias_env,
             &local_env,
             &local_type_env,
             ret_expected,
             ret_expected,
         )?;
     }
+    if block_contains_closure_expr(block) {
+        sanitize_remaining_closure_literals_in_block(
+            block,
+            templates,
+            known_functions,
+            &local_type_env,
+            instances,
+            queue,
+        )?;
+    }
     Ok(())
+}
+
+fn sanitize_remaining_closure_literals_in_stmt(
+    stmt: &mut Stmt,
+    templates: &HashMap<String, Function>,
+    known_functions: &HashMap<String, Function>,
+    local_types_in_scope: &HashMap<String, TypeAst>,
+    instances: &mut HashMap<String, String>,
+    queue: &mut VecDeque<Function>,
+) -> Result<(), String> {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                init,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::Assign { target, value, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                target,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_expr(
+                value,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                expr,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                sanitize_remaining_closure_literals_in_expr(
+                    expr,
+                    templates,
+                    known_functions,
+                    local_types_in_scope,
+                    instances,
+                    queue,
+                )?;
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                cond,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_block(
+                body,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::Loop { body, .. } => {
+            sanitize_remaining_closure_literals_in_block(
+                body,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::ForIn { iter, body, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                iter,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_block(
+                body,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
+            sanitize_remaining_closure_literals_in_expr(
+                start,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_expr(
+                end,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_block(
+                body,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        Stmt::Select { arms, .. } => {
+            for arm in arms {
+                match &mut arm.kind {
+                    crate::frontend::ast::SelectArmKind::Send { chan, value } => {
+                        sanitize_remaining_closure_literals_in_expr(
+                            chan,
+                            templates,
+                            known_functions,
+                            local_types_in_scope,
+                            instances,
+                            queue,
+                        )?;
+                        sanitize_remaining_closure_literals_in_expr(
+                            value,
+                            templates,
+                            known_functions,
+                            local_types_in_scope,
+                            instances,
+                            queue,
+                        )?;
+                    }
+                    crate::frontend::ast::SelectArmKind::Recv { chan, .. } => {
+                        sanitize_remaining_closure_literals_in_expr(
+                            chan,
+                            templates,
+                            known_functions,
+                            local_types_in_scope,
+                            instances,
+                            queue,
+                        )?;
+                    }
+                    crate::frontend::ast::SelectArmKind::After { ms } => {
+                        sanitize_remaining_closure_literals_in_expr(
+                            ms,
+                            templates,
+                            known_functions,
+                            local_types_in_scope,
+                            instances,
+                            queue,
+                        )?;
+                    }
+                    crate::frontend::ast::SelectArmKind::Default => {}
+                }
+                match &mut arm.body {
+                    BlockOrExpr::Block(block) => sanitize_remaining_closure_literals_in_block(
+                        block,
+                        templates,
+                        known_functions,
+                        local_types_in_scope,
+                        instances,
+                        queue,
+                    )?,
+                    BlockOrExpr::Expr(expr) => sanitize_remaining_closure_literals_in_expr(
+                        expr,
+                        templates,
+                        known_functions,
+                        local_types_in_scope,
+                        instances,
+                        queue,
+                    )?,
+                }
+            }
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+    Ok(())
+}
+
+fn sanitize_remaining_closure_literals_in_block(
+    block: &mut Block,
+    templates: &HashMap<String, Function>,
+    known_functions: &HashMap<String, Function>,
+    local_types_in_scope: &HashMap<String, TypeAst>,
+    instances: &mut HashMap<String, String>,
+    queue: &mut VecDeque<Function>,
+) -> Result<(), String> {
+    for stmt in &mut block.stmts {
+        if stmt_contains_closure_expr(stmt) {
+            sanitize_remaining_closure_literals_in_stmt(
+                stmt,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+    }
+    if let Some(tail) = &mut block.tail {
+        if expr_contains_closure_expr(tail) {
+            sanitize_remaining_closure_literals_in_expr(
+                tail,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_remaining_closure_literals_in_expr(
+    expr: &mut Expr,
+    templates: &HashMap<String, Function>,
+    known_functions: &HashMap<String, Function>,
+    local_types_in_scope: &HashMap<String, TypeAst>,
+    instances: &mut HashMap<String, String>,
+    queue: &mut VecDeque<Function>,
+) -> Result<(), String> {
+    match &mut expr.kind {
+        ExprKind::StructLit { fields, .. } => {
+            for (_, field_expr) in fields {
+                sanitize_remaining_closure_literals_in_expr(
+                    field_expr,
+                    templates,
+                    known_functions,
+                    local_types_in_scope,
+                    instances,
+                    queue,
+                )?;
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                sanitize_remaining_closure_literals_in_expr(
+                    item,
+                    templates,
+                    known_functions,
+                    local_types_in_scope,
+                    instances,
+                    queue,
+                )?;
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            sanitize_remaining_closure_literals_in_block(
+                block,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            sanitize_remaining_closure_literals_in_expr(
+                cond,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_block(
+                then_block,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            if let Some(else_block) = else_block {
+                sanitize_remaining_closure_literals_in_block(
+                    else_block,
+                    templates,
+                    known_functions,
+                    local_types_in_scope,
+                    instances,
+                    queue,
+                )?;
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            sanitize_remaining_closure_literals_in_expr(
+                scrutinee,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            for arm in arms {
+                if let Some(guard) = &mut arm.guard {
+                    sanitize_remaining_closure_literals_in_expr(
+                        guard,
+                        templates,
+                        known_functions,
+                        local_types_in_scope,
+                        instances,
+                        queue,
+                    )?;
+                }
+                match &mut arm.body {
+                    BlockOrExpr::Block(block) => sanitize_remaining_closure_literals_in_block(
+                        block,
+                        templates,
+                        known_functions,
+                        local_types_in_scope,
+                        instances,
+                        queue,
+                    )?,
+                    BlockOrExpr::Expr(expr) => sanitize_remaining_closure_literals_in_expr(
+                        expr,
+                        templates,
+                        known_functions,
+                        local_types_in_scope,
+                        instances,
+                        queue,
+                    )?,
+                }
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                callee,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            for arg in args {
+                sanitize_remaining_closure_literals_in_expr(
+                    arg,
+                    templates,
+                    known_functions,
+                    local_types_in_scope,
+                    instances,
+                    queue,
+                )?;
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::Unary { expr: base, .. }
+        | ExprKind::Cast { expr: base, .. }
+        | ExprKind::Borrow { expr: base, .. }
+        | ExprKind::Deref { expr: base }
+        | ExprKind::Try { expr: base }
+        | ExprKind::Recv { chan: base }
+        | ExprKind::Close { chan: base }
+        | ExprKind::After { ms: base } => {
+            sanitize_remaining_closure_literals_in_expr(
+                base,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        ExprKind::Index { base, index } => {
+            sanitize_remaining_closure_literals_in_expr(
+                base,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_expr(
+                index,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        ExprKind::Binary { left, right, .. } => {
+            sanitize_remaining_closure_literals_in_expr(
+                left,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_expr(
+                right,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        ExprKind::Send { chan, value } => {
+            sanitize_remaining_closure_literals_in_expr(
+                chan,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+            sanitize_remaining_closure_literals_in_expr(
+                value,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            )?;
+        }
+        ExprKind::Closure { .. } => {
+            if let Some(runtime_expr) = ensure_runtime_closure_object_expr(
+                expr,
+                templates,
+                known_functions,
+                local_types_in_scope,
+                instances,
+                queue,
+            ) {
+                *expr = runtime_expr;
+            } else {
+                return Err(
+                    "internal: failed to lower closure literal to runtime object".to_string(),
+                );
+            }
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => {}
+    }
+    Ok(())
+}
+
+fn closure_capture_projection_expr(
+    idx: usize,
+    span: &crate::frontend::ast::Span,
+    id_seed: usize,
+) -> Expr {
+    let base_id = id_seed.wrapping_add(idx.saturating_mul(8).saturating_add(1));
+    let idx_id = id_seed.wrapping_add(idx.saturating_mul(8).saturating_add(2));
+    Expr {
+        id: id_seed.wrapping_add(idx.saturating_mul(8).saturating_add(3)),
+        kind: ExprKind::Index {
+            base: Box::new(Expr {
+                id: base_id,
+                kind: ExprKind::Ident("self".to_string()),
+                span: span.clone(),
+            }),
+            index: Box::new(Expr {
+                id: idx_id,
+                kind: ExprKind::Int(idx.to_string()),
+                span: span.clone(),
+            }),
+        },
+        span: span.clone(),
+    }
+}
+
+fn ensure_runtime_closure_object_expr(
+    closure_expr: &Expr,
+    templates: &HashMap<String, Function>,
+    known_functions: &HashMap<String, Function>,
+    local_types_in_scope: &HashMap<String, TypeAst>,
+    instances: &mut HashMap<String, String>,
+    queue: &mut VecDeque<Function>,
+) -> Option<Expr> {
+    let ExprKind::Closure { params, body } = &closure_expr.kind else {
+        return None;
+    };
+    let inferred = infer_expr_type_ast(
+        closure_expr,
+        local_types_in_scope,
+        templates,
+        known_functions,
+    )?;
+    let TypeAstKind::Closure {
+        params: inferred_params,
+        ret: inferred_ret,
+        is_variadic,
+    } = &inferred.kind
+    else {
+        return None;
+    };
+    if inferred_params.len() != params.len() {
+        return None;
+    }
+    let method_name = closure_runtime_method_name(inferred_params, inferred_ret.as_ref(), *is_variadic);
+    let binding = ClosureBinding {
+        params: params.clone(),
+        body: body.as_ref().clone(),
+        span: closure_expr.span.clone(),
+        expr_id: closure_expr.id,
+        enclosing_locals: local_types_in_scope.keys().cloned().collect(),
+    };
+    let captures = closure_captured_outer_locals(&binding);
+    let mut capture_types = Vec::with_capacity(captures.len());
+    for cap in &captures {
+        let ty = local_types_in_scope.get(cap).cloned()?;
+        capture_types.push(ty);
+    }
+
+    let env_type = TypeAst {
+        kind: TypeAstKind::Tuple(capture_types),
+        span: closure_expr.span.clone(),
+    };
+    let env_type_key = type_ast_key(&env_type);
+    let cache_key = format!(
+        "__closure_runtime_method__{}__{}__{}",
+        closure_expr.id, method_name, env_type_key
+    );
+    let method_symbol = if let Some(existing) = instances.get(&cache_key) {
+        existing.clone()
+    } else {
+        let mut fn_params = Vec::with_capacity(params.len() + 1);
+        fn_params.push(Param {
+            name: "self".to_string(),
+            ty: env_type.clone(),
+            span: closure_expr.span.clone(),
+        });
+        for (idx, param) in params.iter().enumerate() {
+            let ty = param
+                .ty
+                .clone()
+                .unwrap_or_else(|| inferred_params[idx].clone());
+            fn_params.push(Param {
+                name: param.name.clone(),
+                ty,
+                span: param.span.clone(),
+            });
+        }
+
+        let mut method_body = match body.as_ref() {
+            BlockOrExpr::Block(block) => block.as_ref().clone(),
+            BlockOrExpr::Expr(expr) => Block {
+                stmts: Vec::new(),
+                tail: Some(expr.clone()),
+                span: expr.span.clone(),
+            },
+        };
+        let mut subst = HashMap::new();
+        let projection_seed = closure_expr
+            .id
+            .wrapping_mul(131_071)
+            .wrapping_add(97_531);
+        for (idx, cap) in captures.iter().enumerate() {
+            subst.insert(
+                cap.clone(),
+                closure_capture_projection_expr(idx, &closure_expr.span, projection_seed),
+            );
+        }
+        substitute_free_idents_with_exprs_in_block(&mut method_body, &subst);
+
+        let recv_name = format!("closure_env_{}_{}", closure_expr.id, captures.len());
+        let method_symbol = mangle_impl_method("__gost_closure_runtime", &recv_name, &method_name);
+        queue.push_back(Function {
+            vis: Visibility::Private,
+            name: method_symbol.clone(),
+            type_params: Vec::new(),
+            params: fn_params,
+            is_variadic: *is_variadic,
+            ret_type: Some(inferred_ret.as_ref().clone()),
+            is_extern: false,
+            is_unsafe: false,
+            extern_abi: None,
+            body: method_body,
+            span: closure_expr.span.clone(),
+        });
+        instances.insert(cache_key, method_symbol.clone());
+        method_symbol
+    };
+
+    let mut env_items = Vec::with_capacity(captures.len());
+    let expr_seed = closure_expr
+        .id
+        .wrapping_mul(65_537)
+        .wrapping_add(19_997);
+    for (idx, cap) in captures.iter().enumerate() {
+        env_items.push(Expr {
+            id: expr_seed.wrapping_add(idx.saturating_mul(5)),
+            kind: ExprKind::Ident(cap.clone()),
+            span: closure_expr.span.clone(),
+        });
+    }
+    let env_expr = Expr {
+        id: expr_seed.wrapping_add(4096),
+        kind: ExprKind::Tuple(env_items),
+        span: closure_expr.span.clone(),
+    };
+    let runtime_obj_expr = Expr {
+        id: expr_seed.wrapping_add(8192),
+        kind: ExprKind::Cast {
+            expr: Box::new(env_expr),
+            ty: TypeAst {
+                kind: TypeAstKind::Closure {
+                    params: inferred_params.clone(),
+                    ret: Box::new(inferred_ret.as_ref().clone()),
+                    is_variadic: *is_variadic,
+                },
+                span: closure_expr.span.clone(),
+            },
+        },
+        span: closure_expr.span.clone(),
+    };
+
+    let _ = method_symbol;
+    Some(runtime_obj_expr)
+}
+
+fn extract_closure_init_prelude(stmt: &mut Stmt) -> Option<Vec<Stmt>> {
+    let init = match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => init,
+        _ => return None,
+    };
+    let block = match &mut init.kind {
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => block,
+        _ => return None,
+    };
+    let tail = block.tail.as_ref()?;
+    if !matches!(tail.kind, ExprKind::Closure { .. }) {
+        return None;
+    }
+    let prelude = std::mem::take(&mut block.stmts);
+    if prelude.is_empty() {
+        return None;
+    }
+    let Some(tail_expr) = block.tail.take() else {
+        return None;
+    };
+    *init = tail_expr;
+    Some(prelude)
+}
+
+fn update_fn_alias_env_for_stmt(
+    stmt: &Stmt,
+    fn_alias_env: &mut HashMap<String, String>,
+    known_functions: &HashMap<String, Function>,
+) {
+    match stmt {
+        Stmt::Let { name, init, .. } | Stmt::Const { name, init, .. } => {
+            if let ExprKind::Ident(src_name) = &init.kind {
+                if known_functions.contains_key(src_name) {
+                    fn_alias_env.insert(name.clone(), src_name.clone());
+                } else if let Some(target) = fn_alias_env.get(src_name).cloned() {
+                    fn_alias_env.insert(name.clone(), target);
+                } else {
+                    fn_alias_env.remove(name);
+                }
+            } else {
+                fn_alias_env.remove(name);
+            }
+        }
+        Stmt::Assign { target, .. } => {
+            if let ExprKind::Ident(name) = &target.kind {
+                fn_alias_env.remove(name);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn update_closure_env_for_stmt(
@@ -765,8 +1813,21 @@ fn update_closure_env_for_stmt(
     closure_env: &mut HashMap<String, ClosureBinding>,
     locals_in_scope: &HashSet<String>,
 ) -> bool {
+    fn remove_bindings_for_base(
+        closure_env: &mut HashMap<String, ClosureBinding>,
+        base: &str,
+    ) {
+        closure_env.remove(base);
+        let prefix = format!("{}.", base);
+        closure_env.retain(|name, _| !name.starts_with(&prefix));
+    }
+
     match stmt {
-        Stmt::Let { name, init, .. } | Stmt::Const { name, init, .. } => {
+        Stmt::Let { name, ty, init, .. } | Stmt::Const { name, ty, init, .. } => {
+            let requires_fnptr_rewrite = ty
+                .as_ref()
+                .is_some_and(|annot| matches!(annot.kind, TypeAstKind::FnPtr { .. }));
+            remove_bindings_for_base(closure_env, name);
             if let ExprKind::Closure { params, body } = &init.kind {
                 closure_env.insert(
                     name.clone(),
@@ -778,23 +1839,52 @@ fn update_closure_env_for_stmt(
                         enclosing_locals: locals_in_scope.clone(),
                     },
                 );
-                false
+                !requires_fnptr_rewrite
             } else if let ExprKind::Ident(src_name) = &init.kind {
                 if let Some(binding) = closure_env.get(src_name).cloned() {
                     closure_env.insert(name.clone(), binding);
-                    false
-                } else {
-                    closure_env.remove(name);
-                    true
+                    return !requires_fnptr_rewrite;
                 }
+                true
+            } else if let ExprKind::StructLit { fields, .. } = &init.kind {
+                if fields.is_empty() {
+                    return true;
+                }
+                for (field_name, field_expr) in fields {
+                    let key = format!("{}.{}", name, field_name);
+                    match &field_expr.kind {
+                        ExprKind::Closure { params, body } => {
+                            closure_env.insert(
+                                key,
+                                ClosureBinding {
+                                    params: params.clone(),
+                                    body: body.as_ref().clone(),
+                                    span: field_expr.span.clone(),
+                                    expr_id: field_expr.id,
+                                    enclosing_locals: locals_in_scope.clone(),
+                                },
+                            );
+                        }
+                        ExprKind::Ident(src_name) => {
+                            if let Some(binding) = closure_env.get(src_name).cloned() {
+                                closure_env.insert(key, binding);
+                            } else {
+                                closure_env.remove(&key);
+                            }
+                        }
+                        _ => {
+                            closure_env.remove(&key);
+                        }
+                    }
+                }
+                true
             } else {
-                closure_env.remove(name);
                 true
             }
         }
         Stmt::Assign { target, .. } => {
             if let ExprKind::Ident(name) = &target.kind {
-                closure_env.remove(name);
+                remove_bindings_for_base(closure_env, name);
             }
             true
         }
@@ -843,6 +1933,7 @@ fn rewrite_block_or_expr_high_level(
     queue: &mut VecDeque<Function>,
     known_functions: &HashMap<String, Function>,
     closure_env: &HashMap<String, ClosureBinding>,
+    fn_alias_env: &HashMap<String, String>,
     locals_in_scope: &HashSet<String>,
     local_types_in_scope: &HashMap<String, TypeAst>,
     ret_expected: Option<&TypeAst>,
@@ -858,6 +1949,7 @@ fn rewrite_block_or_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -872,6 +1964,7 @@ fn rewrite_block_or_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -889,6 +1982,7 @@ fn rewrite_stmt_high_level(
     queue: &mut VecDeque<Function>,
     known_functions: &HashMap<String, Function>,
     closure_env: &HashMap<String, ClosureBinding>,
+    fn_alias_env: &HashMap<String, String>,
     locals_in_scope: &HashSet<String>,
     local_types_in_scope: &HashMap<String, TypeAst>,
     ret_expected: Option<&TypeAst>,
@@ -903,6 +1997,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -918,6 +2013,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -935,6 +2031,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -950,6 +2047,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -970,6 +2068,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -986,6 +2085,7 @@ fn rewrite_stmt_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1002,6 +2102,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1015,6 +2116,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1029,6 +2131,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1049,6 +2152,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1067,6 +2171,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 &body_locals,
                 local_types_in_scope,
                 ret_expected,
@@ -1088,6 +2193,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1101,6 +2207,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1119,6 +2226,7 @@ fn rewrite_stmt_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 &body_locals,
                 local_types_in_scope,
                 ret_expected,
@@ -1136,6 +2244,7 @@ fn rewrite_stmt_high_level(
                             queue,
                             known_functions,
                             closure_env,
+                            fn_alias_env,
                             locals_in_scope,
                             local_types_in_scope,
                             ret_expected,
@@ -1149,6 +2258,7 @@ fn rewrite_stmt_high_level(
                             queue,
                             known_functions,
                             closure_env,
+                            fn_alias_env,
                             locals_in_scope,
                             local_types_in_scope,
                             ret_expected,
@@ -1164,6 +2274,7 @@ fn rewrite_stmt_high_level(
                             queue,
                             known_functions,
                             closure_env,
+                            fn_alias_env,
                             locals_in_scope,
                             local_types_in_scope,
                             ret_expected,
@@ -1179,6 +2290,7 @@ fn rewrite_stmt_high_level(
                             queue,
                             known_functions,
                             closure_env,
+                            fn_alias_env,
                             locals_in_scope,
                             local_types_in_scope,
                             ret_expected,
@@ -1204,6 +2316,7 @@ fn rewrite_stmt_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     &arm_locals,
                     local_types_in_scope,
                     ret_expected,
@@ -1224,6 +2337,7 @@ fn rewrite_expr_high_level(
     queue: &mut VecDeque<Function>,
     known_functions: &HashMap<String, Function>,
     closure_env: &HashMap<String, ClosureBinding>,
+    fn_alias_env: &HashMap<String, String>,
     locals_in_scope: &HashSet<String>,
     local_types_in_scope: &HashMap<String, TypeAst>,
     ret_expected: Option<&TypeAst>,
@@ -1240,6 +2354,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1257,6 +2372,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1274,6 +2390,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1290,6 +2407,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1308,6 +2426,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1321,6 +2440,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1334,6 +2454,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1349,6 +2470,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1366,6 +2488,7 @@ fn rewrite_expr_high_level(
                         queue,
                         known_functions,
                         closure_env,
+                        fn_alias_env,
                         &arm_locals,
                         local_types_in_scope,
                         ret_expected,
@@ -1380,6 +2503,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     &arm_locals,
                     local_types_in_scope,
                     ret_expected,
@@ -1406,13 +2530,14 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 &nested_env,
+                fn_alias_env,
                 &nested_locals,
                 &nested_local_types,
                 ret_expected,
                 expected,
             )?;
             if let Some(expected_ty) = expected {
-                if matches!(expected_ty.kind, TypeAstKind::FnPtr { .. }) {
+                if is_callable_type_ast(expected_ty) {
                     let binding = ClosureBinding {
                         params: params.clone(),
                         body: body.as_ref().clone(),
@@ -1426,8 +2551,12 @@ fn rewrite_expr_high_level(
                         expected_ty,
                         instances,
                         queue,
-                    )?;
-                    expr.kind = ExprKind::Ident(lifted);
+                    );
+                    match lifted {
+                        Ok(Some(name)) => expr.kind = ExprKind::Ident(name),
+                        Ok(None) => {}
+                        Err(err) => return Err(err),
+                    }
                 }
             }
         }
@@ -1444,6 +2573,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1461,8 +2591,23 @@ fn rewrite_expr_high_level(
             }
             let mut arg_expected = vec![None; args.len()];
             let mut has_known_callee_sig = false;
-            if let ExprKind::Ident(callee_name) = &callee.kind {
-                if let Some(func_sig) = known_functions.get(callee_name) {
+            let resolved_known_callee = match &callee.kind {
+                ExprKind::Ident(callee_name) => {
+                    if known_functions.contains_key(callee_name)
+                        || queue.iter().any(|f| f.name == *callee_name)
+                    {
+                        Some(callee_name.clone())
+                    } else {
+                        fn_alias_env.get(callee_name).cloned()
+                    }
+                }
+                _ => None,
+            };
+            if let Some(resolved_callee_name) = resolved_known_callee.as_ref() {
+                if let Some(func_sig) = known_functions
+                    .get(resolved_callee_name)
+                    .or_else(|| queue.iter().find(|f| f.name == *resolved_callee_name))
+                {
                     has_known_callee_sig = true;
                     for (idx, param) in func_sig.params.iter().enumerate().take(args.len()) {
                         arg_expected[idx] = Some(param.ty.clone());
@@ -1503,6 +2648,7 @@ fn rewrite_expr_high_level(
                     queue,
                     known_functions,
                     closure_env,
+                    fn_alias_env,
                     locals_in_scope,
                     local_types_in_scope,
                     ret_expected,
@@ -1526,12 +2672,44 @@ fn rewrite_expr_high_level(
                         queue,
                         known_functions,
                         closure_env,
+                        fn_alias_env,
                         locals_in_scope,
                         local_types_in_scope,
                         ret_expected,
                     )?;
                 }
                 return Ok(());
+            }
+
+            if let ExprKind::Field { base, name: field } = &callee.kind {
+                if let ExprKind::Ident(base_name) = &base.kind {
+                    let key = format!("{}.{}", base_name, field);
+                    if let Some(binding) = closure_env.get(&key) {
+                        let desugared = desugar_immediate_closure_call(
+                            &binding.params,
+                            &binding.body,
+                            args,
+                            expr.span.clone(),
+                        )?;
+                        expr.kind = ExprKind::Block(Box::new(desugared));
+                        if let ExprKind::Block(block) = &mut expr.kind {
+                            rewrite_block_high_level_in_env(
+                                block,
+                                templates,
+                                trait_methods,
+                                instances,
+                                queue,
+                                known_functions,
+                                closure_env,
+                                fn_alias_env,
+                                locals_in_scope,
+                                local_types_in_scope,
+                                ret_expected,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
             }
 
             if let ExprKind::Ident(name) = &callee.kind {
@@ -1552,12 +2730,46 @@ fn rewrite_expr_high_level(
                             queue,
                             known_functions,
                             closure_env,
+                            fn_alias_env,
                             locals_in_scope,
                             local_types_in_scope,
                             ret_expected,
                         )?;
                     }
                     return Ok(());
+                }
+            }
+
+            let already_runtime_closure_call = matches!(
+                &callee.kind,
+                ExprKind::Field { name, .. } if name.starts_with("__gost_closure_call_")
+            );
+            if !already_runtime_closure_call {
+                if let Some((params, ret, is_variadic, method_name)) = infer_closure_runtime_signature(
+                    callee,
+                    local_types_in_scope,
+                    templates,
+                    known_functions,
+                ) {
+                    let _ = (params, ret, is_variadic);
+                    let old_callee = std::mem::replace(
+                        callee,
+                        Box::new(Expr {
+                            id: expr.id,
+                            kind: ExprKind::Nil,
+                            span: expr.span.clone(),
+                        }),
+                    );
+                    let method_callee = Expr {
+                        id: old_callee.id,
+                        kind: ExprKind::Field {
+                            base: old_callee,
+                            name: method_name,
+                        },
+                        span: expr.span.clone(),
+                    };
+                    *callee = Box::new(method_callee);
+                    type_args.clear();
                 }
             }
 
@@ -1616,20 +2828,50 @@ fn rewrite_expr_high_level(
                 _ => None,
             };
             if let Some(callee_name) = callee_name {
+                let resolved_callee_name = if known_functions.contains_key(&callee_name)
+                    || queue.iter().any(|f| f.name == callee_name)
+                {
+                    callee_name.clone()
+                } else if let Some(alias) = fn_alias_env.get(&callee_name) {
+                    alias.clone()
+                } else {
+                    callee_name.clone()
+                };
                 let func_sig = known_functions
-                    .get(&callee_name)
+                    .get(&resolved_callee_name)
                     .cloned()
-                    .or_else(|| queue.iter().find(|f| f.name == callee_name).cloned());
+                    .or_else(|| queue.iter().find(|f| f.name == resolved_callee_name).cloned());
                 if let Some(func_sig) = func_sig {
+                    let args_snapshot = args.clone();
+                    if let Some(replacement) =
+                        callable_return_replacement_expr(expr, &func_sig, &args_snapshot)
+                    {
+                        *expr = replacement;
+                        rewrite_expr_high_level(
+                            expr,
+                            templates,
+                            trait_methods,
+                            instances,
+                            queue,
+                            known_functions,
+                            closure_env,
+                            fn_alias_env,
+                            locals_in_scope,
+                            local_types_in_scope,
+                            ret_expected,
+                            expected,
+                        )?;
+                        return Ok(());
+                    }
                     if let Some((fn_param_idx, binding, captures)) = find_captured_closure_fnptr_arg(
                         &func_sig,
-                        args,
+                        &args_snapshot,
                         closure_env,
                         locals_in_scope,
                     ) {
                         specialize_call_with_captured_closure(
                             expr,
-                            &callee_name,
+                            &resolved_callee_name,
                             &func_sig,
                             fn_param_idx,
                             &binding,
@@ -1660,6 +2902,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1675,6 +2918,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1688,6 +2932,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1703,6 +2948,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1716,6 +2962,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1731,6 +2978,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1744,6 +2992,7 @@ fn rewrite_expr_high_level(
                 queue,
                 known_functions,
                 closure_env,
+                fn_alias_env,
                 locals_in_scope,
                 local_types_in_scope,
                 ret_expected,
@@ -1758,7 +3007,7 @@ fn rewrite_expr_high_level(
         | ExprKind::Nil => {}
         ExprKind::Ident(name) => {
             if let Some(expected_ty) = expected {
-                if matches!(expected_ty.kind, TypeAstKind::FnPtr { .. }) {
+                if is_callable_type_ast(expected_ty) {
                     if let Some(binding) = closure_env.get(name) {
                         let lifted = lift_closure_binding_to_fnptr(
                             name,
@@ -1766,8 +3015,12 @@ fn rewrite_expr_high_level(
                             expected_ty,
                             instances,
                             queue,
-                        )?;
-                        *name = lifted;
+                        );
+                        match lifted {
+                            Ok(Some(lifted_name)) => *name = lifted_name,
+                            Ok(None) => {}
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
             }
@@ -1776,8 +3029,427 @@ fn rewrite_expr_high_level(
     Ok(())
 }
 
+fn type_ast_callable_parts(kind: &TypeAstKind) -> Option<(&Vec<TypeAst>, &TypeAst, bool)> {
+    match kind {
+        TypeAstKind::FnPtr {
+            params,
+            ret,
+            is_variadic,
+        }
+        | TypeAstKind::Closure {
+            params,
+            ret,
+            is_variadic,
+        } => Some((params, ret.as_ref(), *is_variadic)),
+        _ => None,
+    }
+}
+
+fn is_callable_type_ast(ty: &TypeAst) -> bool {
+    type_ast_callable_parts(&ty.kind).is_some()
+}
+
+fn closure_runtime_signature_hash(params: &[TypeAst], ret: &TypeAst, is_variadic: bool) -> u64 {
+    let sig_ty = TypeAst {
+        kind: TypeAstKind::Closure {
+            params: params.to_vec(),
+            ret: Box::new(ret.clone()),
+            is_variadic,
+        },
+        span: ret.span.clone(),
+    };
+    let mut hasher = DefaultHasher::new();
+    type_ast_key(&sig_ty).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn closure_runtime_method_name(params: &[TypeAst], ret: &TypeAst, is_variadic: bool) -> String {
+    let sig_hash = closure_runtime_signature_hash(params, ret, is_variadic);
+    format!("__gost_closure_call_{:016x}", sig_hash)
+}
+
+fn infer_closure_runtime_signature(
+    callee: &Expr,
+    local_types_in_scope: &HashMap<String, TypeAst>,
+    templates: &HashMap<String, Function>,
+    known_functions: &HashMap<String, Function>,
+) -> Option<(Vec<TypeAst>, TypeAst, bool, String)> {
+    let callee_ty = infer_expr_type_ast(callee, local_types_in_scope, templates, known_functions)?;
+    match callee_ty.kind {
+        TypeAstKind::Closure {
+            params,
+            ret,
+            is_variadic,
+        } => {
+            let method = closure_runtime_method_name(&params, ret.as_ref(), is_variadic);
+            Some((params, (*ret).clone(), is_variadic, method))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+enum CallableReturnSource {
+    Param(usize),
+    Closure {
+        params: Vec<ClosureParam>,
+        body: BlockOrExpr,
+        span: crate::frontend::ast::Span,
+        expr_id: crate::frontend::ast::ExprId,
+    },
+}
+
+fn callable_return_source(func: &Function) -> Option<CallableReturnSource> {
+    if !func.ret_type.as_ref().is_some_and(is_callable_type_ast) {
+        return None;
+    }
+
+    let mut return_expr: Option<&Expr> = None;
+    let mut return_stmt_idx = 0usize;
+    for (idx, stmt) in func.body.stmts.iter().enumerate() {
+        if let Stmt::Return { expr: Some(expr), .. } = stmt {
+            return_expr = Some(expr);
+            return_stmt_idx = idx;
+        }
+    }
+    if return_expr.is_none() {
+        if let Some(tail) = &func.body.tail {
+            return_expr = Some(tail);
+            return_stmt_idx = func.body.stmts.len();
+        }
+    }
+    let returned = return_expr?;
+
+    let callable_param_idx = |name: &str| -> Option<usize> {
+        func.params
+            .iter()
+            .enumerate()
+            .find_map(|(idx, param)| {
+                if param.name == name && is_callable_type_ast(&param.ty) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+    };
+
+    match &returned.kind {
+        ExprKind::Ident(name) => {
+            if let Some(idx) = callable_param_idx(name) {
+                return Some(CallableReturnSource::Param(idx));
+            }
+            for stmt in func.body.stmts.iter().take(return_stmt_idx) {
+                let (bound_name, init) = match stmt {
+                    Stmt::Let { name, init, .. } | Stmt::Const { name, init, .. } => {
+                        (name, init)
+                    }
+                    _ => continue,
+                };
+                if bound_name != name {
+                    continue;
+                }
+                match &init.kind {
+                    ExprKind::Closure { params, body } => {
+                        return Some(CallableReturnSource::Closure {
+                            params: params.clone(),
+                            body: body.as_ref().clone(),
+                            span: init.span.clone(),
+                            expr_id: init.id,
+                        });
+                    }
+                    ExprKind::Ident(src) => {
+                        if let Some(idx) = callable_param_idx(src) {
+                            return Some(CallableReturnSource::Param(idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        ExprKind::Closure { params, body } => Some(CallableReturnSource::Closure {
+            params: params.clone(),
+            body: body.as_ref().clone(),
+            span: returned.span.clone(),
+            expr_id: returned.id,
+        }),
+        _ => None,
+    }
+}
+
+fn can_inline_captured_arg_expr(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Ident(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::String(_)
+            | ExprKind::Nil
+    )
+}
+
+fn substitute_free_idents_with_exprs_in_block_or_expr(
+    body: &mut BlockOrExpr,
+    subst: &HashMap<String, Expr>,
+) {
+    match body {
+        BlockOrExpr::Block(block) => substitute_free_idents_with_exprs_in_block(block, subst),
+        BlockOrExpr::Expr(expr) => substitute_free_idents_with_exprs_in_expr(expr, subst),
+    }
+}
+
+fn substitute_free_idents_with_exprs_in_block(block: &mut Block, subst: &HashMap<String, Expr>) {
+    for stmt in &mut block.stmts {
+        substitute_free_idents_with_exprs_in_stmt(stmt, subst);
+    }
+    if let Some(tail) = &mut block.tail {
+        substitute_free_idents_with_exprs_in_expr(tail, subst);
+    }
+}
+
+fn substitute_free_idents_with_exprs_in_stmt(stmt: &mut Stmt, subst: &HashMap<String, Expr>) {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => {
+            substitute_free_idents_with_exprs_in_expr(init, subst);
+        }
+        Stmt::Assign { target, value, .. } => {
+            substitute_free_idents_with_exprs_in_expr(target, subst);
+            substitute_free_idents_with_exprs_in_expr(value, subst);
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+            substitute_free_idents_with_exprs_in_expr(expr, subst);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                substitute_free_idents_with_exprs_in_expr(expr, subst);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            substitute_free_idents_with_exprs_in_expr(cond, subst);
+            substitute_free_idents_with_exprs_in_block(body, subst);
+        }
+        Stmt::Loop { body, .. } => substitute_free_idents_with_exprs_in_block(body, subst),
+        Stmt::ForIn { iter, body, .. } => {
+            substitute_free_idents_with_exprs_in_expr(iter, subst);
+            substitute_free_idents_with_exprs_in_block(body, subst);
+        }
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
+            substitute_free_idents_with_exprs_in_expr(start, subst);
+            substitute_free_idents_with_exprs_in_expr(end, subst);
+            substitute_free_idents_with_exprs_in_block(body, subst);
+        }
+        Stmt::Select { arms, .. } => {
+            for arm in arms {
+                match &mut arm.kind {
+                    crate::frontend::ast::SelectArmKind::Send { chan, value } => {
+                        substitute_free_idents_with_exprs_in_expr(chan, subst);
+                        substitute_free_idents_with_exprs_in_expr(value, subst);
+                    }
+                    crate::frontend::ast::SelectArmKind::Recv { chan, .. } => {
+                        substitute_free_idents_with_exprs_in_expr(chan, subst);
+                    }
+                    crate::frontend::ast::SelectArmKind::After { ms } => {
+                        substitute_free_idents_with_exprs_in_expr(ms, subst);
+                    }
+                    crate::frontend::ast::SelectArmKind::Default => {}
+                }
+                match &mut arm.body {
+                    BlockOrExpr::Block(block) => {
+                        substitute_free_idents_with_exprs_in_block(block, subst)
+                    }
+                    BlockOrExpr::Expr(expr) => {
+                        substitute_free_idents_with_exprs_in_expr(expr, subst)
+                    }
+                }
+            }
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+}
+
+fn substitute_free_idents_with_exprs_in_expr(expr: &mut Expr, subst: &HashMap<String, Expr>) {
+    match &mut expr.kind {
+        ExprKind::Ident(name) => {
+            if let Some(replacement) = subst.get(name) {
+                *expr = replacement.clone();
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, field_expr) in fields {
+                substitute_free_idents_with_exprs_in_expr(field_expr, subst);
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                substitute_free_idents_with_exprs_in_expr(item, subst);
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            substitute_free_idents_with_exprs_in_block(block, subst);
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            substitute_free_idents_with_exprs_in_expr(cond, subst);
+            substitute_free_idents_with_exprs_in_block(then_block, subst);
+            if let Some(block) = else_block {
+                substitute_free_idents_with_exprs_in_block(block, subst);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            substitute_free_idents_with_exprs_in_expr(scrutinee, subst);
+            for arm in arms {
+                if let Some(guard) = &mut arm.guard {
+                    substitute_free_idents_with_exprs_in_expr(guard, subst);
+                }
+                match &mut arm.body {
+                    BlockOrExpr::Block(block) => {
+                        substitute_free_idents_with_exprs_in_block(block, subst)
+                    }
+                    BlockOrExpr::Expr(expr) => {
+                        substitute_free_idents_with_exprs_in_expr(expr, subst)
+                    }
+                }
+            }
+        }
+        ExprKind::Closure { body, .. } => {
+            substitute_free_idents_with_exprs_in_block_or_expr(body.as_mut(), subst);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            substitute_free_idents_with_exprs_in_expr(callee, subst);
+            for arg in args {
+                substitute_free_idents_with_exprs_in_expr(arg, subst);
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::Unary { expr: base, .. }
+        | ExprKind::Cast { expr: base, .. }
+        | ExprKind::Borrow { expr: base, .. }
+        | ExprKind::Deref { expr: base }
+        | ExprKind::Try { expr: base }
+        | ExprKind::Recv { chan: base }
+        | ExprKind::Close { chan: base }
+        | ExprKind::After { ms: base } => {
+            substitute_free_idents_with_exprs_in_expr(base, subst);
+        }
+        ExprKind::Index { base, index } => {
+            substitute_free_idents_with_exprs_in_expr(base, subst);
+            substitute_free_idents_with_exprs_in_expr(index, subst);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            substitute_free_idents_with_exprs_in_expr(left, subst);
+            substitute_free_idents_with_exprs_in_expr(right, subst);
+        }
+        ExprKind::Send { chan, value } => {
+            substitute_free_idents_with_exprs_in_expr(chan, subst);
+            substitute_free_idents_with_exprs_in_expr(value, subst);
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil => {}
+    }
+}
+
+fn callable_return_replacement_expr(
+    call_expr: &Expr,
+    callee_func: &Function,
+    args: &[Expr],
+) -> Option<Expr> {
+    let Some(source) = callable_return_source(callee_func) else {
+        return None;
+    };
+    match source {
+        CallableReturnSource::Param(idx) => {
+            if let Some(arg) = args.get(idx) {
+                return Some(arg.clone());
+            }
+            None
+        }
+        CallableReturnSource::Closure {
+            params,
+            mut body,
+            span: _span,
+            expr_id,
+        } => {
+            let mut param_name_to_index = HashMap::new();
+            for (idx, param) in callee_func.params.iter().enumerate() {
+                param_name_to_index.insert(param.name.clone(), idx);
+            }
+            let enclosing_locals: HashSet<String> =
+                callee_func.params.iter().map(|param| param.name.clone()).collect();
+            let binding = ClosureBinding {
+                params: params.clone(),
+                body: body.clone(),
+                span: call_expr.span.clone(),
+                expr_id,
+                enclosing_locals,
+            };
+            let captures = closure_captured_outer_locals(&binding);
+            let mut subst = HashMap::new();
+            let mut prelude = Vec::new();
+            for captured in captures {
+                let Some(arg_idx) = param_name_to_index.get(&captured).copied() else {
+                    return None;
+                };
+                let Some(arg) = args.get(arg_idx) else {
+                    return None;
+                };
+                if can_inline_captured_arg_expr(arg) {
+                    subst.insert(captured, arg.clone());
+                    continue;
+                }
+                let cap_name = format!("__gost_closure_cap_{}_{}", call_expr.id, arg_idx);
+                prelude.push(Stmt::Let {
+                    name: cap_name.clone(),
+                    ty: None,
+                    init: arg.clone(),
+                    span: call_expr.span.clone(),
+                });
+                subst.insert(
+                    captured,
+                    Expr {
+                        id: call_expr.id,
+                        kind: ExprKind::Ident(cap_name),
+                        span: call_expr.span.clone(),
+                    },
+                );
+            }
+            substitute_free_idents_with_exprs_in_block_or_expr(&mut body, &subst);
+            let closure_expr = Expr {
+                id: call_expr.id,
+                kind: ExprKind::Closure {
+                    params,
+                    body: Box::new(body),
+                },
+                span: call_expr.span.clone(),
+            };
+            if prelude.is_empty() {
+                return Some(closure_expr);
+            }
+            Some(Expr {
+                id: call_expr.id,
+                kind: ExprKind::Block(Box::new(Block {
+                    stmts: prelude,
+                    tail: Some(closure_expr),
+                    span: call_expr.span.clone(),
+                })),
+                span: call_expr.span.clone(),
+            })
+        }
+    }
+}
+
 fn set_call_arg_expected_from_fnptr(callee_ty: &TypeAst, arg_expected: &mut [Option<TypeAst>]) {
-    let TypeAstKind::FnPtr { params, .. } = &callee_ty.kind else {
+    let Some((params, _, _)) = type_ast_callable_parts(&callee_ty.kind) else {
         return;
     };
     for (idx, param) in params.iter().enumerate().take(arg_expected.len()) {
@@ -1813,31 +3485,19 @@ fn lift_closure_binding_to_fnptr(
     expected: &TypeAst,
     instances: &mut HashMap<String, String>,
     queue: &mut VecDeque<Function>,
-) -> Result<String, String> {
-    let TypeAstKind::FnPtr {
-        params: expected_params,
-        ret: expected_ret,
-        is_variadic,
-    } = &expected.kind
+) -> Result<Option<String>, String> {
+    let Some((expected_params, expected_ret, is_variadic)) = type_ast_callable_parts(&expected.kind)
     else {
         return Err("closure can only be converted to function pointer type".to_string());
     };
     if let Some(msg) =
-        closure_fnptr_arity_mismatch(binding.params.len(), expected_params.len(), *is_variadic)
+        closure_fnptr_arity_mismatch(binding.params.len(), expected_params.len(), is_variadic)
     {
         return Err(msg);
     }
     let captures = closure_captured_outer_locals(binding);
     if !captures.is_empty() {
-        let names = captures
-            .iter()
-            .map(|name| format!("`{}`", name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "closure captures local variable(s) {} and cannot be converted to fn pointer type",
-            names
-        ));
+        return Ok(None);
     }
 
     let sig_key = type_ast_key(expected);
@@ -1846,7 +3506,7 @@ fn lift_closure_binding_to_fnptr(
         binding_name, binding.expr_id, sig_key
     );
     if let Some(existing) = instances.get(&cache_key) {
-        return Ok(existing.clone());
+        return Ok(Some(existing.clone()));
     }
 
     let mut hasher = DefaultHasher::new();
@@ -1878,8 +3538,8 @@ fn lift_closure_binding_to_fnptr(
         name: lifted_name.clone(),
         type_params: Vec::new(),
         params,
-        is_variadic: *is_variadic,
-        ret_type: Some((**expected_ret).clone()),
+        is_variadic,
+        ret_type: Some(expected_ret.clone()),
         is_extern: false,
         is_unsafe: false,
         extern_abi: None,
@@ -1887,7 +3547,7 @@ fn lift_closure_binding_to_fnptr(
         span: binding.span.clone(),
     });
     instances.insert(cache_key, lifted_name.clone());
-    Ok(lifted_name)
+    Ok(Some(lifted_name))
 }
 
 fn find_captured_closure_fnptr_arg(
@@ -1897,7 +3557,7 @@ fn find_captured_closure_fnptr_arg(
     locals_in_scope: &HashSet<String>,
 ) -> Option<(usize, ClosureBinding, Vec<String>)> {
     for (idx, (param, arg)) in callee_func.params.iter().zip(args.iter()).enumerate() {
-        if !matches!(param.ty.kind, TypeAstKind::FnPtr { .. }) {
+        if !is_callable_type_ast(&param.ty) {
             continue;
         }
         match &arg.kind {
@@ -1906,6 +3566,17 @@ fn find_captured_closure_fnptr_arg(
                     let captures = closure_captured_outer_locals(binding);
                     if !captures.is_empty() {
                         return Some((idx, binding.clone(), captures));
+                    }
+                }
+            }
+            ExprKind::Field { base, name } => {
+                if let ExprKind::Ident(base_name) = &base.kind {
+                    let key = format!("{}.{}", base_name, name);
+                    if let Some(binding) = closure_env.get(&key) {
+                        let captures = closure_captured_outer_locals(binding);
+                        if !captures.is_empty() {
+                            return Some((idx, binding.clone(), captures));
+                        }
                     }
                 }
             }
@@ -1996,16 +3667,11 @@ fn specialize_function_with_captured_closure(
         .params
         .get(fn_param_idx)
         .ok_or_else(|| "closure argument index out of bounds".to_string())?;
-    let TypeAstKind::FnPtr {
-        params: expected_params,
-        is_variadic,
-        ..
-    } = &fn_param.ty.kind
-    else {
+    let Some((expected_params, _, is_variadic)) = type_ast_callable_parts(&fn_param.ty.kind) else {
         return Err("closure specialization requires fn pointer parameter".to_string());
     };
     if let Some(msg) =
-        closure_fnptr_arity_mismatch(binding.params.len(), expected_params.len(), *is_variadic)
+        closure_fnptr_arity_mismatch(binding.params.len(), expected_params.len(), is_variadic)
     {
         return Err(msg);
     }
@@ -2345,6 +4011,28 @@ fn inline_fn_param_calls_in_expr(
             for arg in args.iter_mut() {
                 inline_fn_param_calls_in_expr(arg, fn_param_name, closure_params, closure_body)?;
             }
+            if let ExprKind::Field { base, name } = &callee.kind {
+                if let ExprKind::Ident(recv_name) = &base.kind {
+                    if recv_name == fn_param_name && name.starts_with("__gost_closure_call_") {
+                        let desugared = desugar_immediate_closure_call(
+                            closure_params,
+                            closure_body,
+                            args,
+                            expr.span.clone(),
+                        )?;
+                        expr.kind = ExprKind::Block(Box::new(desugared));
+                        if let ExprKind::Block(block) = &mut expr.kind {
+                            inline_fn_param_calls_in_block(
+                                block,
+                                fn_param_name,
+                                closure_params,
+                                closure_body,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             if let ExprKind::Ident(name) = &callee.kind {
                 if name == fn_param_name {
                     let desugared = desugar_immediate_closure_call(
@@ -2369,10 +4057,11 @@ fn inline_fn_param_calls_in_expr(
         }
         ExprKind::Ident(name) => {
             if name == fn_param_name {
-                return Err(format!(
-                    "capturing closure specialization does not support using `{}` as a value",
-                    fn_param_name
-                ));
+                expr.kind = ExprKind::Closure {
+                    params: closure_params.to_vec(),
+                    body: Box::new(closure_body.clone()),
+                };
+                return Ok(());
             }
         }
         ExprKind::StructLit { fields, .. } => {
@@ -2799,7 +4488,6 @@ fn instantiate_generic_method_call(
                         queue,
                     )?;
                 }
-                type_args.clear();
                 return Ok(());
             }
             return Err(format!(
@@ -2875,7 +4563,9 @@ fn instantiate_generic_method_call(
             format!("failed to instantiate generic method `{}`", method)
         }));
     }
-    type_args.clear();
+    if !recv_is_interface_like {
+        type_args.clear();
+    }
     Ok(())
 }
 
@@ -3134,7 +4824,8 @@ fn pattern_mentions_type_param(pattern: &TypeAst, type_params: &[TypeParam]) -> 
         TypeAstKind::Tuple(items) => items
             .iter()
             .any(|item| pattern_mentions_type_param(item, type_params)),
-        TypeAstKind::FnPtr { params, ret, .. } => {
+        TypeAstKind::FnPtr { params, ret, .. }
+        | TypeAstKind::Closure { params, ret, .. } => {
             params
                 .iter()
                 .any(|p| pattern_mentions_type_param(p, type_params))
@@ -3154,12 +4845,7 @@ fn infer_generic_type_args_from_closure(
     known_functions: &HashMap<String, Function>,
     inferred: &mut HashMap<String, TypeAst>,
 ) {
-    let TypeAstKind::FnPtr {
-        params: expected_params,
-        ret: expected_ret,
-        ..
-    } = &param_ty.kind
-    else {
+    let Some((expected_params, expected_ret, _)) = type_ast_callable_parts(&param_ty.kind) else {
         return;
     };
     if closure_params.len() != expected_params.len() {
@@ -3176,9 +4862,7 @@ fn infer_generic_type_args_from_closure(
             closure_locals.insert(closure_param.name.clone(), param_ty.clone());
         }
     }
-    if let Some(actual_ret_ty) =
-        infer_closure_body_type_ast(body, &closure_locals, templates, known_functions)
-    {
+    if let Some(actual_ret_ty) = infer_closure_body_type_ast(body, &closure_locals, templates, known_functions) {
         let _ = unify_generic_pattern(expected_ret, &actual_ret_ty, type_params, inferred);
     }
 }
@@ -3280,8 +4964,18 @@ fn unify_generic_pattern(
             params: pp,
             ret: pr,
             is_variadic: pv,
+        }
+        | TypeAstKind::Closure {
+            params: pp,
+            ret: pr,
+            is_variadic: pv,
         } => match &actual.kind {
             TypeAstKind::FnPtr {
+                params: ap,
+                ret: ar,
+                is_variadic: av,
+            }
+            | TypeAstKind::Closure {
                 params: ap,
                 ret: ar,
                 is_variadic: av,
@@ -3341,11 +5035,80 @@ fn infer_expr_type_ast(
                 span: expr.span.clone(),
             },
         ),
+        ExprKind::Unary { op, expr: inner } => {
+            let inner_ty =
+                infer_expr_type_ast(inner, local_types_in_scope, templates, known_functions)?;
+            match op {
+                UnaryOp::Not => Some(type_ast_named("bool", &expr.span)),
+                UnaryOp::Neg | UnaryOp::BitNot => Some(inner_ty),
+            }
+        }
         ExprKind::Deref { expr: inner } => {
             let inner_ty = infer_expr_type_ast(inner, local_types_in_scope, templates, known_functions)?;
             match inner_ty.kind {
                 TypeAstKind::Ref(pointee) | TypeAstKind::MutRef(pointee) => Some((*pointee).clone()),
                 _ => None,
+            }
+        }
+        ExprKind::Index { base, index } => {
+            let base_ty =
+                infer_expr_type_ast(base, local_types_in_scope, templates, known_functions)?;
+            let mut container = base_ty.clone();
+            loop {
+                match container.kind {
+                    TypeAstKind::Ref(inner) | TypeAstKind::MutRef(inner) => {
+                        container = (*inner).clone();
+                    }
+                    _ => break,
+                }
+            }
+            match container.kind {
+                TypeAstKind::Tuple(items) => {
+                    let idx = match &index.kind {
+                        ExprKind::Int(v) => v.parse::<usize>().ok(),
+                        _ => None,
+                    }?;
+                    items.get(idx).cloned()
+                }
+                TypeAstKind::Array(elem, _) | TypeAstKind::Slice(elem) => Some((*elem).clone()),
+                _ => None,
+            }
+        }
+        ExprKind::Binary { op, left, right } => {
+            let left_ty = infer_expr_type_ast(left, local_types_in_scope, templates, known_functions)?;
+            let right_ty =
+                infer_expr_type_ast(right, local_types_in_scope, templates, known_functions)?;
+            match op {
+                BinaryOp::And | BinaryOp::Or => Some(type_ast_named("bool", &expr.span)),
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Lte
+                | BinaryOp::Gt
+                | BinaryOp::Gte => Some(type_ast_named("bool", &expr.span)),
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr => {
+                    if type_ast_eq(&left_ty, &right_ty) {
+                        Some(left_ty)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            if let Some(tail) = &block.tail {
+                infer_expr_type_ast(tail, local_types_in_scope, templates, known_functions)
+            } else {
+                Some(type_ast_named("unit", &expr.span))
             }
         }
         ExprKind::Tuple(items) => {
@@ -3466,7 +5229,7 @@ fn infer_expr_type_ast(
             )
                 .unwrap_or_else(|| type_ast_named("unit", &expr.span));
             Some(TypeAst {
-                kind: TypeAstKind::FnPtr {
+                kind: TypeAstKind::Closure {
                     params: param_tys,
                     ret: Box::new(ret_ty),
                     is_variadic: false,
@@ -3507,6 +5270,42 @@ fn type_ast_eq(a: &TypeAst, b: &TypeAst) -> bool {
         }
         (
             TypeAstKind::FnPtr {
+                params: xp,
+                ret: xr,
+                is_variadic: xv,
+            },
+            TypeAstKind::FnPtr {
+                params: yp,
+                ret: yr,
+                is_variadic: yv,
+            },
+        )
+        | (
+            TypeAstKind::Closure {
+                params: xp,
+                ret: xr,
+                is_variadic: xv,
+            },
+            TypeAstKind::Closure {
+                params: yp,
+                ret: yr,
+                is_variadic: yv,
+            },
+        )
+        | (
+            TypeAstKind::FnPtr {
+                params: xp,
+                ret: xr,
+                is_variadic: xv,
+            },
+            TypeAstKind::Closure {
+                params: yp,
+                ret: yr,
+                is_variadic: yv,
+            },
+        )
+        | (
+            TypeAstKind::Closure {
                 params: xp,
                 ret: xr,
                 is_variadic: xv,
@@ -3961,7 +5760,7 @@ fn substitute_type_ast(ty: &mut TypeAst, map: &HashMap<String, TypeAst>) {
                 substitute_type_ast(item, map);
             }
         }
-        TypeAstKind::FnPtr { params, ret, .. } => {
+        TypeAstKind::FnPtr { params, ret, .. } | TypeAstKind::Closure { params, ret, .. } => {
             for param in params {
                 substitute_type_ast(param, map);
             }
@@ -4017,6 +5816,26 @@ fn type_ast_key(ty: &TypeAst) -> String {
             is_variadic,
         } => {
             let mut s = "fn<".to_string();
+            for (idx, param) in params.iter().enumerate() {
+                if idx > 0 {
+                    s.push(',');
+                }
+                s.push_str(&type_ast_key(param));
+            }
+            s.push_str("->");
+            s.push_str(&type_ast_key(ret));
+            if *is_variadic {
+                s.push_str(",...");
+            }
+            s.push('>');
+            s
+        }
+        TypeAstKind::Closure {
+            params,
+            ret,
+            is_variadic,
+        } => {
+            let mut s = "closure<".to_string();
             for (idx, param) in params.iter().enumerate() {
                 if idx > 0 {
                     s.push(',');
@@ -4252,6 +6071,145 @@ fn main() -> i32 {
     }
 
     #[test]
+    fn closure_typed_param_accepts_capturing_closure_argument() {
+        let src = r#"
+module main
+
+fn apply(f: closure(i32)->i32, x: i32) -> i32 {
+    return f(x)
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add = |x: i32| x + base
+    let out = apply(add, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should compile for closure-typed parameter");
+    }
+
+    #[test]
+    fn closure_typed_local_binding_accepts_capturing_closure() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let out = add(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should compile for closure-typed local binding");
+    }
+
+    #[test]
+    fn closure_typed_alias_call_specializes_capturing_closure() {
+        let src = r#"
+module main
+
+fn apply(f: closure(i32)->i32, x: i32) -> i32 {
+    return f(x)
+}
+
+fn main() -> i32 {
+    let run: fn(closure(i32)->i32, i32)->i32 = apply
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let out = run(add, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should specialize through closure-typed alias call");
+    }
+
+    #[test]
+    fn capturing_closure_accepts_fnptr_typed_local_binding() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: fn(i32)->i32 = |x: i32| x + base
+    let out = add(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should work for fnptr-typed local binding");
+    }
+
+    #[test]
+    fn capturing_closure_specializes_through_fnptr_alias_call() {
+        let src = r#"
+module main
+
+fn apply(f: fn(i32)->i32, x: i32) -> i32 {
+    return f(x)
+}
+
+fn main() -> i32 {
+    let run: fn(fn(i32)->i32, i32)->i32 = apply
+    let base: i32 = 1
+    let add: fn(i32)->i32 = |x: i32| x + base
+    let out = run(add, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should specialize through fnptr alias call");
+    }
+
+    #[test]
+    fn capturing_closure_specializes_through_variadic_fnptr_alias_call() {
+        let src = r#"
+module main
+
+fn apply(f: fn(i32, ...)->i32, x: i32) -> i32 {
+    return f(x)
+}
+
+fn main() -> i32 {
+    let run: fn(fn(i32, ...)->i32, i32)->i32 = apply
+    let base: i32 = 1
+    let add: fn(i32, ...)->i32 = |x: i32| x + base
+    let out = run(add, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should specialize through variadic fnptr alias call");
+    }
+
+    #[test]
     fn variadic_fnptr_call_accepts_non_capturing_closure_binding() {
         let src = r#"
 module main
@@ -4296,6 +6254,231 @@ fn main() -> i32 {
         let file = TempSource::new(src);
         compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect("inline closure should convert for variadic fnptr call");
+    }
+
+    #[test]
+    fn closure_return_value_preserves_capture() {
+        let src = r#"
+module main
+
+fn make_adder(base: i32) -> closure(i32)->i32 {
+    let add: closure(i32)->i32 = |x: i32| x + base
+    return add
+}
+
+fn main() -> i32 {
+    let add = make_adder(1)
+    let out = add(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should survive return and call");
+    }
+
+    #[test]
+    fn closure_identity_round_trip_preserves_capture() {
+        let src = r#"
+module main
+
+fn id(f: closure(i32)->i32) -> closure(i32)->i32 {
+    return f
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let out = id(add)(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should survive identity round-trip");
+    }
+
+    #[test]
+    fn closure_factory_capture_expression_is_frozen_at_creation() {
+        let src = r#"
+module main
+
+fn make_adder(base: i32) -> closure(i32)->i32 {
+    let add: closure(i32)->i32 = |x: i32| x + base
+    return add
+}
+
+fn main() -> i32 {
+    let i: i32 = 1
+    let add = make_adder(i + 1)
+    i = 10
+    let out = add(1)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("closure factory capture expression should be evaluated at creation");
+    }
+
+    #[test]
+    fn capturing_closure_specialization_handles_fn_param_value_alias() {
+        let src = r#"
+module main
+
+fn apply_alias(f: closure(i32)->i32, x: i32) -> i32 {
+    let g: closure(i32)->i32 = f
+    return g(x)
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let out = apply_alias(add, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should specialize through value alias of fn param");
+    }
+
+    #[test]
+    fn capturing_closure_fnptr_return_round_trip() {
+        let src = r#"
+module main
+
+fn make_adder(base: i32) -> fn(i32)->i32 {
+    let add: fn(i32)->i32 = |x: i32| x + base
+    return add
+}
+
+fn main() -> i32 {
+    let add = make_adder(1)
+    let out = add(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should survive fnptr-typed return and call");
+    }
+
+    #[test]
+    fn capturing_closure_can_flow_through_struct_field() {
+        let src = r#"
+module main
+
+struct Holder {
+    f: closure(i32)->i32
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let h = Holder { f = add }
+    let out = h.f(2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should flow through struct field and call");
+    }
+
+    #[test]
+    fn capturing_closure_struct_field_with_non_closure_fields_compiles() {
+        let src = r#"
+module main
+
+struct Holder {
+    f: closure(i32)->i32
+    n: i32
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let h = Holder { f = |x: i32| x + base, n = 2 }
+    let out = h.f(2)
+    if out != 3 {
+        return 1
+    }
+    if h.n != 2 {
+        return 2
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("capturing closure should compile in mixed struct literal fields");
+    }
+
+    #[test]
+    fn closure_array_index_call_compiles() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let fs: [2]closure(i32)->i32 = [|x: i32| x + base, |x: i32| x + 2]
+    let out = fs[0](2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("closure stored in array should be callable via index");
+    }
+
+    #[test]
+    fn closure_param_round_trip_and_call_compiles() {
+        let src = r#"
+module main
+
+fn forward(f: closure(i32)->i32) -> closure(i32)->i32 {
+    return f
+}
+
+fn invoke(f: closure(i32)->i32, x: i32) -> i32 {
+    return f(x)
+}
+
+fn main() -> i32 {
+    let base: i32 = 1
+    let add: closure(i32)->i32 = |x: i32| x + base
+    let f = forward(add)
+    let out = invoke(f, 2)
+    if out != 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("closure should round-trip through closure-typed params and return");
     }
 
     #[test]
@@ -4671,6 +6854,173 @@ fn main() -> i32 {
             llvm.contains("define i32 @pick(i32 %arg0, ...)"),
             "expected variadic user function definition"
         );
+    }
+
+    #[test]
+    fn dyn_trait_object_dispatch_compiles() {
+        let src = r#"
+module main
+
+trait Greeter {
+    fn greet() -> i32
+}
+
+copy struct User {
+    id: i32
+}
+
+impl Greeter for User {
+    fn greet() -> i32 {
+        return self.id + 1
+    }
+}
+
+fn call(v: dyn Greeter) -> i32 {
+    return v.greet()
+}
+
+fn main() -> i32 {
+    let u = User { id = 1 }
+    let any = u as dyn Greeter
+    if call(any) != 2 {
+        return 1
+    }
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("dyn trait object dispatch should compile");
+    }
+
+    #[test]
+    fn trait_object_cast_rejects_missing_impl() {
+        let src = r#"
+module main
+
+trait Greeter {
+    fn greet() -> i32
+}
+
+copy struct User {
+    id: i32
+}
+
+fn main() -> i32 {
+    let u = User { id = 1 }
+    let _ = u as Greeter
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("casting to trait object without impl should fail");
+        assert!(
+            err.contains("does not implement trait `Greeter`"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn trait_object_rejects_methods_outside_trait() {
+        let src = r#"
+module main
+
+trait Greeter {
+    fn greet() -> i32
+}
+
+copy struct User {
+    id: i32
+}
+
+impl Greeter for User {
+    fn greet() -> i32 {
+        return self.id + 1
+    }
+}
+
+impl User {
+    fn only_user() -> i32 {
+        return 7
+    }
+}
+
+fn main() -> i32 {
+    let u = User { id = 1 }
+    let any = u as Greeter
+    return any.only_user()
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("trait object should reject methods outside declared trait");
+        assert!(
+            err.contains("unknown method `only_user` on trait object `Greeter`"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn recursive_struct_with_own_indirection_compiles() {
+        let src = r#"
+module main
+
+struct Node {
+    next: own[Node]
+}
+
+fn main() -> i32 {
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("recursive struct through own indirection should compile");
+    }
+
+    #[test]
+    fn direct_recursive_struct_cycle_is_rejected() {
+        let src = r#"
+module main
+
+struct Bad {
+    next: Bad
+}
+
+fn main() -> i32 {
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("direct recursive value cycle should be rejected");
+        assert!(
+            err.contains("recursive value cycle is not allowed"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn mutual_recursive_structs_with_indirection_compile() {
+        let src = r#"
+module main
+
+struct A {
+    b: own[B]
+}
+
+struct B {
+    a: own[A]
+}
+
+fn main() -> i32 {
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("mutual recursion via own indirection should compile");
     }
 
     #[test]
@@ -5075,6 +7425,187 @@ fn main() -> i32 {
         compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect("ref[unit] should compile through codegen");
     }
+
+    #[test]
+    fn compiler_reports_diverse_error_categories() {
+        struct Case<'a> {
+            name: &'a str,
+            src: &'a str,
+            expected: &'a [&'a str],
+        }
+
+        let cases = vec![
+            Case {
+                name: "undefined_name",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    let x = missing_name
+    return 0
 }
+"#,
+                expected: &["E1002", "undefined name `missing_name`"],
+            },
+            Case {
+                name: "unknown_type",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    let x: strnig = "a"
+    let _ = x
+    return 0
+}
+"#,
+                expected: &["E1003", "unknown type `strnig`"],
+            },
+            Case {
+                name: "unknown_function",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    let xs = make_slice[i32](0 as i64, 0 as i64)
+    let _ = filter(iter(&xs), pritn)
+    return 0
+}
+"#,
+                expected: &["E1004", "unknown function `pritn`"],
+            },
+            Case {
+                name: "unknown_field",
+                src: r#"
+module main
+
+struct S {
+    x: i32
+}
+
+fn main() -> i32 {
+    let s = S { x = 1 }
+    let _ = s.y
+    return 0
+}
+"#,
+                expected: &["E1101", "unknown field `y`"],
+            },
+            Case {
+                name: "unknown_method",
+                src: r#"
+module main
+
+struct S {
+    x: i32
+}
+
+fn main() -> i32 {
+    let s = S { x = 1 }
+    s.nope()
+    return 0
+}
+"#,
+                expected: &["E1102", "unknown method `nope`"],
+            },
+            Case {
+                name: "unknown_variant",
+                src: r#"
+module main
+
+enum E {
+    A
+}
+
+fn main() -> i32 {
+    let _ = E.B
+    return 0
+}
+"#,
+                expected: &["E1103", "unknown enum variant"],
+            },
+            Case {
+                name: "receiver_not_addressable",
+                src: r#"
+module main
+
+struct P {
+    x: i32
+}
+
+fn read(self: ref[P]) -> i32 {
+    return self.x
+}
+
+fn make() -> P {
+    return P { x = 1 }
+}
+
+                fn main() -> i32 {
+    let _ = make().read()
+    return 0
+}
+"#,
+                expected: &["E1104", "temporary value is not addressable"],
+            },
+            Case {
+                name: "break_outside_loop",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    break
+    return 0
+}
+"#,
+                expected: &["break outside loop"],
+            },
+            Case {
+                name: "return_type_mismatch",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    return true
+}
+"#,
+                expected: &["return type mismatch"],
+            },
+            Case {
+                name: "map_iteration_mutation_conflict",
+                src: r#"
+module main
+
+fn main() -> i32 {
+    let m = make_map[i32, i32](4 as i64)
+    map_set[i32, i32](&mut m, 1, 10)
+    for k, v in &m {
+        let _ = v
+        map_set[i32, i32](&mut m, k, 11)
+    }
+    return 0
+}
+"#,
+                expected: &["mutable borrow conflicts with existing borrows"],
+            },
+        ];
+
+        for case in cases {
+            let file = TempSource::new(case.src);
+            let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+                .expect_err(case.name);
+            for needle in case.expected {
+                assert!(
+                    err.contains(needle),
+                    "case `{}` expected diagnostic containing `{}` but got:\n{}",
+                    case.name,
+                    needle,
+                    err
+                );
+            }
+        }
+    }
+}
+
+
 
 

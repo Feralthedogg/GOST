@@ -1,8 +1,4 @@
-# Owner/Alias Handle Model (No Lifetime) v1
-
-Status: Accepted
-Date: 2026-02-18
-Scope: Frontend type system, sema rules, MIR invariants, codegen contract, runtime ABI mapping
+# Owner/Alias Handle Model
 
 ## 1. Purpose
 

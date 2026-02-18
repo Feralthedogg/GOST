@@ -33,6 +33,11 @@ pub enum Type {
         ret: Box<Type>,
         is_variadic: bool,
     },
+    Closure {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        is_variadic: bool,
+    },
     Ref(Box<Type>),
     MutRef(Box<Type>),
     Own(Box<Type>),
@@ -154,7 +159,7 @@ impl Type {
         if matches!(self, Type::Builtin(BuiltinType::Bool | BuiltinType::Char)) {
             return Some(2);
         }
-        if matches!(self, Type::FnPtr { .. }) {
+        if matches!(self, Type::FnPtr { .. } | Type::Closure { .. }) {
             return Some(4);
         }
         if matches!(self, Type::Alias(_) | Type::Shared(_) | Type::Chan(_)) {
@@ -201,6 +206,27 @@ fn fmt_type_pretty(ty: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             is_variadic,
         } => {
             write!(f, "fn(")?;
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                fmt_type_pretty(p, f)?;
+            }
+            if *is_variadic {
+                if !params.is_empty() {
+                    write!(f, ", ")?;
+                }
+                write!(f, "...")?;
+            }
+            write!(f, ") -> ")?;
+            fmt_type_pretty(ret, f)
+        }
+        Type::Closure {
+            params,
+            ret,
+            is_variadic,
+        } => {
+            write!(f, "closure(")?;
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
@@ -367,6 +393,7 @@ pub struct LayoutInfo {
 pub struct TypeDefs {
     defs: HashMap<String, TypeDefKind>,
     aliases: HashMap<String, Type>,
+    trait_names: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,9 +420,18 @@ impl TypeDefs {
         self.aliases.get(name)
     }
 
+    pub fn insert_trait_name(&mut self, name: String) {
+        self.trait_names.insert(name);
+    }
+
+    pub fn is_trait_name(&self, name: &str) -> bool {
+        self.trait_names.contains(name)
+    }
+
     pub fn all_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.defs.keys().cloned().collect();
         names.extend(self.aliases.keys().cloned());
+        names.extend(self.trait_names.iter().cloned());
         names.sort();
         names.dedup();
         names
@@ -497,7 +533,7 @@ impl TypeDefs {
         if matches!(ty, Type::Alias(_) | Type::Shared(_) | Type::Chan(_)) {
             return true;
         }
-        if matches!(ty, Type::FnPtr { .. }) {
+        if matches!(ty, Type::FnPtr { .. } | Type::Closure { .. }) {
             return true;
         }
         if ty.int_info().is_some() {
@@ -617,7 +653,7 @@ impl TypeDefs {
                 | BuiltinType::Error => Some(TypeClass::Copy),
                 BuiltinType::Bytes => Some(TypeClass::Linear),
             },
-            Type::FnPtr { .. } => Some(TypeClass::Copy),
+            Type::FnPtr { .. } | Type::Closure { .. } => Some(TypeClass::Copy),
             Type::Own(_) => Some(TypeClass::Linear),
             Type::Alias(_) => Some(TypeClass::Copy),
             Type::Shared(_) | Type::Interface => Some(TypeClass::Copy),
@@ -743,7 +779,7 @@ impl TypeDefs {
                     | BuiltinType::String
                     | BuiltinType::Error,
             ) => true,
-            Type::FnPtr { .. } => true,
+            Type::FnPtr { .. } | Type::Closure { .. } => true,
             Type::Tuple(items) => items
                 .iter()
                 .all(|it| self.interface_cast_supported_inner(it, visiting)),
@@ -793,10 +829,10 @@ impl TypeDefs {
         if from == to {
             return true;
         }
-        if matches!(to, Type::Interface) {
+        if matches!(to, Type::Interface | Type::Closure { .. }) {
             return self.interface_cast_supported(from);
         }
-        if matches!(from, Type::Interface) {
+        if matches!(from, Type::Interface | Type::Closure { .. }) {
             return self.interface_cast_supported(to);
         }
         if from.is_integer() && to.is_integer() {

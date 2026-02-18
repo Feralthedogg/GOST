@@ -153,7 +153,11 @@ pub fn analyze(
                 );
                 type_order.push(def.name.clone());
             }
-            Item::TypeAlias(_) => {}
+            Item::TypeAlias(alias) => {
+                if alias.is_trait {
+                    types.insert_trait_name(alias.name.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -443,6 +447,7 @@ pub fn analyze(
     }
 
     let namespaced_only_funcs = build_namespaced_only_funcs(file, &functions);
+    let trait_methods = collect_trait_method_requirements(file);
 
     let global_check_sig = FunctionSig {
         params: Vec::new(),
@@ -475,6 +480,7 @@ pub fn analyze(
             &extern_globals,
             &globals,
             &consts,
+            &trait_methods,
             &namespaced_only_funcs,
             &global_check_sig,
             false,
@@ -530,6 +536,7 @@ pub fn analyze(
                     &extern_globals,
                     &globals,
                     &consts,
+                    &trait_methods,
                     &namespaced_only_funcs,
                     &sig,
                     std_funcs.contains(&func.name),
@@ -580,6 +587,18 @@ fn build_namespaced_only_funcs(
                 if !rest.is_empty() {
                     out.entry(rest.to_string()).or_insert_with(|| alias.clone());
                 }
+            }
+        }
+    }
+    out
+}
+
+fn collect_trait_method_requirements(file: &FileAst) -> HashMap<String, Vec<TraitMethod>> {
+    let mut out = HashMap::new();
+    for item in &file.items {
+        if let Item::TypeAlias(alias) = item {
+            if alias.is_trait {
+                out.insert(alias.name.clone(), alias.trait_methods.clone());
             }
         }
     }
@@ -1046,6 +1065,22 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
                 is_variadic: *is_variadic,
             })
         }
+        TypeAstKind::Closure {
+            params,
+            ret,
+            is_variadic,
+        } => {
+            let mut ptys = Vec::new();
+            for p in params {
+                ptys.push(resolve_type(p, defs, diags)?);
+            }
+            let rty = resolve_type(ret, defs, diags)?;
+            Some(Type::Closure {
+                params: ptys,
+                ret: Box::new(rty),
+                is_variadic: *is_variadic,
+            })
+        }
     }
 }
 
@@ -1167,6 +1202,7 @@ enum LinearState {
 #[derive(Clone, Debug)]
 struct VarInfo {
     ty: Type,
+    trait_obj: Option<String>,
     mutable: bool,
     class: TypeClass,
     state: LinearState,
@@ -1240,6 +1276,7 @@ struct FunctionChecker<'a> {
     extern_globals: &'a HashMap<String, ExternGlobalSig>,
     globals: &'a HashMap<String, GlobalVarSig>,
     consts: &'a HashMap<String, ConstSig>,
+    trait_methods: &'a HashMap<String, Vec<TraitMethod>>,
     namespaced_only_funcs: &'a HashMap<String, String>,
     sig: &'a FunctionSig,
     is_std: bool,
@@ -1262,6 +1299,7 @@ impl<'a> FunctionChecker<'a> {
         extern_globals: &'a HashMap<String, ExternGlobalSig>,
         globals: &'a HashMap<String, GlobalVarSig>,
         consts: &'a HashMap<String, ConstSig>,
+        trait_methods: &'a HashMap<String, Vec<TraitMethod>>,
         namespaced_only_funcs: &'a HashMap<String, String>,
         sig: &'a FunctionSig,
         is_std: bool,
@@ -1274,6 +1312,7 @@ impl<'a> FunctionChecker<'a> {
             extern_globals,
             globals,
             consts,
+            trait_methods,
             namespaced_only_funcs,
             sig,
             is_std,
@@ -1378,6 +1417,391 @@ impl<'a> FunctionChecker<'a> {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    fn trait_name_from_type_ast(&self, ty: &TypeAst) -> Option<String> {
+        match &ty.kind {
+            TypeAstKind::Named(name) if self.defs.is_trait_name(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn trait_name_from_expr(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => self.env.vars.get(name).and_then(|v| v.trait_obj.clone()),
+            ExprKind::Cast { ty, .. } => self.trait_name_from_type_ast(ty),
+            _ => None,
+        }
+    }
+
+    fn trait_method_names(&self, trait_name: &str) -> Vec<String> {
+        let mut out = self
+            .trait_methods
+            .get(trait_name)
+            .into_iter()
+            .flat_map(|methods| methods.iter().map(|m| m.name.clone()))
+            .collect::<Vec<_>>();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn substitute_type_params_in_type_ast(
+        &self,
+        ty: &TypeAst,
+        subst: &HashMap<String, TypeAst>,
+    ) -> TypeAst {
+        if let TypeAstKind::Named(name) = &ty.kind {
+            if let Some(repl) = subst.get(name) {
+                return repl.clone();
+            }
+        }
+        let kind = match &ty.kind {
+            TypeAstKind::Named(name) => TypeAstKind::Named(name.clone()),
+            TypeAstKind::Ref(inner) => {
+                TypeAstKind::Ref(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
+            }
+            TypeAstKind::MutRef(inner) => TypeAstKind::MutRef(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
+            TypeAstKind::Own(inner) => {
+                TypeAstKind::Own(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
+            }
+            TypeAstKind::Alias(inner) => {
+                TypeAstKind::Alias(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
+            }
+            TypeAstKind::Slice(inner) => {
+                TypeAstKind::Slice(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
+            }
+            TypeAstKind::Array(inner, len) => TypeAstKind::Array(
+                Box::new(self.substitute_type_params_in_type_ast(inner, subst)),
+                *len,
+            ),
+            TypeAstKind::Map(key, val) => TypeAstKind::Map(
+                Box::new(self.substitute_type_params_in_type_ast(key, subst)),
+                Box::new(self.substitute_type_params_in_type_ast(val, subst)),
+            ),
+            TypeAstKind::Result(ok, err) => TypeAstKind::Result(
+                Box::new(self.substitute_type_params_in_type_ast(ok, subst)),
+                Box::new(self.substitute_type_params_in_type_ast(err, subst)),
+            ),
+            TypeAstKind::Chan(inner) => {
+                TypeAstKind::Chan(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
+            }
+            TypeAstKind::Shared(inner) => TypeAstKind::Shared(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
+            TypeAstKind::Interface => TypeAstKind::Interface,
+            TypeAstKind::Tuple(items) => TypeAstKind::Tuple(
+                items
+                    .iter()
+                    .map(|item| self.substitute_type_params_in_type_ast(item, subst))
+                    .collect(),
+            ),
+            TypeAstKind::FnPtr {
+                params,
+                ret,
+                is_variadic,
+            } => TypeAstKind::FnPtr {
+                params: params
+                    .iter()
+                    .map(|p| self.substitute_type_params_in_type_ast(p, subst))
+                    .collect(),
+                ret: Box::new(self.substitute_type_params_in_type_ast(ret, subst)),
+                is_variadic: *is_variadic,
+            },
+            TypeAstKind::Closure {
+                params,
+                ret,
+                is_variadic,
+            } => TypeAstKind::Closure {
+                params: params
+                    .iter()
+                    .map(|p| self.substitute_type_params_in_type_ast(p, subst))
+                    .collect(),
+                ret: Box::new(self.substitute_type_params_in_type_ast(ret, subst)),
+                is_variadic: *is_variadic,
+            },
+        };
+        TypeAst {
+            kind,
+            span: ty.span.clone(),
+        }
+    }
+
+    fn resolve_trait_method_signature_for_call(
+        &mut self,
+        trait_name: &str,
+        method_name: &str,
+        type_args: &[TypeAst],
+        span: &Span,
+    ) -> Option<FunctionSig> {
+        let Some(methods) = self.trait_methods.get(trait_name) else {
+            self.diags.push(
+                format!("unknown trait `{}`", trait_name),
+                Some(span.clone()),
+            );
+            return None;
+        };
+        let Some(required) = methods.iter().find(|m| m.name == method_name) else {
+            // Marker-style empty traits act as open interface aliases.
+            // Allow method dispatch recovery from available receiver-first candidates.
+            if methods.is_empty() {
+                let mut dispatch = Vec::<(String, FunctionSig)>::new();
+                for (symbol, sig) in self.method_candidates_named(method_name) {
+                    let Some(param0) = sig.params.first() else {
+                        continue;
+                    };
+                    if self.defs.interface_cast_supported(param0) {
+                        dispatch.push((symbol, sig));
+                    }
+                }
+                if dispatch.is_empty() {
+                    return None;
+                }
+                dispatch.sort_by(|a, b| a.0.cmp(&b.0));
+                let canonical = dispatch[0].1.clone();
+                for (_, sig) in dispatch.iter().skip(1) {
+                    if sig.params.len() != canonical.params.len()
+                        || sig.is_variadic != canonical.is_variadic
+                        || !type_eq(&sig.ret, &canonical.ret)
+                    {
+                        self.diags.push(
+                            format!(
+                                "interface method `{}` has incompatible implementations",
+                                method_name
+                            ),
+                            Some(span.clone()),
+                        );
+                        return None;
+                    }
+                    for idx in 1..sig.params.len() {
+                        if !type_eq(&sig.params[idx], &canonical.params[idx]) {
+                            self.diags.push(
+                                format!(
+                                    "interface method `{}` has incompatible implementations",
+                                    method_name
+                                ),
+                                Some(span.clone()),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                let mut params = Vec::with_capacity(canonical.params.len());
+                params.push(Type::Interface);
+                params.extend(canonical.params.iter().skip(1).cloned());
+                return Some(FunctionSig {
+                    params,
+                    ret: canonical.ret,
+                    is_variadic: canonical.is_variadic,
+                    is_extern: false,
+                    is_unsafe: false,
+                    extern_abi: None,
+                });
+            }
+            return None;
+        };
+        let mut subst = HashMap::<String, TypeAst>::new();
+        if required.type_params.is_empty() {
+            if !type_args.is_empty() {
+                self.diag_type_args_call_misuse(span);
+                return None;
+            }
+        } else if type_args.is_empty() {
+            // Method generic args may be consumed during earlier monomorphization rewrites.
+            // In that case, recover the callable signature from available dispatch candidates.
+            let mut dispatch = Vec::<FunctionSig>::new();
+            for (_, sig) in self.method_candidates_named(method_name) {
+                let Some(param0) = sig.params.first() else {
+                    continue;
+                };
+                if !self.defs.interface_cast_supported(param0) {
+                    continue;
+                }
+                dispatch.push(sig);
+            }
+            if let Some(canonical) = dispatch.into_iter().next() {
+                let mut params = Vec::with_capacity(canonical.params.len());
+                params.push(Type::Interface);
+                params.extend(canonical.params.into_iter().skip(1));
+                return Some(FunctionSig {
+                    params,
+                    ret: canonical.ret,
+                    is_variadic: canonical.is_variadic,
+                    is_extern: false,
+                    is_unsafe: false,
+                    extern_abi: None,
+                });
+            }
+            self.diags.push(
+                format!(
+                    "generic method `{}` requires type arguments",
+                    method_name
+                ),
+                Some(span.clone()),
+            );
+            return None;
+        } else if type_args.len() != required.type_params.len() {
+            self.diags.push(
+                format!(
+                    "generic method `{}` expects {} type arguments, got {}",
+                    method_name,
+                    required.type_params.len(),
+                    type_args.len()
+                ),
+                Some(span.clone()),
+            );
+            return None;
+        } else {
+            for (tp, arg) in required.type_params.iter().zip(type_args.iter()) {
+                subst.insert(tp.name.clone(), arg.clone());
+            }
+        }
+        let mut params = Vec::with_capacity(required.params.len() + 1);
+        params.push(Type::Interface);
+        for param in &required.params {
+            let param_ty_ast = if subst.is_empty() {
+                param.ty.clone()
+            } else {
+                self.substitute_type_params_in_type_ast(&param.ty, &subst)
+            };
+            params.push(resolve_type(&param_ty_ast, self.defs, self.diags)?);
+        }
+        let ret_ty_ast = if subst.is_empty() {
+            required.ret_type.clone()
+        } else {
+            self.substitute_type_params_in_type_ast(&required.ret_type, &subst)
+        };
+        let ret = resolve_type(&ret_ty_ast, self.defs, self.diags)?;
+        Some(FunctionSig {
+            params,
+            ret,
+            is_variadic: required.is_variadic,
+            is_extern: false,
+            is_unsafe: false,
+            extern_abi: None,
+        })
+    }
+
+    fn resolve_trait_method_signature(
+        &mut self,
+        trait_name: &str,
+        method_name: &str,
+        span: &Span,
+    ) -> Option<FunctionSig> {
+        let Some(methods) = self.trait_methods.get(trait_name) else {
+            self.diags.push(
+                format!("unknown trait `{}`", trait_name),
+                Some(span.clone()),
+            );
+            return None;
+        };
+        let Some(required) = methods.iter().find(|m| m.name == method_name) else {
+            return None;
+        };
+        let mut params = Vec::with_capacity(required.params.len() + 1);
+        params.push(Type::Interface);
+        for param in &required.params {
+            let ty = resolve_type(&param.ty, self.defs, self.diags)?;
+            params.push(ty);
+        }
+        let ret = resolve_type(&required.ret_type, self.defs, self.diags)?;
+        Some(FunctionSig {
+            params,
+            ret,
+            is_variadic: required.is_variadic,
+            is_extern: false,
+            is_unsafe: false,
+            extern_abi: None,
+        })
+    }
+
+    fn method_sig_matches_trait_requirement(
+        &self,
+        candidate: &FunctionSig,
+        required: &FunctionSig,
+    ) -> bool {
+        if candidate.params.len() != required.params.len() {
+            return false;
+        }
+        if candidate.is_variadic != required.is_variadic {
+            return false;
+        }
+        if !type_eq(&candidate.ret, &required.ret) {
+            return false;
+        }
+        for idx in 1..candidate.params.len() {
+            if !type_eq(&candidate.params[idx], &required.params[idx]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_trait_dispatch_candidate(
+        &self,
+        recv_ty: &Type,
+        method_name: &str,
+        required: &FunctionSig,
+    ) -> bool {
+        for (_, sig) in self.method_candidates_named(method_name) {
+            let Some(param0) = sig.params.first() else {
+                continue;
+            };
+            if self.recv_adjust_cost(recv_ty, param0).is_none() {
+                continue;
+            }
+            if !self.defs.interface_cast_supported(param0) {
+                continue;
+            }
+            if self.method_sig_matches_trait_requirement(&sig, required) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn type_implements_trait_object(
+        &mut self,
+        recv_ty: &Type,
+        trait_name: &str,
+        span: &Span,
+    ) -> bool {
+        let Some(methods) = self.trait_methods.get(trait_name).cloned() else {
+            self.diags.push(
+                format!("unknown trait `{}`", trait_name),
+                Some(span.clone()),
+            );
+            return false;
+        };
+        let mut ok = true;
+        for required in methods {
+            if !required.type_params.is_empty() {
+                // Generic trait methods are validated at call-sites where concrete type
+                // arguments are available.
+                continue;
+            }
+            let Some(req_sig) =
+                self.resolve_trait_method_signature(trait_name, &required.name, &required.span)
+            else {
+                ok = false;
+                continue;
+            };
+            if !self.has_trait_dispatch_candidate(recv_ty, &required.name, &req_sig) {
+                self.diags.push(
+                    format!(
+                        "type `{}` does not implement trait `{}`: missing method `{}`",
+                        recv_ty.pretty(),
+                        trait_name,
+                        required.name
+                    ),
+                    Some(span.clone()),
+                );
+                ok = false;
+            }
+        }
+        ok
     }
 
     fn check_call_args_for_sig(
@@ -1591,6 +2015,7 @@ impl<'a> FunctionChecker<'a> {
             let class = self.defs.classify(&ty).unwrap_or(TypeClass::Copy);
             let info = VarInfo {
                 ty,
+                trait_obj: self.trait_name_from_type_ast(&param.ty),
                 mutable: true,
                 class,
                 state: if class == TypeClass::Linear {
@@ -1751,8 +2176,13 @@ impl<'a> FunctionChecker<'a> {
                     init_ty.ty.clone()
                 };
                 let class = self.defs.classify(&final_ty).unwrap_or(TypeClass::Copy);
+                let trait_obj = ty
+                    .as_ref()
+                    .and_then(|annot| self.trait_name_from_type_ast(annot))
+                    .or_else(|| self.trait_name_from_expr(init));
                 let mut info = VarInfo {
                     ty: final_ty,
+                    trait_obj,
                     mutable: true,
                     class,
                     state: if class == TypeClass::Linear {
@@ -1834,8 +2264,13 @@ impl<'a> FunctionChecker<'a> {
                     self.diags.push(DIAG_VIEW_ESCAPE, Some(span.clone()));
                 }
                 let class = self.defs.classify(&final_ty).unwrap_or(TypeClass::Copy);
+                let trait_obj = ty
+                    .as_ref()
+                    .and_then(|annot| self.trait_name_from_type_ast(annot))
+                    .or_else(|| self.trait_name_from_expr(init));
                 let info = VarInfo {
                     ty: final_ty,
+                    trait_obj,
                     mutable: false,
                     class,
                     state: if class == TypeClass::Linear {
@@ -2141,6 +2576,7 @@ impl<'a> FunctionChecker<'a> {
                         index_name.clone(),
                         VarInfo {
                             ty: index_decl_ty,
+                            trait_obj: None,
                             mutable: true,
                             class: index_class,
                             state: LinearState::Alive,
@@ -2156,6 +2592,7 @@ impl<'a> FunctionChecker<'a> {
                     name.clone(),
                     VarInfo {
                         ty: view_ty,
+                        trait_obj: None,
                         mutable: true,
                         class,
                         state: LinearState::Alive,
@@ -2229,6 +2666,7 @@ impl<'a> FunctionChecker<'a> {
                         index_name.clone(),
                         VarInfo {
                             ty: Type::Builtin(BuiltinType::I64),
+                            trait_obj: None,
                             mutable: true,
                             class: TypeClass::Copy,
                             state: LinearState::Alive,
@@ -2244,6 +2682,7 @@ impl<'a> FunctionChecker<'a> {
                     name.clone(),
                     VarInfo {
                         ty: start_ty,
+                        trait_obj: None,
                         mutable: true,
                         class,
                         state: LinearState::Alive,
@@ -2287,6 +2726,7 @@ impl<'a> FunctionChecker<'a> {
                                     name.clone(),
                                     VarInfo {
                                         ty: elem_ty,
+                                        trait_obj: None,
                                         mutable: true,
                                         class,
                                         state: LinearState::Alive,
@@ -2300,6 +2740,7 @@ impl<'a> FunctionChecker<'a> {
                                     ok_name.clone(),
                                     VarInfo {
                                         ty: Type::Builtin(BuiltinType::Bool),
+                                        trait_obj: None,
                                         mutable: true,
                                         class: TypeClass::Copy,
                                         state: LinearState::Alive,
@@ -2420,10 +2861,58 @@ impl<'a> FunctionChecker<'a> {
         Some(res)
     }
 
+    fn closure_captures(&self, params: &[ClosureParam], body: &BlockOrExpr) -> Vec<String> {
+        let enclosing = self
+            .env
+            .vars
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        collect_closure_captures(params, body, &enclosing)
+    }
+
+    fn apply_closure_capture_policy(&mut self, captures: &[String], span: &Span, consume: bool) {
+        for name in captures {
+            let Some(var) = self.env.vars.get_mut(name) else {
+                continue;
+            };
+            match var.class {
+                TypeClass::Copy => {}
+                TypeClass::View => {
+                    self.diags.push(
+                        format!("{} (`{}` captured by closure)", DIAG_VIEW_ESCAPE, name),
+                        Some(span.clone()),
+                    );
+                }
+                TypeClass::Linear => {
+                    if consume {
+                        match var.state {
+                            LinearState::Alive => {
+                                var.state = LinearState::Moved;
+                            }
+                            _ => {
+                                self.diags.push(
+                                    format!("{} (`{}`)", DIAG_OWN_USE_AFTER_MOVE, name),
+                                    Some(span.clone()),
+                                );
+                            }
+                        }
+                    } else if var.state != LinearState::Alive {
+                        self.diags.push(
+                            format!("{} (`{}`)", DIAG_OWN_USE_AFTER_MOVE, name),
+                            Some(span.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn declare_pattern_binding(&mut self, name: &str, ty: Type) {
         let class = self.defs.classify(&ty).unwrap_or(TypeClass::Copy);
         let info = VarInfo {
             ty,
+            trait_obj: None,
             mutable: true,
             class,
             state: LinearState::Alive,
@@ -5495,12 +5984,29 @@ impl<'a> FunctionChecker<'a> {
                     borrow: None,
                 })
             }
-            ExprKind::Closure { .. } => {
-                self.diags.push(
-                    "closure value must be immediately invoked",
-                    Some(expr.span.clone()),
-                );
-                None
+            ExprKind::Closure { params, body } => {
+                let captures = self.closure_captures(params, body.as_ref());
+                self.apply_closure_capture_policy(&captures, &expr.span, consume);
+                let ty = match expected {
+                    Some(Type::Closure { .. }) => expected.cloned().unwrap_or(Type::Interface),
+                    Some(Type::FnPtr {
+                        params,
+                        ret,
+                        is_variadic,
+                    }) => {
+                        if captures.is_empty() {
+                            expected.cloned().unwrap_or(Type::Interface)
+                        } else {
+                            Type::Closure {
+                                params: params.clone(),
+                                ret: ret.clone(),
+                                is_variadic: *is_variadic,
+                            }
+                        }
+                    }
+                    _ => Type::Interface,
+                };
+                Some(ExprResult { ty, borrow: None })
             }
             ExprKind::Call { callee, type_args, args } => {
                 if let ExprKind::Field { base, name: variant } = &callee.kind {
@@ -5634,38 +6140,142 @@ impl<'a> FunctionChecker<'a> {
                     let recv_ty = recv_res.ty.clone();
                     let method_candidates = self.method_candidates_named(variant);
 
-                    if recv_ty == Type::Interface {
-                        let mut dispatch = Vec::<(String, FunctionSig)>::new();
-                        for (symbol, sig) in method_candidates {
-                            let Some(param0) = sig.params.first() else {
-                                continue;
+                    if matches!(recv_ty, Type::Interface | Type::Closure { .. }) {
+                        if let Some(trait_name) = self.trait_name_from_expr(base) {
+                            let Some(required_sig) =
+                                self.resolve_trait_method_signature_for_call(
+                                    &trait_name,
+                                    variant,
+                                    type_args,
+                                    &callee.span,
+                                )
+                            else {
+                                let mut d = Diagnostic::new(
+                                    format!(
+                                        "unknown method `{}` on trait object `{}`",
+                                        variant, trait_name
+                                    ),
+                                    Some(callee.span.clone()),
+                                )
+                                .code(E_UNKNOWN_METHOD)
+                                .label(callee.span.clone(), format!("unknown method `{}`", variant));
+                                let candidates = self.trait_method_names(&trait_name);
+                                if let Some(h) = suggest::did_you_mean(variant, candidates) {
+                                    d = d.help(h);
+                                }
+                                self.diags.push_diag(d);
+                                return None;
                             };
-                            if self.defs.interface_cast_supported(param0) {
+                            let mut dispatch = Vec::<(String, FunctionSig)>::new();
+                            for (symbol, sig) in method_candidates {
+                                let Some(param0) = sig.params.first() else {
+                                    continue;
+                                };
+                                if !self.defs.interface_cast_supported(param0) {
+                                    continue;
+                                }
+                                if !self.method_sig_matches_trait_requirement(&sig, &required_sig) {
+                                    continue;
+                                }
                                 dispatch.push((symbol, sig));
                             }
-                        }
-                        if dispatch.is_empty() {
-                            self.diag_unknown_method(callee.span.clone(), Some(recv_ty), variant);
-                            return None;
-                        }
-                        dispatch.sort_by(|a, b| a.0.cmp(&b.0));
-                        let canonical = dispatch[0].1.clone();
-                        for (_, sig) in dispatch.iter().skip(1) {
-                            if sig.params.len() != canonical.params.len()
-                                || sig.is_variadic != canonical.is_variadic
-                                || !type_eq(&sig.ret, &canonical.ret)
-                            {
+                            if dispatch.is_empty() {
                                 self.diags.push(
                                     format!(
-                                        "interface method `{}` has incompatible implementations",
-                                        variant
+                                        "trait object `{}` has no dispatch target for method `{}`",
+                                        trait_name, variant
                                     ),
                                     Some(callee.span.clone()),
                                 );
                                 return None;
                             }
-                            for idx in 1..sig.params.len() {
-                                if !type_eq(&sig.params[idx], &canonical.params[idx]) {
+                            if dispatch
+                                .iter()
+                                .any(|(_, sig)| sig.is_extern || sig.is_unsafe)
+                            {
+                                self.require_unsafe_operation(
+                                    &expr.span,
+                                    &format!("call to `{}`", variant),
+                                );
+                            }
+                            self.check_call_args_for_sig(&expr.span, args, &required_sig, 1)?;
+                            return self.record_expr(
+                                expr,
+                                ExprResult {
+                                    ty: required_sig.ret,
+                                    borrow: None,
+                                },
+                            );
+                        } else {
+                            let mut dispatch = Vec::<(String, FunctionSig)>::new();
+                            for (symbol, sig) in method_candidates {
+                                let Some(param0) = sig.params.first() else {
+                                    continue;
+                                };
+                                if self.defs.interface_cast_supported(param0) {
+                                    dispatch.push((symbol, sig));
+                                }
+                            }
+                            if dispatch.is_empty() {
+                                if let Type::Closure {
+                                    params,
+                                    ret,
+                                    is_variadic,
+                                } = &recv_ty
+                                {
+                                    if variant.starts_with("__gost_closure_call_") {
+                                        if (!*is_variadic && params.len() != args.len())
+                                            || (*is_variadic && args.len() < params.len())
+                                        {
+                                            self.diags.push(
+                                                "argument count mismatch",
+                                                Some(expr.span.clone()),
+                                            );
+                                        }
+                                        for (idx, arg) in args.iter().enumerate() {
+                                            if let Some(param_ty) = params.get(idx) {
+                                                let res = self.check_expr_expected(arg, param_ty)?;
+                                                if view_arg_not_allowed(self.defs, &res.ty, param_ty) {
+                                                    self.diags.push(
+                                                        "view arguments can only be passed to intrinsics",
+                                                        Some(arg.span.clone()),
+                                                    );
+                                                }
+                                                if !type_eq(&res.ty, param_ty) {
+                                                    self.diags.push(
+                                                        "argument type mismatch",
+                                                        Some(arg.span.clone()),
+                                                    );
+                                                }
+                                            } else {
+                                                let res = self.check_expr(arg)?;
+                                                if self.defs.contains_view(&res.ty) {
+                                                    self.diags.push(
+                                                        "view arguments are not allowed in variadic positions",
+                                                        Some(arg.span.clone()),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        return self.record_expr(
+                                            expr,
+                                            ExprResult {
+                                                ty: *ret.clone(),
+                                                borrow: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                self.diag_unknown_method(callee.span.clone(), Some(recv_ty), variant);
+                                return None;
+                            }
+                            dispatch.sort_by(|a, b| a.0.cmp(&b.0));
+                            let canonical = dispatch[0].1.clone();
+                            for (_, sig) in dispatch.iter().skip(1) {
+                                if sig.params.len() != canonical.params.len()
+                                    || sig.is_variadic != canonical.is_variadic
+                                    || !type_eq(&sig.ret, &canonical.ret)
+                                {
                                     self.diags.push(
                                         format!(
                                             "interface method `{}` has incompatible implementations",
@@ -5675,25 +6285,37 @@ impl<'a> FunctionChecker<'a> {
                                     );
                                     return None;
                                 }
+                                for idx in 1..sig.params.len() {
+                                    if !type_eq(&sig.params[idx], &canonical.params[idx]) {
+                                        self.diags.push(
+                                            format!(
+                                                "interface method `{}` has incompatible implementations",
+                                                variant
+                                            ),
+                                            Some(callee.span.clone()),
+                                        );
+                                        return None;
+                                    }
+                                }
                             }
-                        }
-                        if dispatch
-                            .iter()
-                            .any(|(_, sig)| sig.is_extern || sig.is_unsafe)
-                        {
-                            self.require_unsafe_operation(
-                                &expr.span,
-                                &format!("call to `{}`", variant),
+                            if dispatch
+                                .iter()
+                                .any(|(_, sig)| sig.is_extern || sig.is_unsafe)
+                            {
+                                self.require_unsafe_operation(
+                                    &expr.span,
+                                    &format!("call to `{}`", variant),
+                                );
+                            }
+                            self.check_call_args_for_sig(&expr.span, args, &canonical, 1)?;
+                            return self.record_expr(
+                                expr,
+                                ExprResult {
+                                    ty: canonical.ret,
+                                    borrow: None,
+                                },
                             );
                         }
-                        self.check_call_args_for_sig(&expr.span, args, &canonical, 1)?;
-                        return self.record_expr(
-                            expr,
-                            ExprResult {
-                                ty: canonical.ret,
-                                borrow: None,
-                            },
-                        );
                     }
 
                     let mut resolved = Vec::<(u8, String, FunctionSig)>::new();
@@ -5857,6 +6479,11 @@ impl<'a> FunctionChecker<'a> {
                 let callee_ty = self.check_expr_no_move(callee)?.ty;
                 match callee_ty {
                     Type::FnPtr {
+                        params,
+                        ret,
+                        is_variadic,
+                    }
+                    | Type::Closure {
                         params,
                         ret,
                         is_variadic,
@@ -6100,6 +6727,9 @@ impl<'a> FunctionChecker<'a> {
             ExprKind::Cast { expr: inner, ty } => {
                 let inner_res = self.check_expr(inner)?;
                 let target_ty = resolve_type(ty, self.defs, self.diags)?;
+                if let Some(trait_name) = self.trait_name_from_type_ast(ty) {
+                    self.type_implements_trait_object(&inner_res.ty, &trait_name, &expr.span);
+                }
                 if !self.defs.can_explicit_cast(&inner_res.ty, &target_ty) {
                     if matches!((&inner_res.ty, &target_ty), (Type::Alias(_), Type::Own(_))) {
                         self.diags.push(DIAG_ALIAS_TO_OWN, Some(expr.span.clone()));
@@ -6418,5 +7048,260 @@ fn join_state(a: LinearState, b: LinearState) -> LinearState {
         LinearState::Uninit
     } else {
         LinearState::Alive
+    }
+}
+
+fn collect_closure_captures(
+    params: &[ClosureParam],
+    body: &BlockOrExpr,
+    enclosing: &HashSet<String>,
+) -> Vec<String> {
+    let mut bound = HashSet::new();
+    for param in params {
+        bound.insert(param.name.clone());
+    }
+    let mut captures = HashSet::new();
+    collect_captured_in_block_or_expr(body, &mut bound, enclosing, &mut captures);
+    let mut out: Vec<String> = captures.into_iter().collect();
+    out.sort();
+    out
+}
+
+fn collect_captured_in_block_or_expr(
+    body: &BlockOrExpr,
+    bound: &mut HashSet<String>,
+    enclosing: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match body {
+        BlockOrExpr::Block(block) => collect_captured_in_block(block, bound, enclosing, captures),
+        BlockOrExpr::Expr(expr) => collect_captured_in_expr(expr, bound, enclosing, captures),
+    }
+}
+
+fn collect_captured_in_block(
+    block: &Block,
+    bound: &mut HashSet<String>,
+    enclosing: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    for stmt in &block.stmts {
+        collect_captured_in_stmt(stmt, bound, enclosing, captures);
+    }
+    if let Some(tail) = &block.tail {
+        collect_captured_in_expr(tail, bound, enclosing, captures);
+    }
+}
+
+fn collect_captured_in_stmt(
+    stmt: &Stmt,
+    bound: &mut HashSet<String>,
+    enclosing: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match stmt {
+        Stmt::Let { name, init, .. } | Stmt::Const { name, init, .. } => {
+            collect_captured_in_expr(init, bound, enclosing, captures);
+            bound.insert(name.clone());
+        }
+        Stmt::Assign { target, value, .. } => {
+            collect_captured_in_expr(target, bound, enclosing, captures);
+            collect_captured_in_expr(value, bound, enclosing, captures);
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } | Stmt::Defer { expr, .. } => {
+            collect_captured_in_expr(expr, bound, enclosing, captures);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                collect_captured_in_expr(expr, bound, enclosing, captures);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_captured_in_expr(cond, bound, enclosing, captures);
+            let mut inner = bound.clone();
+            collect_captured_in_block(body, &mut inner, enclosing, captures);
+        }
+        Stmt::Loop { body, .. } => {
+            let mut inner = bound.clone();
+            collect_captured_in_block(body, &mut inner, enclosing, captures);
+        }
+        Stmt::ForIn {
+            name,
+            index,
+            iter,
+            body,
+            ..
+        } => {
+            collect_captured_in_expr(iter, bound, enclosing, captures);
+            let mut inner = bound.clone();
+            inner.insert(name.clone());
+            if let Some(index) = index {
+                inner.insert(index.clone());
+            }
+            collect_captured_in_block(body, &mut inner, enclosing, captures);
+        }
+        Stmt::ForRange {
+            name,
+            index,
+            start,
+            end,
+            body,
+            ..
+        } => {
+            collect_captured_in_expr(start, bound, enclosing, captures);
+            collect_captured_in_expr(end, bound, enclosing, captures);
+            let mut inner = bound.clone();
+            inner.insert(name.clone());
+            if let Some(index) = index {
+                inner.insert(index.clone());
+            }
+            collect_captured_in_block(body, &mut inner, enclosing, captures);
+        }
+        Stmt::Select { arms, .. } => {
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                match &arm.kind {
+                    SelectArmKind::Send { chan, value } => {
+                        collect_captured_in_expr(chan, bound, enclosing, captures);
+                        collect_captured_in_expr(value, bound, enclosing, captures);
+                    }
+                    SelectArmKind::Recv { chan, bind } => {
+                        collect_captured_in_expr(chan, bound, enclosing, captures);
+                        if let Some((value_name, ok_name)) = bind {
+                            if value_name != "_" {
+                                arm_bound.insert(value_name.clone());
+                            }
+                            if ok_name != "_" {
+                                arm_bound.insert(ok_name.clone());
+                            }
+                        }
+                    }
+                    SelectArmKind::After { ms } => {
+                        collect_captured_in_expr(ms, bound, enclosing, captures);
+                    }
+                    SelectArmKind::Default => {}
+                }
+                collect_captured_in_block_or_expr(&arm.body, &mut arm_bound, enclosing, captures);
+            }
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+}
+
+fn collect_pattern_bindings_for_capture(pattern: &Pattern, out: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Ident(name) => {
+            if name != "_" {
+                out.insert(name.clone());
+            }
+        }
+        Pattern::Or(patterns) => {
+            for pattern in patterns {
+                collect_pattern_bindings_for_capture(pattern, out);
+            }
+        }
+        Pattern::Variant { binds, .. } => {
+            for bind in binds {
+                if bind != "_" {
+                    out.insert(bind.clone());
+                }
+            }
+        }
+        Pattern::Wildcard | Pattern::Bool(_) | Pattern::Int(_) => {}
+    }
+}
+
+fn collect_captured_in_expr(
+    expr: &Expr,
+    bound: &mut HashSet<String>,
+    enclosing: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(name) => {
+            if enclosing.contains(name) && !bound.contains(name) {
+                captures.insert(name.clone());
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, field_expr) in fields {
+                collect_captured_in_expr(field_expr, bound, enclosing, captures);
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                collect_captured_in_expr(item, bound, enclosing, captures);
+            }
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            let mut inner = bound.clone();
+            collect_captured_in_block(block, &mut inner, enclosing, captures);
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            collect_captured_in_expr(cond, bound, enclosing, captures);
+            let mut then_bound = bound.clone();
+            collect_captured_in_block(then_block, &mut then_bound, enclosing, captures);
+            if let Some(else_block) = else_block {
+                let mut else_bound = bound.clone();
+                collect_captured_in_block(else_block, &mut else_bound, enclosing, captures);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_captured_in_expr(scrutinee, bound, enclosing, captures);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings_for_capture(&arm.pattern, &mut arm_bound);
+                if let Some(guard) = &arm.guard {
+                    collect_captured_in_expr(guard, &mut arm_bound, enclosing, captures);
+                }
+                collect_captured_in_block_or_expr(&arm.body, &mut arm_bound, enclosing, captures);
+            }
+        }
+        ExprKind::Closure { params, body } => {
+            let mut nested = bound.clone();
+            for param in params {
+                nested.insert(param.name.clone());
+            }
+            collect_captured_in_block_or_expr(body, &mut nested, enclosing, captures);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_captured_in_expr(callee, bound, enclosing, captures);
+            for arg in args {
+                collect_captured_in_expr(arg, bound, enclosing, captures);
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::Unary { expr: base, .. }
+        | ExprKind::Cast { expr: base, .. }
+        | ExprKind::Borrow { expr: base, .. }
+        | ExprKind::Deref { expr: base }
+        | ExprKind::Try { expr: base }
+        | ExprKind::Recv { chan: base }
+        | ExprKind::Close { chan: base }
+        | ExprKind::After { ms: base } => {
+            collect_captured_in_expr(base, bound, enclosing, captures);
+        }
+        ExprKind::Index { base, index } => {
+            collect_captured_in_expr(base, bound, enclosing, captures);
+            collect_captured_in_expr(index, bound, enclosing, captures);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_captured_in_expr(left, bound, enclosing, captures);
+            collect_captured_in_expr(right, bound, enclosing, captures);
+        }
+        ExprKind::Send { chan, value } => {
+            collect_captured_in_expr(chan, bound, enclosing, captures);
+            collect_captured_in_expr(value, bound, enclosing, captures);
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil => {}
     }
 }

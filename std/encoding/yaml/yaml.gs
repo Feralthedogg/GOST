@@ -1,5 +1,7 @@
 module yaml
 
+import "std/strings"
+
 // Stable YAML subset AST.
 // Composite values are stored as emitted YAML text to avoid nested shared-copy hazards.
 copy enum Yaml {
@@ -53,22 +55,8 @@ fn is_digit(b: i32) -> bool {
     return b >= byte("0") && b <= byte("9")
 }
 
-fn is_empty(s: string) -> bool {
+fn yaml_is_empty(s: string) -> bool {
     return string_len(s) == zero_i64()
-}
-
-fn str_eq(a: string, b: string) -> bool {
-    let na: i64 = string_len(a)
-    let nb: i64 = string_len(b)
-    if na != nb { return false
- }
-    let i: i64 = zero_i64()
-    while i < na {
-        if string_get(a, i) != string_get(b, i) { return false
- }
-        i = i + one_i64()
-    }
-    return true
 }
 
 fn trim_left(s: string) -> string {
@@ -141,20 +129,20 @@ fn content_after_indent(line: string, ind: i64) -> string {
 
 fn is_blank_or_comment(content: string) -> bool {
     let t: string = trim(content)
-    if is_empty(t) { return true
+    if yaml_is_empty(t) { return true
  }
     return string_get(t, zero_i64()) == byte("#")
 }
 
 fn parse_scalar(text: string) -> Yaml {
     let t: string = trim(text)
-    if is_empty(t) { return Yaml.Null
+    if yaml_is_empty(t) { return Yaml.Null
  }
-    if str_eq(t, "null") || str_eq(t, "~") { return Yaml.Null
+    if equal(t, "null") || equal(t, "~") { return Yaml.Null
  }
-    if str_eq(t, "true") { return Yaml.Bool(true)
+    if equal(t, "true") { return Yaml.Bool(true)
  }
-    if str_eq(t, "false") { return Yaml.Bool(false)
+    if equal(t, "false") { return Yaml.Bool(false)
  }
 
     let n: i64 = string_len(t)
@@ -314,7 +302,7 @@ fn parse_seq(lines: ref[[]string], idx: mutref[i64], indent: i64) -> Result[Yaml
  }
 
         let cont: string = trim(content_after_indent(line, ind))
-        if is_empty(cont) || is_blank_or_comment(cont) {
+        if yaml_is_empty(cont) || is_blank_or_comment(cont) {
             *idx = *idx + one_i64()
             continue
         }
@@ -324,10 +312,10 @@ fn parse_seq(lines: ref[[]string], idx: mutref[i64], indent: i64) -> Result[Yaml
  }
 
         let rest: string = trim(string_slice(cont, one_i64() + one_i64(), string_len(cont) - (one_i64() + one_i64())))
-        if !is_empty(out) { out = string_concat(out, "\n")
+        if !yaml_is_empty(out) { out = string_concat(out, "\n")
  }
 
-        if is_empty(rest) {
+        if yaml_is_empty(rest) {
             *idx = *idx + one_i64()
             let r = parse_block(lines, idx, indent + one_i64() + one_i64())
             match r {
@@ -368,7 +356,7 @@ fn parse_map(lines: ref[[]string], idx: mutref[i64], indent: i64) -> Result[Yaml
  }
 
         let cont: string = trim(content_after_indent(line, ind))
-        if is_empty(cont) || is_blank_or_comment(cont) {
+        if yaml_is_empty(cont) || is_blank_or_comment(cont) {
             *idx = *idx + one_i64()
             continue
         }
@@ -378,14 +366,14 @@ fn parse_map(lines: ref[[]string], idx: mutref[i64], indent: i64) -> Result[Yaml
  }
 
         let key: string = trim(string_slice(cont, zero_i64(), pos))
-        if is_empty(key) { return err_yaml("invalid mapping entry")
+        if yaml_is_empty(key) { return err_yaml("invalid mapping entry")
  }
         let val_text: string = trim(string_slice(cont, pos + one_i64(), string_len(cont) - (pos + one_i64())))
 
-        if !is_empty(out) { out = string_concat(out, "\n")
+        if !yaml_is_empty(out) { out = string_concat(out, "\n")
  }
 
-        if is_empty(val_text) {
+        if yaml_is_empty(val_text) {
             *idx = *idx + one_i64()
             let r = parse_block(lines, idx, indent + one_i64() + one_i64())
             match r {

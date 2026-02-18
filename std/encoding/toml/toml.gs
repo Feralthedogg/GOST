@@ -1,5 +1,7 @@
 module toml
 
+import "std/strings"
+
 // Stable TOML subset AST.
 // Composite values are stored as TOML text to avoid nested shared-copy hazards.
 copy enum Toml {
@@ -60,22 +62,8 @@ fn is_digit(b: i32) -> bool {
     return b >= byte("0") && b <= byte("9")
 }
 
-fn is_empty(s: string) -> bool {
+fn toml_is_empty(s: string) -> bool {
     return string_len(s) == zero_i64()
-}
-
-fn str_eq(a: string, b: string) -> bool {
-    let na: i64 = string_len(a)
-    let nb: i64 = string_len(b)
-    if na != nb { return false
- }
-    let i: i64 = zero_i64()
-    while i < na {
-        if string_get(a, i) != string_get(b, i) { return false
- }
-        i = i + one_i64()
-    }
-    return true
 }
 
 fn trim_left(s: string) -> string {
@@ -197,13 +185,13 @@ fn toml_quote_raw(s: string) -> string {
 
 fn parse_scalar_token(t: string) -> Toml {
     let s: string = trim(t)
-    if is_empty(s) { return Toml.Null
+    if toml_is_empty(s) { return Toml.Null
  }
-    if str_eq(s, "true") { return Toml.Bool(true)
+    if equal(s, "true") { return Toml.Bool(true)
  }
-    if str_eq(s, "false") { return Toml.Bool(false)
+    if equal(s, "false") { return Toml.Bool(false)
  }
-    if str_eq(s, "null") { return Toml.Null
+    if equal(s, "null") { return Toml.Null
  }
 
     let n: i64 = string_len(s)
@@ -389,7 +377,7 @@ fn parse(s: string) -> Result[Toml, error] {
     while i < n {
         let raw: string = slice_get_copy[string](&lines, i)
         let line: string = trim(strip_comment(raw))
-        if is_empty(line) { i = i + one_i64() continue }
+        if toml_is_empty(line) { i = i + one_i64() continue }
 
         if string_get(line, zero_i64()) == byte("[") {
             let ln: i64 = string_len(line)
@@ -409,10 +397,10 @@ fn parse(s: string) -> Result[Toml, error] {
 
         let key: string = trim(string_slice(line, zero_i64(), pos))
         let val_text: string = trim(string_slice(line, pos + one_i64(), string_len(line) - (pos + one_i64())))
-        if is_empty(key) { return err_toml("empty key") }
+        if toml_is_empty(key) { return err_toml("empty key") }
 
         let full_key: string = key
-        if !is_empty(prefix) {
+        if !toml_is_empty(prefix) {
             full_key = string_concat(string_concat(prefix, "."), key)
         }
 

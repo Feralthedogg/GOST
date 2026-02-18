@@ -4,22 +4,6 @@ private fn byte(c: string) -> i32 {
     return string_get(c, 0)
 }
 
-private fn str_eq(a: string, b: string) -> bool {
-    let na: i64 = string_len(a)
-    let nb: i64 = string_len(b)
-    if na != nb {
-        return false
-    }
-    let i: i64 = 0
-    while i < na {
-        if string_get(a, i) != string_get(b, i) {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
 private fn is_sep_byte(b: i32) -> bool {
     return b == byte("/") || b == byte("\\")
 }

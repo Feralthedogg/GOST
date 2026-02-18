@@ -9,6 +9,80 @@ pub enum CliMode {
     Run,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+}
+
+impl OptLevel {
+    fn as_digit(self) -> u8 {
+        match self {
+            Self::O0 => 0,
+            Self::O1 => 1,
+            Self::O2 => 2,
+            Self::O3 => 3,
+        }
+    }
+
+    fn from_level_value(raw: &str) -> Option<Self> {
+        let v = raw.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "0" | "o0" => Some(Self::O0),
+            "1" | "o1" | "o" => Some(Self::O1),
+            "2" | "o2" => Some(Self::O2),
+            "3" | "o3" => Some(Self::O3),
+            _ => None,
+        }
+    }
+
+    fn from_flag(arg: &str) -> Option<Self> {
+        match arg {
+            "-O" => Some(Self::O1),
+            "-O0" | "-o0" => Some(Self::O0),
+            "-O1" | "-o1" => Some(Self::O1),
+            "-O2" | "-o2" => Some(Self::O2),
+            "-O3" | "-o3" => Some(Self::O3),
+            _ => None,
+        }
+    }
+
+    fn clang_flag(self) -> String {
+        format!("-O{}", self.as_digit())
+    }
+
+    fn llc_flag(self) -> String {
+        format!("-O={}", self.as_digit())
+    }
+
+    fn is_optimized(self) -> bool {
+        !matches!(self, Self::O0)
+    }
+}
+
+fn default_opt_level() -> OptLevel {
+    if let Ok(v) = std::env::var("GOST_OPT_LEVEL") {
+        if let Some(level) = OptLevel::from_level_value(&v) {
+            return level;
+        }
+    }
+    if let Ok(v) = std::env::var("GOST_OPT") {
+        if let Some(level) = OptLevel::from_level_value(&v) {
+            return level;
+        }
+    }
+    let release = std::env::var("GOST_RELEASE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if release {
+        OptLevel::O3
+    } else {
+        OptLevel::O0
+    }
+}
+
 pub fn run_cli<I>(args: I) -> i32
 where
     I: IntoIterator<Item = String>,
@@ -29,7 +103,7 @@ pub fn run_cli_with_mode<I>(args: I, default_mode: CliMode) -> i32
 where
     I: IntoIterator<Item = String>,
 {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let mut global_offline = false;
     let mut global_online = false;
     let mut first = match args.next() {
@@ -266,6 +340,7 @@ where
         (default_mode, first)
     };
     let mut output = None;
+    let mut opt_level = default_opt_level();
     let mut mod_mode = if mode == CliMode::Run {
         ModMode::Mod
     } else {
@@ -274,13 +349,53 @@ where
     let mut offline = false;
     while let Some(arg) = args.next() {
         if arg == "-o" {
+            let next = args.peek().map(|s| s.as_str());
+            if next.is_none() || next.is_some_and(|s| s.starts_with('-')) {
+                opt_level = OptLevel::O1;
+                continue;
+            }
+            if let Some(level) = next.and_then(OptLevel::from_level_value) {
+                let _ = args.next();
+                opt_level = level;
+                continue;
+            }
+            let Some(path) = args.next() else {
+                eprintln!("expected output after -o");
+                return 1;
+            };
+            output = Some(PathBuf::from(path));
+        } else if arg == "--output" {
             match args.next() {
                 Some(path) => output = Some(PathBuf::from(path)),
                 None => {
-                    eprintln!("expected output after -o");
+                    eprintln!("expected output after --output");
                     return 1;
                 }
             }
+        } else if arg == "--opt" {
+            let Some(level_raw) = args.next() else {
+                eprintln!("expected optimization level after --opt (0|1|2|3)");
+                return 1;
+            };
+            let Some(level) = OptLevel::from_level_value(&level_raw) else {
+                eprintln!(
+                    "invalid optimization level `{}` (expected 0|1|2|3)",
+                    level_raw
+                );
+                return 1;
+            };
+            opt_level = level;
+        } else if let Some(level_raw) = arg.strip_prefix("--opt=") {
+            let Some(level) = OptLevel::from_level_value(level_raw) else {
+                eprintln!(
+                    "invalid optimization level `{}` (expected 0|1|2|3)",
+                    level_raw
+                );
+                return 1;
+            };
+            opt_level = level;
+        } else if let Some(level) = OptLevel::from_flag(&arg) {
+            opt_level = level;
         } else if arg == "--offline" {
             offline = true;
         } else if let Some(val) = arg.strip_prefix("-mod=") {
@@ -332,7 +447,7 @@ where
         return 1;
     }
     if mode == CliMode::Run {
-        if let Err(err) = link_and_run(&input_path, &ll_path) {
+        if let Err(err) = link_and_run(&input_path, &ll_path, opt_level) {
             eprintln!("{}", err);
             return 1;
         }
@@ -469,6 +584,11 @@ fn print_help_run() {
     eprintln!("  <file.gs>    Entry file (.gs)");
     eprintln!();
     eprintln!("OPTIONS:");
+    eprintln!("  -O, -O0..-O3      LLVM optimization level [default: O3] (-O == -O1)");
+    eprintln!("  -o0..-o3          Lowercase aliases for optimization level");
+    eprintln!("  --opt <0..3>      Set optimization level");
+    eprintln!("  --output <file>   LLVM IR output path (default: <file>.ll)");
+    eprintln!("  -o <file>         Same as --output");
     eprintln!("  -mod <mode>        Module mode: mod | readonly");
     eprintln!("                     [default: mod]");
     eprintln!("                     - mod:     may update gost.lock if needed");
@@ -497,6 +617,11 @@ fn print_help_build() {
     eprintln!("  <file.gs>    Entry file (.gs)");
     eprintln!();
     eprintln!("OPTIONS:");
+    eprintln!("  -O, -O0..-O3      LLVM optimization level [default: O3] (-O == -O1)");
+    eprintln!("  -o0..-o3          Lowercase aliases for optimization level");
+    eprintln!("  --opt <0..3>      Set optimization level");
+    eprintln!("  --output <file>   LLVM IR output path (default: <file>.ll)");
+    eprintln!("  -o <file>         Same as --output");
     eprintln!("  -mod <mode>        Module mode: mod | readonly");
     eprintln!("                     [default: readonly]");
     eprintln!("                     - mod:     may update gost.lock if needed");
@@ -651,21 +776,18 @@ fn print_help_mod_graph() {
     eprintln!("  gs mod graph --online");
 }
 
-fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
+fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Result<(), String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runtime_dir = manifest_dir.join("runtime");
     let cc = resolve_cc();
     ensure_native_compiler(&cc)?;
-    let rt_lib = build_runtime(&runtime_dir, &cc)?;
+    let rt_lib = build_runtime(&runtime_dir, &cc, opt_level)?;
     let obj_path = input_path.with_extension("o");
     let exe_path = input_path.with_extension(if cfg!(windows) { "exe" } else { "" });
     if exe_path.exists() {
         let _ = std::fs::remove_file(&exe_path);
     }
-    compile_ll_to_obj(&cc, ll_path, &obj_path)?;
-    let release = std::env::var("GOST_RELEASE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    compile_ll_to_obj(&cc, ll_path, &obj_path, opt_level)?;
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -673,12 +795,10 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
         obj_path.display().to_string(),
         rt_lib.display().to_string(),
     ];
-    if release {
-        link_args.push("-O3".into());
-        if native {
-            link_args.push("-march=native".into());
-            link_args.push("-mtune=native".into());
-        }
+    link_args.push(opt_level.clang_flag());
+    if opt_level.is_optimized() && native {
+        link_args.push("-march=native".into());
+        link_args.push("-mtune=native".into());
     }
     if is_gcc(&cc) {
         link_args.push("-pthread".into());
@@ -719,19 +839,16 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build_runtime(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
+fn build_runtime(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Result<PathBuf, String> {
     let cargo_toml = runtime_dir.join("Cargo.toml");
     if !cargo_toml.exists() {
         return Err("runtime/Cargo.toml not found; Rust runtime required".to_string());
     }
-    build_runtime_rust(runtime_dir, cc)
+    build_runtime_rust(runtime_dir, cc, opt_level)
 }
 
-fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
-    // Default to optimized runtime for execution throughput.
-    let release = std::env::var("GOST_RELEASE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+fn build_runtime_rust(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Result<PathBuf, String> {
+    let release = opt_level.is_optimized();
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -763,14 +880,20 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
     if std::env::var("GOST_STATS").ok().as_deref() == Some("1") {
         cmd.arg("--features").arg("stats");
     }
-    if native {
-        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-        if !rustflags.contains("target-cpu") {
-            if !rustflags.is_empty() {
-                rustflags.push(' ');
-            }
-            rustflags.push_str("-C target-cpu=native");
+    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.contains("opt-level=") {
+        if !rustflags.is_empty() {
+            rustflags.push(' ');
         }
+        rustflags.push_str(&format!("-C opt-level={}", opt_level.as_digit()));
+    }
+    if native && opt_level.is_optimized() && !rustflags.contains("target-cpu") {
+        if !rustflags.is_empty() {
+            rustflags.push(' ');
+        }
+        rustflags.push_str("-C target-cpu=native");
+    }
+    if !rustflags.is_empty() {
         cmd.env("RUSTFLAGS", rustflags);
     }
     cmd.env("CC", cc);
@@ -830,10 +953,12 @@ fn compiler_target(cc: &str) -> Option<String> {
     None
 }
 
-fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), String> {
-    let release = std::env::var("GOST_RELEASE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+fn compile_ll_to_obj(
+    cc: &str,
+    ll_path: &Path,
+    obj_path: &Path,
+    opt_level: OptLevel,
+) -> Result<(), String> {
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -844,11 +969,9 @@ fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), St
             "-o".into(),
             obj_path.display().to_string(),
         ];
-        if release {
-            args.push("-O3".into());
-            if native {
-                args.push("-march=native".into());
-            }
+        args.push(opt_level.clang_flag());
+        if opt_level.is_optimized() && native {
+            args.push("-march=native".into());
         }
         return run_cmd(
             cc,
@@ -864,11 +987,9 @@ fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), St
         "-o".into(),
         obj_path.display().to_string(),
     ];
-    if release {
-        args.push("-O=3".into());
-        if native {
-            args.push("-mcpu=native".into());
-        }
+    args.push(opt_level.llc_flag());
+    if opt_level.is_optimized() && native {
+        args.push("-mcpu=native".into());
     }
     if let Some(triple) = compiler_triple(cc) {
         args.push("-mtriple".into());

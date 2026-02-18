@@ -32,6 +32,63 @@ pub struct Parser {
 }
 
 impl Parser {
+    fn parse_callable_type(
+        &mut self,
+        span: Span,
+        is_closure: bool,
+    ) -> Option<TypeAst> {
+        self.expect_symbol(Symbol::LParen);
+        let mut params = Vec::new();
+        let mut is_variadic = false;
+        if !self.at_symbol(Symbol::RParen) {
+            loop {
+                if self.at_variadic_marker() {
+                    self.consume_variadic_marker();
+                    is_variadic = true;
+                    break;
+                }
+                params.push(self.parse_type()?);
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                    if self.at_symbol(Symbol::RParen) {
+                        break;
+                    }
+                    if self.at_variadic_marker() {
+                        self.consume_variadic_marker();
+                        is_variadic = true;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(Symbol::RParen);
+        let ret = if self.at_symbol(Symbol::Arrow) {
+            self.bump();
+            self.parse_type()?
+        } else {
+            TypeAst {
+                kind: TypeAstKind::Named("unit".to_string()),
+                span: span.clone(),
+            }
+        };
+        let kind = if is_closure {
+            TypeAstKind::Closure {
+                params,
+                ret: Box::new(ret),
+                is_variadic,
+            }
+        } else {
+            TypeAstKind::FnPtr {
+                params,
+                ret: Box::new(ret),
+                is_variadic,
+            }
+        };
+        Some(TypeAst { kind, span })
+    }
+
     pub fn new(tokens: Vec<Token>) -> Self {
         Self::new_with_expr_id(tokens, 0)
     }
@@ -1039,6 +1096,50 @@ impl Parser {
             }
             (
                 TypeAstKind::FnPtr {
+                    params: a_params,
+                    ret: a_ret,
+                    is_variadic: a_var,
+                },
+                TypeAstKind::FnPtr {
+                    params: b_params,
+                    ret: b_ret,
+                    is_variadic: b_var,
+                },
+            ) => {
+                a_var == b_var
+                    && a_params.len() == b_params.len()
+                    && a_params
+                        .iter()
+                        .zip(b_params.iter())
+                        .all(|(a, b)| Self::type_ast_eq_with_generic_map(a, b, rhs_generic_to_lhs))
+                    && Self::type_ast_eq_with_generic_map(a_ret, b_ret, rhs_generic_to_lhs)
+            }
+            (
+                TypeAstKind::Closure {
+                    params: a_params,
+                    ret: a_ret,
+                    is_variadic: a_var,
+                },
+                TypeAstKind::Closure {
+                    params: b_params,
+                    ret: b_ret,
+                    is_variadic: b_var,
+                },
+            )
+            | (
+                TypeAstKind::FnPtr {
+                    params: a_params,
+                    ret: a_ret,
+                    is_variadic: a_var,
+                },
+                TypeAstKind::Closure {
+                    params: b_params,
+                    ret: b_ret,
+                    is_variadic: b_var,
+                },
+            )
+            | (
+                TypeAstKind::Closure {
                     params: a_params,
                     ret: a_ret,
                     is_variadic: a_var,
@@ -3194,6 +3295,20 @@ impl Parser {
                 span,
             });
         }
+        if self.at_ident("dyn") {
+            self.bump();
+            let trait_name = match self.bump().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected trait name after `dyn`");
+                    return None;
+                }
+            };
+            return Some(TypeAst {
+                kind: TypeAstKind::Named(trait_name),
+                span,
+            });
+        }
         if self.at_keyword(Keyword::Interface) || self.at_keyword(Keyword::Trait) {
             self.bump();
             return Some(TypeAst {
@@ -3203,50 +3318,11 @@ impl Parser {
         }
         if self.at_keyword(Keyword::Fn) {
             self.bump();
-            self.expect_symbol(Symbol::LParen);
-            let mut params = Vec::new();
-            let mut is_variadic = false;
-            if !self.at_symbol(Symbol::RParen) {
-                loop {
-                    if self.at_variadic_marker() {
-                        self.consume_variadic_marker();
-                        is_variadic = true;
-                        break;
-                    }
-                    params.push(self.parse_type()?);
-                    if self.at_symbol(Symbol::Comma) {
-                        self.bump();
-                        if self.at_symbol(Symbol::RParen) {
-                            break;
-                        }
-                        if self.at_variadic_marker() {
-                            self.consume_variadic_marker();
-                            is_variadic = true;
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            self.expect_symbol(Symbol::RParen);
-            let ret = if self.at_symbol(Symbol::Arrow) {
-                self.bump();
-                self.parse_type()?
-            } else {
-                TypeAst {
-                    kind: TypeAstKind::Named("unit".to_string()),
-                    span: span.clone(),
-                }
-            };
-            return Some(TypeAst {
-                kind: TypeAstKind::FnPtr {
-                    params,
-                    ret: Box::new(ret),
-                    is_variadic,
-                },
-                span,
-            });
+            return self.parse_callable_type(span, false);
+        }
+        if self.at_ident("closure") {
+            self.bump();
+            return self.parse_callable_type(span, true);
         }
         if self.at_ident("ref") {
             self.bump();

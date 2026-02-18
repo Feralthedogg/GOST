@@ -22,3 +22,7 @@ jobs:
       - name: Guard new codegen reject strings
         shell: pwsh
         run: ./scripts/check_codegen_reject_strings.ps1
+
+      - name: Guard invalid string compare LLVM emission
+        shell: pwsh
+        run: ./scripts/check_string_cmp_codegen.ps1

@@ -834,6 +834,7 @@ pub(crate) fn llvm_type(ty: &Type) -> Result<String, String> {
             ret,
             is_variadic,
         } => format!("{}*", llvm_fn_sig(params, ret, *is_variadic)?),
+        Type::Closure { .. } => "%interface".to_string(),
         Type::Ref(inner) | Type::MutRef(inner) => {
             let inner_ty = llvm_type(inner)?;
             if inner_ty == "void" {
@@ -940,6 +941,7 @@ pub(crate) fn zero_value(ty: &Type) -> Result<String, String> {
         | Type::Shared(_)
         | Type::Map(_, _)
         | Type::Interface
+        | Type::Closure { .. }
         | Type::Named(_) => Ok("zeroinitializer".to_string()),
         Type::FnPtr { .. } | Type::Chan(_) | Type::Ref(_) | Type::MutRef(_) => {
             Ok("null".to_string())

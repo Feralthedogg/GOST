@@ -15,7 +15,7 @@ fn is_empty(s: string) -> bool {
     return string_len(s) == strings_zero_i64()
 }
 
-private fn eq(a: string, b: string) -> bool {
+fn equal(a: string, b: string) -> bool {
     let na: i64 = string_len(a)
     let nb: i64 = string_len(b)
     if na != nb {

@@ -486,4 +486,9 @@ pub enum TypeAstKind {
         ret: Box<TypeAst>,
         is_variadic: bool,
     },
+    Closure {
+        params: Vec<TypeAst>,
+        ret: Box<TypeAst>,
+        is_variadic: bool,
+    },
 }

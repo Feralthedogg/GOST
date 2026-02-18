@@ -1642,7 +1642,9 @@ impl<'a> FnEmitter<'a> {
                 }
             }
             ExprKind::Closure { .. } => {
-                self.invariant_err("closure value must be immediately invoked")
+                self.unreachable_internal(
+                    "MIR lowering invariant: closure literal must be lowered before backend",
+                )
             }
             ExprKind::Call { callee, type_args, args } => {
                 if let ExprKind::Field { base, name } = &callee.kind {
@@ -1677,7 +1679,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 if let ExprKind::Field { base, name: method } = &callee.kind {
                     let base_val = self.emit_expr(base)?;
-                    if base_val.ty == Type::Interface {
+                    if Self::is_interface_object_type(&base_val.ty) {
                         let mut resolved_args = Vec::new();
                         for arg in args {
                             resolved_args.push(self.emit_expr(arg)?);
@@ -7437,15 +7439,36 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    fn is_interface_object_type(ty: &Type) -> bool {
+        matches!(ty, Type::Interface | Type::Closure { .. })
+    }
+
     fn cast_value(&mut self, val: Value, target: &Type) -> Result<Value, String> {
         if &val.ty == target {
             return Ok(val);
         }
-        if *target == Type::Interface {
-            return self.emit_interface_box_value(val);
+        let target_interface_like = Self::is_interface_object_type(target);
+        let value_interface_like = Self::is_interface_object_type(&val.ty);
+        if target_interface_like {
+            if value_interface_like {
+                let mut out = val;
+                out.ty = target.clone();
+                return Ok(out);
+            }
+            let mut boxed = self.emit_interface_box_value(val)?;
+            boxed.ty = target.clone();
+            return Ok(boxed);
         }
-        if val.ty == Type::Interface {
-            return self.emit_interface_unbox_value(val, target);
+        if value_interface_like {
+            let iface = if val.ty == Type::Interface {
+                val
+            } else {
+                Value {
+                    ty: Type::Interface,
+                    ir: val.ir,
+                }
+            };
+            return self.emit_interface_unbox_value(iface, target);
         }
         if self.is_int_type(&val.ty) && self.is_int_type(target) {
             return self.cast_int_value(val, target);
@@ -7730,7 +7753,10 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn emit_interface_unbox_value(&mut self, iface: Value, target: &Type) -> Result<Value, String> {
-        self.require_not_invariant(iface.ty != Type::Interface, "interface cast source must be interface")?;
+        self.require_not_invariant(
+            !Self::is_interface_object_type(&iface.ty),
+            "interface cast source must be interface-like",
+        )?;
         let tag_ir = self.new_temp();
         self.emit(format!(
             "{} = extractvalue %interface {}, 0",
@@ -7761,7 +7787,10 @@ impl<'a> FnEmitter<'a> {
         iface: &Value,
         target: &Type,
     ) -> Result<Value, String> {
-        self.require_not_invariant(iface.ty != Type::Interface, "interface cast source must be interface")?;
+        self.require_not_invariant(
+            !Self::is_interface_object_type(&iface.ty),
+            "interface cast source must be interface-like",
+        )?;
         if *target == Type::Builtin(BuiltinType::Unit) {
             return Ok(Value {
                 ty: target.clone(),
@@ -7829,6 +7858,28 @@ impl<'a> FnEmitter<'a> {
                     is_variadic,
                 } => {
                     out.push_str("fn(");
+                    for (idx, p) in params.iter().enumerate() {
+                        if idx > 0 {
+                            out.push(',');
+                        }
+                        write_type(out, p);
+                    }
+                    if *is_variadic {
+                        if !params.is_empty() {
+                            out.push(',');
+                        }
+                        out.push_str("...");
+                    }
+                    out.push(')');
+                    out.push_str("->");
+                    write_type(out, ret);
+                }
+                Type::Closure {
+                    params,
+                    ret,
+                    is_variadic,
+                } => {
+                    out.push_str("closure(");
                     for (idx, p) in params.iter().enumerate() {
                         if idx > 0 {
                             out.push(',');
@@ -8999,6 +9050,22 @@ impl<'a> FnEmitter<'a> {
                 }
                 let rty = self.resolve_type_ast(ret)?;
                 Ok(Type::FnPtr {
+                    params: ptys,
+                    ret: Box::new(rty),
+                    is_variadic: *is_variadic,
+                })
+            }
+            crate::frontend::ast::TypeAstKind::Closure {
+                params,
+                ret,
+                is_variadic,
+            } => {
+                let mut ptys = Vec::new();
+                for p in params {
+                    ptys.push(self.resolve_type_ast(p)?);
+                }
+                let rty = self.resolve_type_ast(ret)?;
+                Ok(Type::Closure {
                     params: ptys,
                     ret: Box::new(rty),
                     is_variadic: *is_variadic,

@@ -1008,6 +1008,18 @@ impl Lowerer {
                 ret: Box::new(self.type_to_ast(ret, span.clone())),
                 is_variadic: *is_variadic,
             },
+            Type::Closure {
+                params,
+                ret,
+                is_variadic,
+            } => TypeAstKind::Closure {
+                params: params
+                    .iter()
+                    .map(|p| self.type_to_ast(p, span.clone()))
+                    .collect(),
+                ret: Box::new(self.type_to_ast(ret, span.clone())),
+                is_variadic: *is_variadic,
+            },
             Type::Ref(inner) => TypeAstKind::Ref(Box::new(self.type_to_ast(inner, span.clone()))),
             Type::MutRef(inner) => {
                 TypeAstKind::MutRef(Box::new(self.type_to_ast(inner, span.clone())))
@@ -2628,6 +2640,17 @@ impl Lowerer {
                     span: expr.span.clone(),
                 })
             }
+            ExprKind::ArrayLit(items) => {
+                let mut lowered = Vec::with_capacity(items.len());
+                for item in items {
+                    lowered.push(self.lower_expr_value(item)?);
+                }
+                Ok(Expr {
+                    id: expr.id,
+                    kind: ExprKind::ArrayLit(lowered),
+                    span: expr.span.clone(),
+                })
+            }
             ExprKind::Tuple(items) => {
                 let mut lowered = Vec::new();
                 for item in items {
@@ -2689,7 +2712,7 @@ impl Lowerer {
 
                     if !is_enum_ctor {
                         let recv_ty = self.expr_type(base)?;
-                        if recv_ty != Type::Interface {
+                        if !matches!(recv_ty, Type::Interface | Type::Closure { .. }) {
                             if let Some((method_symbol, param0_ty)) =
                                 self.resolve_method_symbol(name, &recv_ty, args)?
                             {

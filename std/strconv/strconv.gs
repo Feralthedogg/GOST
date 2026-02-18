@@ -1,5 +1,7 @@
 module strconv
 
+import "std/strings"
+
 private fn strconv_zero_i64() -> i64 { return string_len("")
  }
 private fn strconv_one_i64() -> i64 { return string_len("a")
@@ -53,22 +55,6 @@ private fn strconv_trim_space(s: string) -> string {
 
 private fn strconv_digit_char(d: i32) -> string {
     return string_from_byte(strconv_byte("0") + d)
-}
-
-private fn strconv_str_eq(a: string, b: string) -> bool {
-    let na: i64 = string_len(a)
-    let nb: i64 = string_len(b)
-    if na != nb {
-        return false
-    }
-    let i: i64 = strconv_zero_i64()
-    while i < na {
-        if string_get(a, i) != string_get(b, i) {
-            return false
-        }
-        i = i + strconv_one_i64()
-    }
-    return true
 }
 
 fn format_i64(v: i64) -> string {
@@ -167,22 +153,22 @@ fn atoi(s: string) -> Result[i32, error] {
 
 fn parse_bool(s: string) -> Result[bool, error] {
     let raw: string = strconv_trim_space(s)
-    if strconv_str_eq(raw, "true") { return Result.Ok[bool, error](true)
+    if equal(raw, "true") { return Result.Ok[bool, error](true)
  }
-    if strconv_str_eq(raw, "1") { return Result.Ok[bool, error](true)
+    if equal(raw, "1") { return Result.Ok[bool, error](true)
  }
-    if strconv_str_eq(raw, "t") { return Result.Ok[bool, error](true)
+    if equal(raw, "t") { return Result.Ok[bool, error](true)
  }
-    if strconv_str_eq(raw, "T") {
+    if equal(raw, "T") {
         return Result.Ok[bool, error](true)
     }
-    if strconv_str_eq(raw, "false") { return Result.Ok[bool, error](false)
+    if equal(raw, "false") { return Result.Ok[bool, error](false)
  }
-    if strconv_str_eq(raw, "0") { return Result.Ok[bool, error](false)
+    if equal(raw, "0") { return Result.Ok[bool, error](false)
  }
-    if strconv_str_eq(raw, "f") { return Result.Ok[bool, error](false)
+    if equal(raw, "f") { return Result.Ok[bool, error](false)
  }
-    if strconv_str_eq(raw, "F") {
+    if equal(raw, "F") {
         return Result.Ok[bool, error](false)
     }
     return Result.Err[bool, error](strconv_error_new("invalid bool"))
@@ -237,21 +223,21 @@ fn atoi_loose(s: string, fallback: i32) -> i32 {
 
 fn parse_bool_loose(s: string, fallback: bool) -> bool {
     let raw: string = strconv_trim_space(s)
-    if strconv_str_eq(raw, "true") { return true
+    if equal(raw, "true") { return true
  }
-    if strconv_str_eq(raw, "1") { return true
+    if equal(raw, "1") { return true
  }
-    if strconv_str_eq(raw, "t") { return true
+    if equal(raw, "t") { return true
  }
-    if strconv_str_eq(raw, "T") { return true
+    if equal(raw, "T") { return true
  }
-    if strconv_str_eq(raw, "false") { return false
+    if equal(raw, "false") { return false
  }
-    if strconv_str_eq(raw, "0") { return false
+    if equal(raw, "0") { return false
  }
-    if strconv_str_eq(raw, "f") { return false
+    if equal(raw, "f") { return false
  }
-    if strconv_str_eq(raw, "F") { return false
+    if equal(raw, "F") { return false
  }
     return fallback
 }

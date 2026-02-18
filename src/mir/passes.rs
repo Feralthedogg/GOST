@@ -511,6 +511,9 @@ fn type_contains_iter(ty: &Type) -> bool {
         Type::Map(key, value) => type_contains_iter(key) || type_contains_iter(value),
         Type::Result(ok, err) => type_contains_iter(ok) || type_contains_iter(err),
         Type::Tuple(items) => items.iter().any(type_contains_iter),
+        Type::Closure { params, ret, .. } => {
+            params.iter().any(type_contains_iter) || type_contains_iter(ret)
+        }
         Type::Builtin(_) | Type::FnPtr { .. } | Type::Interface | Type::Named(_) => false,
     }
 }

@@ -4,6 +4,10 @@ fn greet(x: i32) -> i32 {
     return x + 100
 }
 
+trait Greeter {
+    fn greet() -> i32
+}
+
 copy struct User {
     id: i32
 }
@@ -12,19 +16,19 @@ copy struct Admin {
     id: i32
 }
 
-impl User {
+impl Greeter for User {
     fn greet() -> i32 {
         return self.id + 10
     }
 }
 
-impl Admin {
+impl Greeter for Admin {
     fn greet() -> i32 {
         return self.id + 20
     }
 }
 
-fn call_iface(v: interface) -> i32 {
+fn call_iface(v: dyn Greeter) -> i32 {
     return v.greet()
 }
 
@@ -39,8 +43,8 @@ fn main() -> i32 {
         return 2
     }
 
-    let any_u = u as interface
-    let any_a = a as interface
+    let any_u = u as dyn Greeter
+    let any_a = a as dyn Greeter
     if any_u.greet() != 11 {
         return 3
     }
