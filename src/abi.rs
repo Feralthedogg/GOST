@@ -56,4 +56,3 @@ pub fn llvm_call_conv(abi: Option<&str>) -> &'static str {
         _ => "",
     }
 }
-

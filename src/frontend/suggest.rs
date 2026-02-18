@@ -21,11 +21,7 @@ pub fn suggest(needle: &str, candidates: impl IntoIterator<Item = String>) -> Ve
     };
 
     scored.retain(|(d, _)| *d <= max_dist);
-    scored.sort_by(|(da, a), (db, b)| {
-        da.cmp(db)
-            .then(a.len().cmp(&b.len()))
-            .then(a.cmp(b))
-    });
+    scored.sort_by(|(da, a), (db, b)| da.cmp(db).then(a.len().cmp(&b.len())).then(a.cmp(b)));
 
     scored.into_iter().take(3).map(|(_, s)| s).collect()
 }

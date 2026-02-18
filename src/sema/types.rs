@@ -1,6 +1,6 @@
+use crate::frontend::ast::Visibility;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use crate::frontend::ast::Visibility;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinType {
@@ -447,11 +447,7 @@ impl TypeDefs {
         self.map_key_spec(ty).map(|spec| spec.kind)
     }
 
-    fn map_runtime_key_kind_inner(
-        &self,
-        ty: &Type,
-        visiting: &mut HashSet<String>,
-    ) -> Option<i32> {
+    fn map_runtime_key_kind_inner(&self, ty: &Type, visiting: &mut HashSet<String>) -> Option<i32> {
         if let Some(kind) = ty.map_runtime_key_kind() {
             return Some(kind);
         }
@@ -481,7 +477,8 @@ impl TypeDefs {
                 } else {
                     match self.get(name) {
                         Some(TypeDefKind::Enum(def)) => {
-                            let fieldless = def.variants.iter().all(|(_, fields)| fields.is_empty());
+                            let fieldless =
+                                def.variants.iter().all(|(_, fields)| fields.is_empty());
                             if fieldless {
                                 if let Some(repr) = def.layout.repr_int {
                                     Some(if repr.is_signed() { 1 } else { 2 })
@@ -499,10 +496,9 @@ impl TypeDefs {
                             }
                         }
                         Some(TypeDefKind::Struct(def))
-                            if def
-                                .fields
-                                .iter()
-                                .all(|field| self.is_bytewise_map_key_inner(&field.ty, visiting)) =>
+                            if def.fields.iter().all(|field| {
+                                self.is_bytewise_map_key_inner(&field.ty, visiting)
+                            }) =>
                         {
                             Some(4)
                         }
@@ -560,13 +556,11 @@ impl TypeDefs {
                             .fields
                             .iter()
                             .all(|field| self.is_bytewise_map_key_inner(&field.ty, visiting)),
-                        Some(TypeDefKind::Enum(def)) => {
-                            def.variants.iter().all(|(_, fields)| {
-                                fields
-                                    .iter()
-                                    .all(|field| self.is_bytewise_map_key_inner(field, visiting))
-                            })
-                        }
+                        Some(TypeDefKind::Enum(def)) => def.variants.iter().all(|(_, fields)| {
+                            fields
+                                .iter()
+                                .all(|field| self.is_bytewise_map_key_inner(field, visiting))
+                        }),
                         _ => false,
                     }
                 };
@@ -762,22 +756,22 @@ impl TypeDefs {
             Type::Interface => true,
             Type::Builtin(
                 BuiltinType::Bool
-                    | BuiltinType::I8
-                    | BuiltinType::I16
-                    | BuiltinType::I32
-                    | BuiltinType::I64
-                    | BuiltinType::Isize
-                    | BuiltinType::U8
-                    | BuiltinType::U16
-                    | BuiltinType::U32
-                    | BuiltinType::U64
-                    | BuiltinType::Usize
-                    | BuiltinType::F32
-                    | BuiltinType::F64
-                    | BuiltinType::Char
-                    | BuiltinType::Unit
-                    | BuiltinType::String
-                    | BuiltinType::Error,
+                | BuiltinType::I8
+                | BuiltinType::I16
+                | BuiltinType::I32
+                | BuiltinType::I64
+                | BuiltinType::Isize
+                | BuiltinType::U8
+                | BuiltinType::U16
+                | BuiltinType::U32
+                | BuiltinType::U64
+                | BuiltinType::Usize
+                | BuiltinType::F32
+                | BuiltinType::F64
+                | BuiltinType::Char
+                | BuiltinType::Unit
+                | BuiltinType::String
+                | BuiltinType::Error,
             ) => true,
             Type::FnPtr { .. } | Type::Closure { .. } => true,
             Type::Tuple(items) => items
@@ -802,9 +796,9 @@ impl TypeDefs {
                             .iter()
                             .all(|field| self.interface_cast_supported_inner(&field.ty, visiting)),
                         Some(TypeDefKind::Enum(def)) => def.variants.iter().all(|(_, fields)| {
-                            fields
-                                .iter()
-                                .all(|field_ty| self.interface_cast_supported_inner(field_ty, visiting))
+                            fields.iter().all(|field_ty| {
+                                self.interface_cast_supported_inner(field_ty, visiting)
+                            })
                         }),
                         None => false,
                     }

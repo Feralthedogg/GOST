@@ -309,9 +309,17 @@ pub struct SelectArm {
 
 #[derive(Clone, Debug)]
 pub enum SelectArmKind {
-    Send { chan: Expr, value: Expr },
-    Recv { chan: Expr, bind: Option<(String, String)> },
-    After { ms: Expr },
+    Send {
+        chan: Expr,
+        value: Expr,
+    },
+    Recv {
+        chan: Expr,
+        bind: Option<(String, String)>,
+    },
+    After {
+        ms: Expr,
+    },
     Default,
 }
 

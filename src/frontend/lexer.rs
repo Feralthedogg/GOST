@@ -768,21 +768,21 @@ fn is_ident_continue(ch: char) -> bool {
 }
 
 fn can_insert_semi_after(kind: &TokenKind) -> bool {
-    match kind {
-        TokenKind::Ident(_) => true,
-        TokenKind::IntLit(_) => true,
-        TokenKind::FloatLit(_) => true,
-        TokenKind::StringLit(_) => true,
-        TokenKind::CharLit(_) => true,
-        TokenKind::Keyword(Keyword::Return)
-        | TokenKind::Keyword(Keyword::Break)
-        | TokenKind::Keyword(Keyword::Continue)
-        | TokenKind::Keyword(Keyword::True)
-        | TokenKind::Keyword(Keyword::False)
-        | TokenKind::Keyword(Keyword::Nil) => true,
-        TokenKind::Symbol(Symbol::RParen)
-        | TokenKind::Symbol(Symbol::RBracket)
-        | TokenKind::Symbol(Symbol::RBrace) => true,
-        _ => false,
-    }
+    matches!(
+        kind,
+        TokenKind::Ident(_)
+            | TokenKind::IntLit(_)
+            | TokenKind::FloatLit(_)
+            | TokenKind::StringLit(_)
+            | TokenKind::CharLit(_)
+            | TokenKind::Keyword(Keyword::Return)
+            | TokenKind::Keyword(Keyword::Break)
+            | TokenKind::Keyword(Keyword::Continue)
+            | TokenKind::Keyword(Keyword::True)
+            | TokenKind::Keyword(Keyword::False)
+            | TokenKind::Keyword(Keyword::Nil)
+            | TokenKind::Symbol(Symbol::RParen)
+            | TokenKind::Symbol(Symbol::RBracket)
+            | TokenKind::Symbol(Symbol::RBrace)
+    )
 }

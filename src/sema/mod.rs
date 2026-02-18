@@ -4,19 +4,19 @@ use std::collections::{HashMap, HashSet};
 
 use crate::frontend::ast::*;
 use crate::frontend::diagnostic::{
-    Diagnostic, Diagnostics, E_UNDEFINED_NAME, E_UNKNOWN_FIELD, E_UNKNOWN_FUNCTION, E_UNKNOWN_TYPE,
-    E_UNKNOWN_METHOD, E_UNKNOWN_VARIANT,
+    Diagnostic, Diagnostics, E_UNDEFINED_NAME, E_UNKNOWN_FIELD, E_UNKNOWN_FUNCTION,
+    E_UNKNOWN_METHOD, E_UNKNOWN_TYPE, E_UNKNOWN_VARIANT,
 };
-use crate::frontend::symbols::logical_method_name;
 use crate::frontend::diagnostic::{E1104, E1105};
 use crate::frontend::suggest;
+use crate::frontend::symbols::logical_method_name;
 use crate::intrinsics::{
     intrinsic_args_error, intrinsic_internal_std_only_error, intrinsic_type_args_error,
     is_intrinsic_name,
 };
 use crate::sema::types::{
-    builtin_from_name, builtin_names, promote_int_types, type_eq, BuiltinType, EnumDef,
-    LayoutInfo, RefKind, ReprInt, StructDef, StructField, Type, TypeClass, TypeDefKind, TypeDefs,
+    BuiltinType, EnumDef, LayoutInfo, RefKind, ReprInt, StructDef, StructField, Type, TypeClass,
+    TypeDefKind, TypeDefs, builtin_from_name, builtin_names, promote_int_types, type_eq,
 };
 
 const DIAG_VIEW_ESCAPE: &str = "view value cannot escape; use own[T] or alias[T]";
@@ -79,10 +79,7 @@ pub struct Program {
     pub expr_types: HashMap<ExprId, Type>,
 }
 
-pub fn analyze(
-    file: &FileAst,
-    std_funcs: &HashSet<String>,
-) -> Result<Program, Diagnostics> {
+pub fn analyze(file: &FileAst, std_funcs: &HashSet<String>) -> Result<Program, Diagnostics> {
     let mut diags = Diagnostics::default();
     let mut types = TypeDefs::default();
     let mut type_order = Vec::new();
@@ -97,16 +94,10 @@ pub fn analyze(
                     );
                 }
                 if def.layout.bitfield && !def.layout.repr_c {
-                    diags.push(
-                        "bitfield requires repr(C)",
-                        Some(def.span.clone()),
-                    );
+                    diags.push("bitfield requires repr(C)", Some(def.span.clone()));
                 };
                 if def.layout.pack.is_some() && !def.layout.repr_c {
-                    diags.push(
-                        "pack(N) requires repr(C)",
-                        Some(def.span.clone()),
-                    );
+                    diags.push("pack(N) requires repr(C)", Some(def.span.clone()));
                 };
                 if def.layout.repr_int.is_some() {
                     diags.push(
@@ -194,15 +185,14 @@ pub fn analyze(
                         if types.contains_view(&ty) {
                             diags.push(DIAG_VIEW_ESCAPE, Some(field.span.clone()));
                         }
-                        if def.layout.bitfield {
-                            if !(matches!(ty, Type::Builtin(BuiltinType::Bool | BuiltinType::Char))
+                        if def.layout.bitfield
+                            && !(matches!(ty, Type::Builtin(BuiltinType::Bool | BuiltinType::Char))
                                 || ty.is_integer())
-                            {
-                                diags.push(
-                                    "bitfield struct fields must be integer-like types",
-                                    Some(field.span.clone()),
-                                );
-                            }
+                        {
+                            diags.push(
+                                "bitfield struct fields must be integer-like types",
+                                Some(field.span.clone()),
+                            );
                         }
                         fields.push(StructField {
                             name: field.name.clone(),
@@ -241,13 +231,13 @@ pub fn analyze(
                     }
                     variants.push((var.name.clone(), field_tys));
                 }
-                if let Some(repr) = def.layout.repr_int {
-                    if !repr_int_can_represent_variant_count(repr, variants.len()) {
-                        diags.push(
-                            "repr(integer) enum has too many variants for selected tag type",
-                            Some(def.span.clone()),
-                        );
-                    }
+                if let Some(repr) = def.layout.repr_int
+                    && !repr_int_can_represent_variant_count(repr, variants.len())
+                {
+                    diags.push(
+                        "repr(integer) enum has too many variants for selected tag type",
+                        Some(def.span.clone()),
+                    );
                 }
                 types.insert(
                     def.name.clone(),
@@ -269,10 +259,7 @@ pub fn analyze(
                     if def.is_copy {
                         for field in &def.fields {
                             if !types.is_copy_type(&field.ty) {
-                                diags.push(
-                                    "copy struct fields must be Copy",
-                                    None,
-                                );
+                                diags.push("copy struct fields must be Copy", None);
                             }
                         }
                     }
@@ -282,10 +269,7 @@ pub fn analyze(
                         for (_, fields) in &def.variants {
                             for ty in fields {
                                 if !types.is_copy_type(ty) {
-                                    diags.push(
-                                        "copy enum variants must be Copy",
-                                        None,
-                                    );
+                                    diags.push("copy enum variants must be Copy", None);
                                 }
                             }
                         }
@@ -305,10 +289,7 @@ pub fn analyze(
         match item {
             Item::Function(func) => {
                 if func.is_extern {
-                    let abi = func
-                        .extern_abi
-                        .clone()
-                        .unwrap_or_else(|| "C".to_string());
+                    let abi = func.extern_abi.clone().unwrap_or_else(|| "C".to_string());
                     if !crate::abi::is_supported_extern_abi(&abi) {
                         diags.push(
                             format!(
@@ -344,10 +325,7 @@ pub fn analyze(
                     && func.name != "__gost_global_init_user"
                     && !std_funcs.contains(&func.name)
                 {
-                    diags.push(
-                        "reserved internal name",
-                        Some(func.span.clone()),
-                    );
+                    diags.push("reserved internal name", Some(func.span.clone()));
                 }
                 if functions.contains_key(&func.name) {
                     diags.push(
@@ -369,10 +347,7 @@ pub fn analyze(
                 );
             }
             Item::ExternGlobal(global) => {
-                let abi = global
-                    .extern_abi
-                    .clone()
-                    .unwrap_or_else(|| "C".to_string());
+                let abi = global.extern_abi.clone().unwrap_or_else(|| "C".to_string());
                 if !crate::abi::is_supported_extern_abi(&abi) {
                     diags.push(
                         format!(
@@ -427,10 +402,7 @@ pub fn analyze(
                     None
                 };
                 let Some(final_value) = coerced else {
-                    diags.push(
-                        "const initializer type mismatch",
-                        Some(c.init.span.clone()),
-                    );
+                    diags.push("const initializer type mismatch", Some(c.init.span.clone()));
                     continue;
                 };
                 if consts.contains_key(&c.name) {
@@ -440,7 +412,13 @@ pub fn analyze(
                     );
                     continue;
                 }
-                consts.insert(c.name.clone(), ConstSig { ty, value: final_value });
+                consts.insert(
+                    c.name.clone(),
+                    ConstSig {
+                        ty,
+                        value: final_value,
+                    },
+                );
             }
             _ => {}
         }
@@ -583,10 +561,10 @@ fn build_namespaced_only_funcs(
         }
         let prefix = format!("{}.", alias);
         for key in funcs.keys() {
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                if !rest.is_empty() {
-                    out.entry(rest.to_string()).or_insert_with(|| alias.clone());
-                }
+            if let Some(rest) = key.strip_prefix(&prefix)
+                && !rest.is_empty()
+            {
+                out.entry(rest.to_string()).or_insert_with(|| alias.clone());
             }
         }
     }
@@ -596,10 +574,10 @@ fn build_namespaced_only_funcs(
 fn collect_trait_method_requirements(file: &FileAst) -> HashMap<String, Vec<TraitMethod>> {
     let mut out = HashMap::new();
     for item in &file.items {
-        if let Item::TypeAlias(alias) = item {
-            if alias.is_trait {
-                out.insert(alias.name.clone(), alias.trait_methods.clone());
-            }
+        if let Item::TypeAlias(alias) = item
+            && alias.is_trait
+        {
+            out.insert(alias.name.clone(), alias.trait_methods.clone());
         }
     }
     out
@@ -638,9 +616,7 @@ fn repr_int_can_represent_variant_count(repr: crate::frontend::ast::ReprInt, cou
         crate::frontend::ast::ReprInt::U8 => (false, 8u32),
         crate::frontend::ast::ReprInt::U16 => (false, 16u32),
         crate::frontend::ast::ReprInt::U32 => (false, 32u32),
-        crate::frontend::ast::ReprInt::U64 | crate::frontend::ast::ReprInt::Usize => {
-            (false, 64u32)
-        }
+        crate::frontend::ast::ReprInt::U64 | crate::frontend::ast::ReprInt::Usize => (false, 64u32),
     };
     let max_tag: u128 = if signed {
         (1u128 << (bits - 1)) - 1
@@ -770,10 +746,7 @@ fn const_value_convert(value: &ConstValue, from: &Type, to: &Type) -> Option<Con
     }
 }
 
-fn eval_const_expr(
-    expr: &Expr,
-    consts: &HashMap<String, ConstSig>,
-) -> Option<(Type, ConstValue)> {
+fn eval_const_expr(expr: &Expr, consts: &HashMap<String, ConstSig>) -> Option<(Type, ConstValue)> {
     match &expr.kind {
         ExprKind::Bool(v) => Some((Type::Builtin(BuiltinType::Bool), ConstValue::Bool(*v))),
         ExprKind::Int(v) => {
@@ -789,9 +762,7 @@ fn eval_const_expr(
             Type::Builtin(BuiltinType::String),
             ConstValue::String(s.clone()),
         )),
-        ExprKind::Ident(name) => consts
-            .get(name)
-            .map(|c| (c.ty.clone(), c.value.clone())),
+        ExprKind::Ident(name) => consts.get(name).map(|c| (c.ty.clone(), c.value.clone())),
         ExprKind::Unary { op, expr: inner } => {
             let (ty, val) = eval_const_expr(inner, consts)?;
             match op {
@@ -807,7 +778,9 @@ fn eval_const_expr(
                     }
                 }
                 UnaryOp::Not => match val {
-                    ConstValue::Bool(v) => Some((Type::Builtin(BuiltinType::Bool), ConstValue::Bool(!v))),
+                    ConstValue::Bool(v) => {
+                        Some((Type::Builtin(BuiltinType::Bool), ConstValue::Bool(!v)))
+                    }
                     _ => None,
                 },
                 UnaryOp::BitNot => {
@@ -826,8 +799,9 @@ fn eval_const_expr(
             let (lt, lv) = eval_const_expr(left, consts)?;
             let (rt, rv) = eval_const_expr(right, consts)?;
             match op {
-                BinaryOp::Add if type_eq(&lt, &Type::Builtin(BuiltinType::String))
-                    && type_eq(&rt, &Type::Builtin(BuiltinType::String)) =>
+                BinaryOp::Add
+                    if type_eq(&lt, &Type::Builtin(BuiltinType::String))
+                        && type_eq(&rt, &Type::Builtin(BuiltinType::String)) =>
                 {
                     if let (ConstValue::String(a), ConstValue::String(b)) = (&lv, &rv) {
                         return Some((
@@ -974,12 +948,10 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
                     let mut candidates: Vec<String> =
                         builtin_names().iter().map(|s| s.to_string()).collect();
                     candidates.extend(defs.all_names());
-                    let mut d = Diagnostic::new(
-                        format!("unknown type `{}`", name),
-                        Some(ast.span.clone()),
-                    )
-                    .code(E_UNKNOWN_TYPE)
-                    .label(ast.span.clone(), "unknown type");
+                    let mut d =
+                        Diagnostic::new(format!("unknown type `{}`", name), Some(ast.span.clone()))
+                            .code(E_UNKNOWN_TYPE)
+                            .label(ast.span.clone(), "unknown type");
                     if let Some(h) = suggest::did_you_mean(name, candidates) {
                         d = d.help(h);
                     }
@@ -1044,7 +1016,10 @@ fn resolve_type(ast: &TypeAst, defs: &TypeDefs, diags: &mut Diagnostics) -> Opti
                 tys.push(ty);
             }
             if tys.len() == 2 && tys[1] == Type::Builtin(BuiltinType::Error) {
-                Some(Type::Result(Box::new(tys[0].clone()), Box::new(tys[1].clone())))
+                Some(Type::Result(
+                    Box::new(tys[0].clone()),
+                    Box::new(tys[1].clone()),
+                ))
             } else {
                 Some(Type::Tuple(tys))
             }
@@ -1293,6 +1268,7 @@ struct FunctionChecker<'a> {
 }
 
 impl<'a> FunctionChecker<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         defs: &'a TypeDefs,
         funcs: &'a HashMap<String, FunctionSig>,
@@ -1353,7 +1329,10 @@ impl<'a> FunctionChecker<'a> {
     fn require_unsafe_operation(&mut self, span: &Span, what: &str) {
         if self.unsafe_depth == 0 {
             self.diags.push(
-                format!("{} requires unsafe context (`unsafe {{ ... }}` or `unsafe fn`)", what),
+                format!(
+                    "{} requires unsafe context (`unsafe {{ ... }}` or `unsafe fn`)",
+                    what
+                ),
                 Some(span.clone()),
             );
         }
@@ -1376,11 +1355,11 @@ impl<'a> FunctionChecker<'a> {
             (RefKind::None, RefKind::None) => true,
             (RefKind::Shared, RefKind::Shared) => true,
             (RefKind::Mut, RefKind::Mut) => true,
-            (RefKind::None, RefKind::Shared) => true,  // autoref
-            (RefKind::None, RefKind::Mut) => true,     // autoref mut
-            (RefKind::Shared, RefKind::None) => true,  // autoderef
-            (RefKind::Mut, RefKind::None) => true,     // autoderef
-            (RefKind::Mut, RefKind::Shared) => true,   // reborrow
+            (RefKind::None, RefKind::Shared) => true, // autoref
+            (RefKind::None, RefKind::Mut) => true,    // autoref mut
+            (RefKind::Shared, RefKind::None) => true, // autoderef
+            (RefKind::Mut, RefKind::None) => true,    // autoderef
+            (RefKind::Mut, RefKind::Shared) => true,  // reborrow
             (RefKind::Shared, RefKind::Mut) => false,
         }
     }
@@ -1451,28 +1430,28 @@ impl<'a> FunctionChecker<'a> {
         ty: &TypeAst,
         subst: &HashMap<String, TypeAst>,
     ) -> TypeAst {
-        if let TypeAstKind::Named(name) = &ty.kind {
-            if let Some(repl) = subst.get(name) {
-                return repl.clone();
-            }
+        if let TypeAstKind::Named(name) = &ty.kind
+            && let Some(repl) = subst.get(name)
+        {
+            return repl.clone();
         }
         let kind = match &ty.kind {
             TypeAstKind::Named(name) => TypeAstKind::Named(name.clone()),
-            TypeAstKind::Ref(inner) => {
-                TypeAstKind::Ref(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
-            }
+            TypeAstKind::Ref(inner) => TypeAstKind::Ref(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
             TypeAstKind::MutRef(inner) => TypeAstKind::MutRef(Box::new(
                 self.substitute_type_params_in_type_ast(inner, subst),
             )),
-            TypeAstKind::Own(inner) => {
-                TypeAstKind::Own(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
-            }
-            TypeAstKind::Alias(inner) => {
-                TypeAstKind::Alias(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
-            }
-            TypeAstKind::Slice(inner) => {
-                TypeAstKind::Slice(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
-            }
+            TypeAstKind::Own(inner) => TypeAstKind::Own(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
+            TypeAstKind::Alias(inner) => TypeAstKind::Alias(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
+            TypeAstKind::Slice(inner) => TypeAstKind::Slice(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
             TypeAstKind::Array(inner, len) => TypeAstKind::Array(
                 Box::new(self.substitute_type_params_in_type_ast(inner, subst)),
                 *len,
@@ -1485,9 +1464,9 @@ impl<'a> FunctionChecker<'a> {
                 Box::new(self.substitute_type_params_in_type_ast(ok, subst)),
                 Box::new(self.substitute_type_params_in_type_ast(err, subst)),
             ),
-            TypeAstKind::Chan(inner) => {
-                TypeAstKind::Chan(Box::new(self.substitute_type_params_in_type_ast(inner, subst)))
-            }
+            TypeAstKind::Chan(inner) => TypeAstKind::Chan(Box::new(
+                self.substitute_type_params_in_type_ast(inner, subst),
+            )),
             TypeAstKind::Shared(inner) => TypeAstKind::Shared(Box::new(
                 self.substitute_type_params_in_type_ast(inner, subst),
             )),
@@ -1635,10 +1614,7 @@ impl<'a> FunctionChecker<'a> {
                 });
             }
             self.diags.push(
-                format!(
-                    "generic method `{}` requires type arguments",
-                    method_name
-                ),
+                format!("generic method `{}` requires type arguments", method_name),
                 Some(span.clone()),
             );
             return None;
@@ -1697,9 +1673,7 @@ impl<'a> FunctionChecker<'a> {
             );
             return None;
         };
-        let Some(required) = methods.iter().find(|m| m.name == method_name) else {
-            return None;
-        };
+        let required = methods.iter().find(|m| m.name == method_name)?;
         let mut params = Vec::with_capacity(required.params.len() + 1);
         params.push(Type::Interface);
         for param in &required.params {
@@ -1894,19 +1868,16 @@ impl<'a> FunctionChecker<'a> {
                 )
                 .code(E1104)
                 .label(f.recv_span.clone(), "temporary value is not addressable")
-                .note(format!("this call requires receiver type: {}", f.param0_ty.pretty()))
+                .note(format!(
+                    "this call requires receiver type: {}",
+                    f.param0_ty.pretty()
+                ))
                 .note("but the receiver expression is a temporary value");
                 d = d.help("bind the receiver to a local first:");
                 if need_mut {
-                    d = d.with_help_snippet(
-                        f.recv_span.clone(),
-                        "let mut tmp = {snippet};",
-                    );
+                    d = d.with_help_snippet(f.recv_span.clone(), "let mut tmp = {snippet};");
                 } else {
-                    d = d.with_help_snippet(
-                        f.recv_span.clone(),
-                        "let tmp = {snippet};",
-                    );
+                    d = d.with_help_snippet(f.recv_span.clone(), "let tmp = {snippet};");
                 }
                 d = d.help(format!("tmp.{}(...)", f.method));
                 self.diags.push_diag(d);
@@ -1918,11 +1889,15 @@ impl<'a> FunctionChecker<'a> {
                 )
                 .code(E1105)
                 .label(f.recv_span.clone(), "receiver is not mutable")
-                .note(format!("this call requires receiver type: {}", f.param0_ty.pretty()))
+                .note(format!(
+                    "this call requires receiver type: {}",
+                    f.param0_ty.pretty()
+                ))
                 .note(format!("receiver type here is: {}", f.recv_ty.pretty()));
 
                 if let Some(name) = f.recv_base_name.clone() {
-                    d = d.help("make it mutable:")
+                    d = d
+                        .help("make it mutable:")
                         .help(format!("let mut {0} = {0};", name))
                         .help(format!("{}.{}(...)", name, f.method));
                 } else {
@@ -1940,10 +1915,10 @@ impl<'a> FunctionChecker<'a> {
     fn method_candidates_for_recv(&self, recv_ty: &Type) -> Vec<String> {
         let mut out = Vec::new();
         for (name, sig) in self.funcs.iter() {
-            if let Some(p0) = sig.params.first() {
-                if self.recv_param_compatible(recv_ty, p0) {
-                    out.push(logical_method_name(name).to_string());
-                }
+            if let Some(p0) = sig.params.first()
+                && self.recv_param_compatible(recv_ty, p0)
+            {
+                out.push(logical_method_name(name).to_string());
             }
         }
         out.sort();
@@ -2011,18 +1986,19 @@ impl<'a> FunctionChecker<'a> {
         self.collect_asm_labels_in_block(&func.body);
         self.env.enter_scope();
         for (idx, param) in func.params.iter().enumerate() {
-            let ty = self.sig.params.get(idx).cloned().unwrap_or(Type::Builtin(BuiltinType::Unit));
+            let ty = self
+                .sig
+                .params
+                .get(idx)
+                .cloned()
+                .unwrap_or(Type::Builtin(BuiltinType::Unit));
             let class = self.defs.classify(&ty).unwrap_or(TypeClass::Copy);
             let info = VarInfo {
                 ty,
                 trait_obj: self.trait_name_from_type_ast(&param.ty),
                 mutable: true,
                 class,
-                state: if class == TypeClass::Linear {
-                    LinearState::Alive
-                } else {
-                    LinearState::Alive
-                },
+                state: LinearState::Alive,
                 borrowed_shared: 0,
                 borrowed_mut: 0,
                 view_of: None,
@@ -2095,18 +2071,15 @@ impl<'a> FunctionChecker<'a> {
     }
 
     fn extract_asm_label_name(&self, expr: &Expr) -> Option<String> {
-        if let ExprKind::Call { callee, args, .. } = &expr.kind {
-            if let ExprKind::Ident(name) = &callee.kind {
-                if name == "asm_label" {
-                    if let Some(Expr {
-                        kind: ExprKind::String(s),
-                        ..
-                    }) = args.first()
-                    {
-                        return Some(s.trim().to_string());
-                    }
-                }
-            }
+        if let ExprKind::Call { callee, args, .. } = &expr.kind
+            && let ExprKind::Ident(name) = &callee.kind
+            && name == "asm_label"
+            && let Some(Expr {
+                kind: ExprKind::String(s),
+                ..
+            }) = args.first()
+        {
+            return Some(s.trim().to_string());
         }
         None
     }
@@ -2121,7 +2094,10 @@ impl<'a> FunctionChecker<'a> {
         for stmt in &block.stmts {
             self.check_stmt(stmt);
             // Stop after a terminating statement to avoid cascading linear errors.
-            if matches!(stmt, Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. }) {
+            if matches!(
+                stmt,
+                Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. }
+            ) {
                 terminated = true;
                 break;
             }
@@ -2144,7 +2120,12 @@ impl<'a> FunctionChecker<'a> {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, ty, init, span } => {
+            Stmt::Let {
+                name,
+                ty,
+                init,
+                span,
+            } => {
                 let resolved_annot = ty
                     .as_ref()
                     .and_then(|annot| resolve_type(annot, self.defs, self.diags));
@@ -2185,11 +2166,7 @@ impl<'a> FunctionChecker<'a> {
                     trait_obj,
                     mutable: true,
                     class,
-                    state: if class == TypeClass::Linear {
-                        LinearState::Alive
-                    } else {
-                        LinearState::Alive
-                    },
+                    state: LinearState::Alive,
                     borrowed_shared: 0,
                     borrowed_mut: 0,
                     view_of: None,
@@ -2207,15 +2184,13 @@ impl<'a> FunctionChecker<'a> {
                                 } else {
                                     base.borrowed_mut += 1;
                                 }
+                            } else if base.borrowed_mut > 0 {
+                                self.diags.push(
+                                    "shared borrow conflicts with mutable borrow",
+                                    Some(span.clone()),
+                                );
                             } else {
-                                if base.borrowed_mut > 0 {
-                                    self.diags.push(
-                                        "shared borrow conflicts with mutable borrow",
-                                        Some(span.clone()),
-                                    );
-                                } else {
-                                    base.borrowed_shared += 1;
-                                }
+                                base.borrowed_shared += 1;
                             }
                         }
                         info.view_of = Some(borrow.base);
@@ -2229,7 +2204,12 @@ impl<'a> FunctionChecker<'a> {
                 }
                 self.env.declare(name.clone(), info);
             }
-            Stmt::Const { name, ty, init, span } => {
+            Stmt::Const {
+                name,
+                ty,
+                init,
+                span,
+            } => {
                 let resolved_annot = ty
                     .as_ref()
                     .and_then(|annot| resolve_type(annot, self.defs, self.diags));
@@ -2273,11 +2253,7 @@ impl<'a> FunctionChecker<'a> {
                     trait_obj,
                     mutable: false,
                     class,
-                    state: if class == TypeClass::Linear {
-                        LinearState::Alive
-                    } else {
-                        LinearState::Alive
-                    },
+                    state: LinearState::Alive,
                     borrowed_shared: 0,
                     borrowed_mut: 0,
                     view_of: None,
@@ -2311,10 +2287,8 @@ impl<'a> FunctionChecker<'a> {
                         let can_promote = matches!(value.kind, ExprKind::Int(_))
                             && promote_int_types(&target_ty, &value_ty).is_some();
                         if !type_eq(&target_ty, &value_ty) && !can_promote {
-                            self.diags.push(
-                                "assignment type mismatch",
-                                Some(span.clone()),
-                            );
+                            self.diags
+                                .push("assignment type mismatch", Some(span.clone()));
                         }
                     }
                     AssignOp::AddAssign
@@ -2334,10 +2308,8 @@ impl<'a> FunctionChecker<'a> {
                         } else if lhs_int && rhs_int {
                             // allow mixed integer widths/signs via explicit assignment target cast
                         } else if !type_eq(&target_ty, &value_ty) {
-                            self.diags.push(
-                                "compound assignment type mismatch",
-                                Some(span.clone()),
-                            );
+                            self.diags
+                                .push("compound assignment type mismatch", Some(span.clone()));
                         }
                     }
                     AssignOp::BitAndAssign
@@ -2353,12 +2325,11 @@ impl<'a> FunctionChecker<'a> {
                         }
                     }
                 }
-                if let Some(name) = target_name {
-                    if let Some(var) = self.env.vars.get_mut(&name) {
-                        if var.class == TypeClass::Linear {
-                            var.state = LinearState::Alive;
-                        }
-                    }
+                if let Some(name) = target_name
+                    && let Some(var) = self.env.vars.get_mut(&name)
+                    && var.class == TypeClass::Linear
+                {
+                    var.state = LinearState::Alive;
                 }
             }
             Stmt::Expr { expr, .. } => {
@@ -2388,14 +2359,11 @@ impl<'a> FunctionChecker<'a> {
                         .rev()
                         .any(|name| name.as_ref() == Some(want));
                     if !found {
-                        self.diags.push(
-                            format!("unknown loop label `{}`", want),
-                            Some(span.clone()),
-                        );
+                        self.diags
+                            .push(format!("unknown loop label `{}`", want), Some(span.clone()));
                     }
                 } else if self.loop_labels.is_empty() {
-                    self.diags
-                        .push("break outside loop", Some(span.clone()));
+                    self.diags.push("break outside loop", Some(span.clone()));
                 }
             }
             Stmt::Continue { label, span } => {
@@ -2406,23 +2374,26 @@ impl<'a> FunctionChecker<'a> {
                         .rev()
                         .any(|name| name.as_ref() == Some(want));
                     if !found {
-                        self.diags.push(
-                            format!("unknown loop label `{}`", want),
-                            Some(span.clone()),
-                        );
+                        self.diags
+                            .push(format!("unknown loop label `{}`", want), Some(span.clone()));
                     }
                 } else if self.loop_labels.is_empty() {
-                    self.diags
-                        .push("continue outside loop", Some(span.clone()));
+                    self.diags.push("continue outside loop", Some(span.clone()));
                 }
             }
-            Stmt::While { label, cond, body, span } => {
+            Stmt::While {
+                label,
+                cond,
+                body,
+                span,
+            } => {
                 let cond_res = match self.check_expr(cond) {
                     Some(res) => res.ty,
                     None => return,
                 };
                 if !type_eq(&cond_res, &Type::Builtin(BuiltinType::Bool)) {
-                    self.diags.push("while condition must be bool", Some(span.clone()));
+                    self.diags
+                        .push("while condition must be bool", Some(span.clone()));
                 }
                 self.loop_labels.push(label.clone());
                 let _ = self.check_block(body);
@@ -2538,32 +2509,32 @@ impl<'a> FunctionChecker<'a> {
                     &iter_ty_for_guard,
                     Type::Ref(inner) | Type::MutRef(inner) if matches!(inner.as_ref(), Type::Map(_, _))
                 );
-                if iter_is_map_ref {
-                    if let ExprKind::Borrow { is_mut, expr: inner } = &iter.kind {
-                        if let Some(base) = self.borrow_base_ident(inner) {
-                            if let Some(base_info) = self.env.vars.get_mut(&base) {
-                                if *is_mut {
-                                    if base_info.borrowed_shared > 0 || base_info.borrowed_mut > 0
-                                    {
-                                        self.diags.push(
-                                            "mutable borrow conflicts with existing borrows",
-                                            Some(iter.span.clone()),
-                                        );
-                                    } else {
-                                        base_info.borrowed_mut += 1;
-                                        iter_borrow_guard = Some((base, true));
-                                    }
-                                } else if base_info.borrowed_mut > 0 {
-                                    self.diags.push(
-                                        "shared borrow conflicts with mutable borrow",
-                                        Some(iter.span.clone()),
-                                    );
-                                } else {
-                                    base_info.borrowed_shared += 1;
-                                    iter_borrow_guard = Some((base, false));
-                                }
-                            }
+                if iter_is_map_ref
+                    && let ExprKind::Borrow {
+                        is_mut,
+                        expr: inner,
+                    } = &iter.kind
+                    && let Some(base) = self.borrow_base_ident(inner)
+                    && let Some(base_info) = self.env.vars.get_mut(&base)
+                {
+                    if *is_mut {
+                        if base_info.borrowed_shared > 0 || base_info.borrowed_mut > 0 {
+                            self.diags.push(
+                                "mutable borrow conflicts with existing borrows",
+                                Some(iter.span.clone()),
+                            );
+                        } else {
+                            base_info.borrowed_mut += 1;
+                            iter_borrow_guard = Some((base, true));
                         }
+                    } else if base_info.borrowed_mut > 0 {
+                        self.diags.push(
+                            "shared borrow conflicts with mutable borrow",
+                            Some(iter.span.clone()),
+                        );
+                    } else {
+                        base_info.borrowed_shared += 1;
+                        iter_borrow_guard = Some((base, false));
                     }
                 }
                 self.env.enter_scope();
@@ -2606,14 +2577,13 @@ impl<'a> FunctionChecker<'a> {
                 self.check_block(body);
                 self.loop_labels.pop();
                 self.drop_scope();
-                if let Some((base, is_mut)) = iter_borrow_guard {
-                    if let Some(base_info) = self.env.vars.get_mut(&base) {
-                        if is_mut {
-                            base_info.borrowed_mut = base_info.borrowed_mut.saturating_sub(1);
-                        } else {
-                            base_info.borrowed_shared =
-                                base_info.borrowed_shared.saturating_sub(1);
-                        }
+                if let Some((base, is_mut)) = iter_borrow_guard
+                    && let Some(base_info) = self.env.vars.get_mut(&base)
+                {
+                    if is_mut {
+                        base_info.borrowed_mut = base_info.borrowed_mut.saturating_sub(1);
+                    } else {
+                        base_info.borrowed_shared = base_info.borrowed_shared.saturating_sub(1);
                     }
                 }
             }
@@ -2635,17 +2605,18 @@ impl<'a> FunctionChecker<'a> {
                     Some(res) => res,
                     None => return,
                 };
-                if start_res.ty.is_integer() && end_res.ty.is_integer() {
-                    if !type_eq(&start_res.ty, &end_res.ty) {
-                        if matches!(start.kind, ExprKind::Int(_)) {
-                            if let Some(coerced) = self.check_expr_expected(start, &end_res.ty) {
-                                start_res = coerced;
-                            }
-                        } else if matches!(end.kind, ExprKind::Int(_)) {
-                            if let Some(coerced) = self.check_expr_expected(end, &start_res.ty) {
-                                end_res = coerced;
-                            }
+                if start_res.ty.is_integer()
+                    && end_res.ty.is_integer()
+                    && !type_eq(&start_res.ty, &end_res.ty)
+                {
+                    if matches!(start.kind, ExprKind::Int(_)) {
+                        if let Some(coerced) = self.check_expr_expected(start, &end_res.ty) {
+                            start_res = coerced;
                         }
+                    } else if matches!(end.kind, ExprKind::Int(_))
+                        && let Some(coerced) = self.check_expr_expected(end, &start_res.ty)
+                    {
+                        end_res = coerced;
                     }
                 }
                 let start_ty = start_res.ty;
@@ -2716,7 +2687,8 @@ impl<'a> FunctionChecker<'a> {
                             let elem_ty = match chan_res {
                                 Type::Chan(inner) => *inner,
                                 _ => {
-                                    self.diags.push("recv expects chan[T]", Some(arm.span.clone()));
+                                    self.diags
+                                        .push("recv expects chan[T]", Some(arm.span.clone()));
                                     continue;
                                 }
                             };
@@ -2774,12 +2746,12 @@ impl<'a> FunctionChecker<'a> {
             }
             Stmt::Go { expr, span } => {
                 match &expr.kind {
-                    ExprKind::Call { callee, type_args, .. } => {
+                    ExprKind::Call {
+                        callee, type_args, ..
+                    } => {
                         if !type_args.is_empty() {
-                            self.diags.push(
-                                "go does not accept type arguments",
-                                Some(span.clone()),
-                            );
+                            self.diags
+                                .push("go does not accept type arguments", Some(span.clone()));
                         }
                         if let ExprKind::Ident(name) = &callee.kind {
                             if name == "make_chan" {
@@ -2816,11 +2788,12 @@ impl<'a> FunctionChecker<'a> {
                 if !matches!(callee.kind, ExprKind::Ident(_)) {
                     self.diags
                         .push("defer expects a direct call", Some(span.clone()));
-                } else if let ExprKind::Ident(name) = &callee.kind {
-                    if !self.funcs.contains_key(name) && !is_intrinsic_name(name) {
-                        self.diags
-                            .push("defer expects a direct call", Some(span.clone()));
-                    }
+                } else if let ExprKind::Ident(name) = &callee.kind
+                    && !self.funcs.contains_key(name)
+                    && !is_intrinsic_name(name)
+                {
+                    self.diags
+                        .push("defer expects a direct call", Some(span.clone()));
                 }
                 let _ = self.check_expr(expr);
             }
@@ -2836,21 +2809,25 @@ impl<'a> FunctionChecker<'a> {
     }
 
     fn check_expr_expected(&mut self, expr: &Expr, expected: &Type) -> Option<ExprResult> {
-        if let ExprKind::Call { callee, type_args, args } = &expr.kind {
-            if type_args.is_empty() {
-                if let ExprKind::Field { base, name: variant } = &callee.kind {
-                    if let ExprKind::Ident(enum_name) = &base.kind {
-                        if enum_name == "Result" || enum_name == "result" {
-                            if let Some(res) =
-                                self.check_result_ctor(variant, type_args, args, &expr.span, Some(expected))
-                            {
-                                return self.record_expr(expr, res);
-                            }
-                            return None;
-                        }
-                    }
-                }
+        if let ExprKind::Call {
+            callee,
+            type_args,
+            args,
+        } = &expr.kind
+            && type_args.is_empty()
+            && let ExprKind::Field {
+                base,
+                name: variant,
+            } = &callee.kind
+            && let ExprKind::Ident(enum_name) = &base.kind
+            && (enum_name == "Result" || enum_name == "result")
+        {
+            if let Some(res) =
+                self.check_result_ctor(variant, type_args, args, &expr.span, Some(expected))
+            {
+                return self.record_expr(expr, res);
             }
+            return None;
         }
 
         self.check_expr_with_mode(expr, true, Some(expected))
@@ -2862,12 +2839,7 @@ impl<'a> FunctionChecker<'a> {
     }
 
     fn closure_captures(&self, params: &[ClosureParam], body: &BlockOrExpr) -> Vec<String> {
-        let enclosing = self
-            .env
-            .vars
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
+        let enclosing = self.env.vars.keys().cloned().collect::<HashSet<_>>();
         collect_closure_captures(params, body, &enclosing)
     }
 
@@ -2947,7 +2919,8 @@ impl<'a> FunctionChecker<'a> {
             Pattern::Wildcard => {}
             Pattern::Bool(_) => {
                 if !type_eq(scrut_ty, &Type::Builtin(BuiltinType::Bool)) {
-                    self.diags.push("match pattern expects bool", Some(span.clone()));
+                    self.diags
+                        .push("match pattern expects bool", Some(span.clone()));
                 }
             }
             Pattern::Int(_) => {
@@ -2962,7 +2935,8 @@ impl<'a> FunctionChecker<'a> {
                     )
                 );
                 if !ok {
-                    self.diags.push("match pattern expects integer", Some(span.clone()));
+                    self.diags
+                        .push("match pattern expects integer", Some(span.clone()));
                 }
             }
             Pattern::Ident(name) => {
@@ -2970,8 +2944,10 @@ impl<'a> FunctionChecker<'a> {
             }
             Pattern::Or(patterns) => {
                 if patterns.is_empty() {
-                    self.diags
-                        .push("or-pattern must contain at least one alternative", Some(span.clone()));
+                    self.diags.push(
+                        "or-pattern must contain at least one alternative",
+                        Some(span.clone()),
+                    );
                     return;
                 }
                 let mut canonical_binds: Option<HashMap<String, Type>> = None;
@@ -3039,31 +3015,36 @@ impl<'a> FunctionChecker<'a> {
                         }
                     };
                     if binds.len() != 1 {
-                        self.diags.push("enum pattern arity mismatch", Some(span.clone()));
+                        self.diags
+                            .push("enum pattern arity mismatch", Some(span.clone()));
                     }
-                    if let Some(bind) = binds.get(0) {
-                        if bind != "_" {
-                            self.declare_pattern_binding(bind, field_ty);
-                        }
+                    if let Some(bind) = binds.first()
+                        && bind != "_"
+                    {
+                        self.declare_pattern_binding(bind, field_ty);
                     }
                     return;
                 }
                 let scrut_name = match scrut_ty {
                     Type::Named(name) => name.clone(),
                     _ => {
-                        self.diags.push("enum pattern expects enum type", Some(span.clone()));
+                        self.diags
+                            .push("enum pattern expects enum type", Some(span.clone()));
                         return;
                     }
                 };
                 if scrut_name != *enum_name {
-                    self.diags
-                        .push("enum pattern does not match scrutinee type", Some(span.clone()));
+                    self.diags.push(
+                        "enum pattern does not match scrutinee type",
+                        Some(span.clone()),
+                    );
                     return;
                 }
                 let def = match self.defs.get(&scrut_name) {
                     Some(TypeDefKind::Enum(def)) => def,
                     _ => {
-                        self.diags.push("enum pattern expects enum type", Some(span.clone()));
+                        self.diags
+                            .push("enum pattern expects enum type", Some(span.clone()));
                         return;
                     }
                 };
@@ -3086,13 +3067,14 @@ impl<'a> FunctionChecker<'a> {
                     }
                 };
                 if binds.len() != fields.len() {
-                    self.diags.push("enum pattern arity mismatch", Some(span.clone()));
+                    self.diags
+                        .push("enum pattern arity mismatch", Some(span.clone()));
                 }
                 for (idx, field_ty) in fields.iter().enumerate() {
-                    if let Some(bind) = binds.get(idx) {
-                        if bind != "_" {
-                            self.declare_pattern_binding(bind, field_ty.clone());
-                        }
+                    if let Some(bind) = binds.get(idx)
+                        && bind != "_"
+                    {
+                        self.declare_pattern_binding(bind, field_ty.clone());
                     }
                 }
             }
@@ -3143,7 +3125,7 @@ impl<'a> FunctionChecker<'a> {
                     };
                     let current_ok = ok_ty.get_or_insert_with(|| res.ty.clone()).clone();
                     let _ = err_ty
-                        .get_or_insert_with(|| Type::Builtin(BuiltinType::Error))
+                        .get_or_insert(Type::Builtin(BuiltinType::Error))
                         .clone();
                     if view_arg_not_allowed(self.defs, &res.ty, &current_ok) {
                         self.diags.push(
@@ -3171,7 +3153,9 @@ impl<'a> FunctionChecker<'a> {
                     } else {
                         self.check_expr(arg)?
                     };
-                    let _ = ok_ty.get_or_insert(Type::Builtin(BuiltinType::Unit)).clone();
+                    let _ = ok_ty
+                        .get_or_insert(Type::Builtin(BuiltinType::Unit))
+                        .clone();
                     let current_err = err_ty.get_or_insert_with(|| res.ty.clone()).clone();
                     if view_arg_not_allowed(self.defs, &res.ty, &current_err) {
                         self.diags.push(
@@ -3222,7 +3206,9 @@ impl<'a> FunctionChecker<'a> {
 
         if arms.iter().any(|arm| {
             arm.guard.is_none()
-                && pattern_contains(&arm.pattern, &|p| matches!(p, Pattern::Wildcard | Pattern::Ident(_)))
+                && pattern_contains(&arm.pattern, &|p| {
+                    matches!(p, Pattern::Wildcard | Pattern::Ident(_))
+                })
         }) {
             return true;
         }
@@ -3321,10 +3307,10 @@ impl<'a> FunctionChecker<'a> {
         if !is_intrinsic_name(callee_name) {
             return None;
         }
-        if let Some(msg) = intrinsic_internal_std_only_error(callee_name) {
-            if !self.is_std {
-                self.diags.push(msg, Some(span.clone()));
-            }
+        if let Some(msg) = intrinsic_internal_std_only_error(callee_name)
+            && !self.is_std
+        {
+            self.diags.push(msg, Some(span.clone()));
         }
         if let Some(msg) = intrinsic_type_args_error(callee_name, type_args.len()) {
             self.diags.push(msg, Some(span.clone()));
@@ -3377,8 +3363,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_println does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_println does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 for arg in args {
                     let res = self.check_expr(arg)?;
@@ -3394,8 +3382,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "string_len" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("string_len does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "string_len does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -3414,8 +3404,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "string_get" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("string_get does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "string_get does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
                     self.diags
@@ -3424,11 +3416,12 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let s = self.check_expr(&args[0])?;
                 if !type_eq(&s.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("string_get expects string as first argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "string_get expects string as first argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
-                let idx = self
-                    .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?;
+                let idx = self.check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?;
                 if !matches!(idx.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("string_get expects i64 index", Some(args[1].span.clone()));
@@ -3440,8 +3433,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "string_slice" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("string_slice does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "string_slice does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 3 {
                     self.diags
@@ -3450,13 +3445,13 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let s = self.check_expr(&args[0])?;
                 if !type_eq(&s.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("string_slice expects string as first argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "string_slice expects string as first argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
-                let start = self
-                    .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?;
-                let len = self
-                    .check_expr_expected(&args[2], &Type::Builtin(BuiltinType::I64))?;
+                let start = self.check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?;
+                let len = self.check_expr_expected(&args[2], &Type::Builtin(BuiltinType::I64))?;
                 if !matches!(start.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("string_slice expects i64 start", Some(args[1].span.clone()));
@@ -3472,8 +3467,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "string_concat" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("string_concat does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "string_concat does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
                     self.diags
@@ -3495,8 +3492,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "string_from_byte" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("string_from_byte does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "string_from_byte does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -3505,8 +3504,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let b = self.check_expr(&args[0])?;
                 if !matches!(b.ty, Type::Builtin(BuiltinType::I32 | BuiltinType::I64)) {
-                    self.diags
-                        .push("string_from_byte expects i32 byte value", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "string_from_byte expects i32 byte value",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::String),
@@ -3528,8 +3529,10 @@ impl<'a> FunctionChecker<'a> {
                         .push("asm template must be string", Some(args[0].span.clone()));
                 }
                 if !matches!(args[0].kind, ExprKind::String(_)) {
-                    self.diags
-                        .push("asm template must be string literal", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "asm template must be string literal",
+                        Some(args[0].span.clone()),
+                    );
                 }
 
                 let mut constraint_lit: Option<String> = None;
@@ -3554,7 +3557,8 @@ impl<'a> FunctionChecker<'a> {
                 for arg in args.iter().skip(operand_start) {
                     let res = self.check_expr(arg)?;
                     if res.ty == Type::Builtin(BuiltinType::Unit) {
-                        self.diags.push("asm operands cannot be unit", Some(arg.span.clone()));
+                        self.diags
+                            .push("asm operands cannot be unit", Some(arg.span.clone()));
                     }
                     operand_results.push(res.ty);
                 }
@@ -3579,29 +3583,17 @@ impl<'a> FunctionChecker<'a> {
                         if spec.outputs.is_empty() {
                             Type::Builtin(BuiltinType::I64)
                         } else if spec.outputs.len() == 1 {
-                            if explicit_style {
+                            if explicit_style || spec.readwrite_outputs > 0 {
                                 operand_results
-                                    .get(0)
-                                    .cloned()
-                                    .unwrap_or(Type::Builtin(BuiltinType::I64))
-                            } else if spec.readwrite_outputs > 0 {
-                                operand_results
-                                    .get(0)
+                                    .first()
                                     .cloned()
                                     .unwrap_or(Type::Builtin(BuiltinType::I64))
                             } else {
                                 Type::Builtin(BuiltinType::I64)
                             }
-                        } else if explicit_style {
-                            Type::Tuple(
-                                operand_results
-                                    .iter()
-                                    .take(spec.outputs.len())
-                                    .cloned()
-                                    .collect(),
-                            )
-                        } else if spec.readwrite_outputs == spec.outputs.len()
-                            && operand_results.len() >= spec.outputs.len()
+                        } else if explicit_style
+                            || (spec.readwrite_outputs == spec.outputs.len()
+                                && operand_results.len() >= spec.outputs.len())
                         {
                             Type::Tuple(
                                 operand_results
@@ -3652,8 +3644,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let res = self.check_expr(&args[0])?;
                 if !type_eq(&res.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("asm_label expects string argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "asm_label expects string argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 let label = match &args[0].kind {
                     ExprKind::String(s) => s.trim().to_string(),
@@ -3680,8 +3674,10 @@ impl<'a> FunctionChecker<'a> {
             "asm_goto" => {
                 self.require_unsafe_operation(span, "inline asm goto");
                 if type_args.len() > 1 {
-                    self.diags
-                        .push("asm_goto expects at most 1 type argument", Some(span.clone()));
+                    self.diags.push(
+                        "asm_goto expects at most 1 type argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 if args.len() < 3 {
@@ -3745,10 +3741,8 @@ impl<'a> FunctionChecker<'a> {
                 for arg in args.iter().skip(3) {
                     let res = self.check_expr(arg)?;
                     if res.ty == Type::Builtin(BuiltinType::Unit) {
-                        self.diags.push(
-                            "asm_goto operands cannot be unit",
-                            Some(arg.span.clone()),
-                        );
+                        self.diags
+                            .push("asm_goto operands cannot be unit", Some(arg.span.clone()));
                     }
                     operand_results.push(res.ty);
                 }
@@ -3772,29 +3766,17 @@ impl<'a> FunctionChecker<'a> {
                 } else if spec.outputs.is_empty() {
                     Type::Builtin(BuiltinType::Unit)
                 } else if spec.outputs.len() == 1 {
-                    if explicit_style {
+                    if explicit_style || spec.readwrite_outputs > 0 {
                         operand_results
-                            .get(0)
-                            .cloned()
-                            .unwrap_or(Type::Builtin(BuiltinType::I64))
-                    } else if spec.readwrite_outputs > 0 {
-                        operand_results
-                            .get(0)
+                            .first()
                             .cloned()
                             .unwrap_or(Type::Builtin(BuiltinType::I64))
                     } else {
                         Type::Builtin(BuiltinType::I64)
                     }
-                } else if explicit_style {
-                    Type::Tuple(
-                        operand_results
-                            .iter()
-                            .take(spec.outputs.len())
-                            .cloned()
-                            .collect(),
-                    )
-                } else if spec.readwrite_outputs == spec.outputs.len()
-                    && operand_results.len() >= spec.outputs.len()
+                } else if explicit_style
+                    || (spec.readwrite_outputs == spec.outputs.len()
+                        && operand_results.len() >= spec.outputs.len())
                 {
                     Type::Tuple(
                         operand_results
@@ -3827,14 +3809,16 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_error_new does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_error_new does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
                         .push("__gost_error_new expects 1 argument", Some(span.clone()));
                 }
-                if let Some(arg) = args.get(0) {
+                if let Some(arg) = args.first() {
                     let res = self.check_expr(arg)?;
                     if !type_eq(&res.ty, &Type::Builtin(BuiltinType::String)) {
                         self.diags
@@ -3860,16 +3844,16 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if args.len() != 1 {
-                    self.diags
-                        .push("__gost_error_message expects 1 argument", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_error_message expects 1 argument",
+                        Some(span.clone()),
+                    );
                 }
-                if let Some(arg) = args.get(0) {
+                if let Some(arg) = args.first() {
                     let res = self.check_expr(arg)?;
                     if !type_eq(&res.ty, &Type::Builtin(BuiltinType::Error)) {
-                        self.diags.push(
-                            "__gost_error_message expects error",
-                            Some(arg.span.clone()),
-                        );
+                        self.diags
+                            .push("__gost_error_message expects error", Some(arg.span.clone()));
                     }
                 }
                 return Some(ExprResult {
@@ -3885,18 +3869,24 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_singleton_acquire does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_singleton_acquire does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
-                    self.diags
-                        .push("__gost_singleton_acquire expects 1 argument", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_singleton_acquire expects 1 argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_singleton_acquire expects string name", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_singleton_acquire expects string name",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -3905,8 +3895,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "__gost_now_ms" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_now_ms does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_now_ms does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if !args.is_empty() {
                     self.diags
@@ -3919,8 +3911,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "__gost_process_exit" => {
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_process_exit does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_process_exit does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -3931,8 +3925,10 @@ impl<'a> FunctionChecker<'a> {
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::I32))
                     && !type_eq(&a0.ty, &Type::Builtin(BuiltinType::I64))
                 {
-                    self.diags
-                        .push("__gost_process_exit expects i32 or i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_process_exit expects i32 or i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -3953,10 +3949,8 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !args.is_empty() {
-                    self.diags.push(
-                        "__gost_sync_* expects 0 arguments",
-                        Some(span.clone()),
-                    );
+                    self.diags
+                        .push("__gost_sync_* expects 0 arguments", Some(span.clone()));
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I64),
@@ -3987,8 +3981,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_sync_* expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_sync_* expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -4009,19 +4005,25 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if args.len() != 2 {
-                    self.diags
-                        .push("__gost_sync_waitgroup_add expects 2 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_sync_waitgroup_add expects 2 arguments",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
                 let a1 = self.check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I32))?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_sync_waitgroup_add expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_sync_waitgroup_add expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !matches!(a1.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_sync_waitgroup_add expects delta i32", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_sync_waitgroup_add expects delta i32",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -4036,19 +4038,26 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_last_status does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_last_status does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if !args.is_empty() {
-                    self.diags
-                        .push("__gost_os_last_status expects 0 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_last_status expects 0 arguments",
+                        Some(span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
                     borrow: None,
                 });
             }
-            "__gost_os_last_error" | "__gost_os_last_output" | "__gost_os_getwd" | "__gost_os_args" => {
+            "__gost_os_last_error"
+            | "__gost_os_last_output"
+            | "__gost_os_getwd"
+            | "__gost_os_args" => {
                 if !self.is_std {
                     self.diags.push(
                         "__gost_os_* is internal to the standard library",
@@ -4056,8 +4065,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if !args.is_empty() {
                     self.diags
@@ -4076,8 +4087,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -4086,8 +4099,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_os_* expects string argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_os_* expects string argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -4102,8 +4117,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -4112,8 +4129,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_os_* expects string argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_os_* expects string argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::String),
@@ -4128,8 +4147,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
                     self.diags
@@ -4139,12 +4160,16 @@ impl<'a> FunctionChecker<'a> {
                 let a0 = self.check_expr(&args[0])?;
                 let a1 = self.check_expr(&args[1])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_os_* expects string argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_os_* expects string argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !type_eq(&a1.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_os_* expects string argument", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_os_* expects string argument",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 let ret = if callee_name == "__gost_os_write_file" {
                     Type::Builtin(BuiltinType::I64)
@@ -4164,8 +4189,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_os_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_os_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -4174,8 +4201,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_os_* expects string argument", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_os_* expects string argument",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 let ret = if callee_name == "__gost_os_stat_size" {
                     Type::Builtin(BuiltinType::I64)
@@ -4195,12 +4224,16 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_last_status does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_last_status does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if !args.is_empty() {
-                    self.diags
-                        .push("__gost_net_last_status expects 0 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_last_status expects 0 arguments",
+                        Some(span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -4215,19 +4248,27 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_last_error does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_last_error does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if !args.is_empty() {
-                    self.diags
-                        .push("__gost_net_last_error expects 0 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_last_error expects 0 arguments",
+                        Some(span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::String),
                     borrow: None,
                 });
             }
-            "__gost_net_tcp_listen" | "__gost_net_tcp_connect" | "__gost_net_udp_bind" | "__gost_net_udp_connect" | "__gost_net_ws_connect" => {
+            "__gost_net_tcp_listen"
+            | "__gost_net_tcp_connect"
+            | "__gost_net_udp_bind"
+            | "__gost_net_udp_connect"
+            | "__gost_net_ws_connect" => {
                 if !self.is_std {
                     self.diags.push(
                         "__gost_net_* is internal to the standard library",
@@ -4235,8 +4276,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -4245,15 +4288,20 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !type_eq(&a0.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_net_* expects string address", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects string address",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I64),
                     borrow: None,
                 });
             }
-            "__gost_net_tcp_accept" | "__gost_net_tcp_close" | "__gost_net_udp_close" | "__gost_net_ws_close" => {
+            "__gost_net_tcp_accept"
+            | "__gost_net_tcp_close"
+            | "__gost_net_udp_close"
+            | "__gost_net_ws_close" => {
                 if !self.is_std {
                     self.diags.push(
                         "__gost_net_* is internal to the standard library",
@@ -4261,8 +4309,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
                     self.diags
@@ -4271,8 +4321,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_* expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 let ret = if callee_name == "__gost_net_tcp_accept" {
                     Type::Builtin(BuiltinType::I64)
@@ -4292,23 +4344,31 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_ws_send_text does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_send_text does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
-                    self.diags
-                        .push("__gost_net_ws_send_text expects 2 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_send_text expects 2 arguments",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
                 let a1 = self.check_expr(&args[1])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_ws_send_text expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_send_text expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !type_eq(&a1.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_net_ws_send_text expects string payload", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_send_text expects string payload",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I32),
@@ -4323,8 +4383,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
                     self.diags
@@ -4334,12 +4396,16 @@ impl<'a> FunctionChecker<'a> {
                 let a0 = self.check_expr(&args[0])?;
                 let a1 = self.check_expr(&args[1])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_* expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !type_eq(&a1.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_net_* expects string payload", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects string payload",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I64),
@@ -4354,28 +4420,38 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_udp_send_to does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_udp_send_to does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 3 {
-                    self.diags
-                        .push("__gost_net_udp_send_to expects 3 arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_udp_send_to expects 3 arguments",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
                 let a1 = self.check_expr(&args[1])?;
                 let a2 = self.check_expr(&args[2])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_udp_send_to expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_udp_send_to expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !type_eq(&a1.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_net_udp_send_to expects string address", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_net_udp_send_to expects string address",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 if !type_eq(&a2.ty, &Type::Builtin(BuiltinType::String)) {
-                    self.diags
-                        .push("__gost_net_udp_send_to expects string payload", Some(args[2].span.clone()));
+                    self.diags.push(
+                        "__gost_net_udp_send_to expects string payload",
+                        Some(args[2].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::I64),
@@ -4390,8 +4466,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_* does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_* does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 2 {
                     self.diags
@@ -4399,15 +4477,18 @@ impl<'a> FunctionChecker<'a> {
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
-                let a1 = self
-                    .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I32))?;
+                let a1 = self.check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I32))?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_* expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 if !matches!(a1.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_* expects i32 max length", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "__gost_net_* expects i32 max length",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::String),
@@ -4422,18 +4503,24 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_ws_recv_text does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_recv_text does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 if args.len() != 1 {
-                    self.diags
-                        .push("__gost_net_ws_recv_text expects 1 argument", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_recv_text expects 1 argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 let a0 = self.check_expr(&args[0])?;
                 if !matches!(a0.ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
-                    self.diags
-                        .push("__gost_net_ws_recv_text expects handle i64", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "__gost_net_ws_recv_text expects handle i64",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::String),
@@ -4448,8 +4535,10 @@ impl<'a> FunctionChecker<'a> {
                     );
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("__gost_net_http_request does not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "__gost_net_http_request does not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 let expected = if callee_name == "__gost_net_http_request_headers" {
                     5
@@ -4483,14 +4572,14 @@ impl<'a> FunctionChecker<'a> {
             }
             "iter" | "iter_mut" | "filter" | "map" => {
                 if !self.allow_iter_chain {
-                    self.diags.push(
-                        "iterator value cannot escape for-loop",
-                        Some(span.clone()),
-                    );
+                    self.diags
+                        .push("iterator value cannot escape for-loop", Some(span.clone()));
                 }
                 if !type_args.is_empty() {
-                    self.diags
-                        .push("iterator helpers do not take type arguments", Some(span.clone()));
+                    self.diags.push(
+                        "iterator helpers do not take type arguments",
+                        Some(span.clone()),
+                    );
                 }
                 match callee_name {
                     "iter" | "iter_mut" => {
@@ -4507,10 +4596,8 @@ impl<'a> FunctionChecker<'a> {
                                     (Type::Builtin(BuiltinType::U32), false)
                                 }
                                 _ => {
-                                    self.diags.push(
-                                        "iter expects &slice",
-                                        Some(args[0].span.clone()),
-                                    );
+                                    self.diags
+                                        .push("iter expects &slice", Some(args[0].span.clone()));
                                     return None;
                                 }
                             },
@@ -4528,15 +4615,14 @@ impl<'a> FunctionChecker<'a> {
                                 }
                             },
                             _ => {
-                                self.diags.push(
-                                    "iter expects &slice",
-                                    Some(args[0].span.clone()),
-                                );
+                                self.diags
+                                    .push("iter expects &slice", Some(args[0].span.clone()));
                                 return None;
                             }
                         };
                         if callee_name == "iter" && is_mut {
-                            self.diags.push("iter expects &slice", Some(args[0].span.clone()));
+                            self.diags
+                                .push("iter expects &slice", Some(args[0].span.clone()));
                         }
                         if callee_name == "iter_mut" && !is_mut {
                             self.diags
@@ -4562,10 +4648,8 @@ impl<'a> FunctionChecker<'a> {
                         let item_ty = match iter_ty {
                             Type::Iter(inner) => *inner,
                             _ => {
-                                self.diags.push(
-                                    "filter expects iterator",
-                                    Some(args[0].span.clone()),
-                                );
+                                self.diags
+                                    .push("filter expects iterator", Some(args[0].span.clone()));
                                 return None;
                             }
                         };
@@ -4579,23 +4663,21 @@ impl<'a> FunctionChecker<'a> {
                                 return None;
                             }
                         };
-                            let sig = match self.funcs.get(&pred_name) {
-                                Some(sig) => sig,
-                                None => {
-                                    self.diag_unknown_function(args[1].span.clone(), &pred_name);
-                                    return None;
-                                }
-                            };
+                        let sig = match self.funcs.get(&pred_name) {
+                            Some(sig) => sig,
+                            None => {
+                                self.diag_unknown_function(args[1].span.clone(), &pred_name);
+                                return None;
+                            }
+                        };
                         if sig.params.len() != 1 {
                             self.diags.push(
                                 "filter predicate must take one argument",
                                 Some(args[1].span.clone()),
                             );
                         } else if !type_eq(&sig.params[0], &item_ty) {
-                            self.diags.push(
-                                "filter predicate type mismatch",
-                                Some(args[1].span.clone()),
-                            );
+                            self.diags
+                                .push("filter predicate type mismatch", Some(args[1].span.clone()));
                         }
                         if !type_eq(&sig.ret, &Type::Builtin(BuiltinType::Bool)) {
                             self.diags.push(
@@ -4608,19 +4690,18 @@ impl<'a> FunctionChecker<'a> {
                             borrow: None,
                         });
                     }
-            "map" => {
-                if args.len() != 2 {
-                    self.diags.push("map expects two arguments", Some(span.clone()));
-                    return None;
-                }
+                    "map" => {
+                        if args.len() != 2 {
+                            self.diags
+                                .push("map expects two arguments", Some(span.clone()));
+                            return None;
+                        }
                         let iter_ty = self.check_expr_no_move(&args[0])?.ty;
                         let item_ty = match iter_ty {
                             Type::Iter(inner) => *inner,
                             _ => {
-                                self.diags.push(
-                                    "map expects iterator",
-                                    Some(args[0].span.clone()),
-                                );
+                                self.diags
+                                    .push("map expects iterator", Some(args[0].span.clone()));
                                 return None;
                             }
                         };
@@ -4647,10 +4728,8 @@ impl<'a> FunctionChecker<'a> {
                                 Some(args[1].span.clone()),
                             );
                         } else if !type_eq(&sig.params[0], &item_ty) {
-                            self.diags.push(
-                                "map function type mismatch",
-                                Some(args[1].span.clone()),
-                            );
+                            self.diags
+                                .push("map function type mismatch", Some(args[1].span.clone()));
                         }
                         return Some(ExprResult {
                             ty: Type::Iter(Box::new(sig.ret.clone())),
@@ -4748,17 +4827,11 @@ impl<'a> FunctionChecker<'a> {
                 let cap_ty = self
                     .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?
                     .ty;
-                if !matches!(
-                    len_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
+                if !matches!(len_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("make_slice expects i64 len", Some(args[0].span.clone()));
                 }
-                if !matches!(
-                    cap_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
+                if !matches!(cap_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("make_slice expects i64 cap", Some(args[1].span.clone()));
                 }
@@ -4794,8 +4867,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "slice_get_copy" => {
                 if type_args.len() != 1 {
-                    self.diags
-                        .push("slice_get_copy expects one type argument", Some(span.clone()));
+                    self.diags.push(
+                        "slice_get_copy expects one type argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 if args.len() != 2 {
@@ -4815,18 +4890,20 @@ impl<'a> FunctionChecker<'a> {
                 let idx_ty = self
                     .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?
                     .ty;
-                if !matches!(
-                    idx_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
-                    self.diags
-                        .push("slice_get_copy expects i64 index", Some(args[1].span.clone()));
+                if !matches!(idx_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
+                    self.diags.push(
+                        "slice_get_copy expects i64 index",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 if !self.defs.is_copy_type(&elem_ty) {
                     self.diags
                         .push("slice_get_copy requires Copy element", Some(span.clone()));
                 }
-                return Some(ExprResult { ty: elem_ty, borrow: None });
+                return Some(ExprResult {
+                    ty: elem_ty,
+                    borrow: None,
+                });
             }
             "slice_set" => {
                 if type_args.len() != 1 {
@@ -4851,10 +4928,7 @@ impl<'a> FunctionChecker<'a> {
                 let idx_ty = self
                     .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?
                     .ty;
-                if !matches!(
-                    idx_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
+                if !matches!(idx_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("slice_set expects i64 index", Some(args[1].span.clone()));
                 }
@@ -4892,10 +4966,7 @@ impl<'a> FunctionChecker<'a> {
                 let idx_ty = self
                     .check_expr_expected(&args[1], &Type::Builtin(BuiltinType::I64))?
                     .ty;
-                if !matches!(
-                    idx_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
+                if !matches!(idx_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("slice_ref expects i64 index", Some(args[1].span.clone()));
                 }
@@ -4932,8 +5003,10 @@ impl<'a> FunctionChecker<'a> {
                 }
                 let val_ty = self.check_expr(&args[1])?.ty;
                 if !type_eq(&val_ty, &elem_ty) {
-                    self.diags
-                        .push("slice_push expects element type", Some(args[1].span.clone()));
+                    self.diags.push(
+                        "slice_push expects element type",
+                        Some(args[1].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Builtin(BuiltinType::Unit),
@@ -4979,8 +5052,10 @@ impl<'a> FunctionChecker<'a> {
                 let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
                 let val_ty = self.check_expr(&args[0])?.ty;
                 if !type_eq(&val_ty, &elem_ty) {
-                    self.diags
-                        .push("shared_new expects element type", Some(args[0].span.clone()));
+                    self.diags.push(
+                        "shared_new expects element type",
+                        Some(args[0].span.clone()),
+                    );
                 }
                 return Some(ExprResult {
                     ty: Type::Shared(Box::new(elem_ty)),
@@ -5026,8 +5101,10 @@ impl<'a> FunctionChecker<'a> {
                     Type::Ref(inner) | Type::MutRef(inner)
                         if *inner == Type::Shared(Box::new(elem_ty.clone())) => {}
                     _ => {
-                        self.diags
-                            .push("shared_get expects ref shared[T]", Some(args[0].span.clone()));
+                        self.diags.push(
+                            "shared_get expects ref shared[T]",
+                            Some(args[0].span.clone()),
+                        );
                     }
                 }
                 let borrow = arg_res.borrow.map(|b| BorrowInfo {
@@ -5043,8 +5120,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "own_borrow" | "own_borrow_mut" => {
                 if type_args.len() != 1 {
-                    self.diags
-                        .push("handle intrinsic expects one type argument", Some(span.clone()));
+                    self.diags.push(
+                        "handle intrinsic expects one type argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 if args.len() != 1 {
@@ -5055,15 +5134,15 @@ impl<'a> FunctionChecker<'a> {
                 let elem_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
                 let arg_res = self.check_expr(&args[0])?;
                 match (&arg_res.ty, callee_name) {
-                    (Type::Ref(inner), "own_borrow")
-                    | (Type::MutRef(inner), "own_borrow")
+                    (Type::Ref(inner), "own_borrow") | (Type::MutRef(inner), "own_borrow")
                         if **inner == Type::Own(Box::new(elem_ty.clone())) => {}
                     (Type::MutRef(inner), "own_borrow_mut")
                         if **inner == Type::Own(Box::new(elem_ty.clone())) => {}
                     (Type::Ref(inner) | Type::MutRef(inner), "own_borrow_mut")
                         if matches!(inner.as_ref(), Type::Alias(_)) =>
                     {
-                        self.diags.push(DIAG_ALIAS_MUT_BORROW, Some(args[0].span.clone()));
+                        self.diags
+                            .push(DIAG_ALIAS_MUT_BORROW, Some(args[0].span.clone()));
                     }
                     _ => {
                         let msg = if callee_name == "own_borrow_mut" {
@@ -5109,8 +5188,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "alias_borrow" => {
                 if type_args.len() != 1 {
-                    self.diags
-                        .push("handle intrinsic expects one type argument", Some(span.clone()));
+                    self.diags.push(
+                        "handle intrinsic expects one type argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 if args.len() != 1 {
@@ -5124,8 +5205,10 @@ impl<'a> FunctionChecker<'a> {
                     Type::Ref(inner) | Type::MutRef(inner)
                         if *inner == Type::Alias(Box::new(elem_ty.clone())) => {}
                     _ => {
-                        self.diags
-                            .push("alias_borrow expects ref alias[T]", Some(args[0].span.clone()));
+                        self.diags.push(
+                            "alias_borrow expects ref alias[T]",
+                            Some(args[0].span.clone()),
+                        );
                     }
                 }
                 let borrow = arg_res.borrow.map(|b| BorrowInfo {
@@ -5139,8 +5222,10 @@ impl<'a> FunctionChecker<'a> {
             }
             "own_into_value" => {
                 if type_args.len() != 1 {
-                    self.diags
-                        .push("handle intrinsic expects one type argument", Some(span.clone()));
+                    self.diags.push(
+                        "handle intrinsic expects one type argument",
+                        Some(span.clone()),
+                    );
                     return None;
                 }
                 if args.len() != 1 {
@@ -5152,7 +5237,8 @@ impl<'a> FunctionChecker<'a> {
                 let arg_ty = self.check_expr(&args[0])?.ty;
                 if !matches!(&arg_ty, Type::Own(inner) if **inner == elem_ty) {
                     if matches!(arg_ty, Type::Alias(_)) {
-                        self.diags.push(DIAG_ALIAS_TO_OWN, Some(args[0].span.clone()));
+                        self.diags
+                            .push(DIAG_ALIAS_TO_OWN, Some(args[0].span.clone()));
                     } else {
                         self.diags
                             .push("own_into_value expects own[T]", Some(args[0].span.clone()));
@@ -5177,16 +5263,15 @@ impl<'a> FunctionChecker<'a> {
                 let key_ty = resolve_type(&type_args[0], self.defs, self.diags)?;
                 let val_ty = resolve_type(&type_args[1], self.defs, self.diags)?;
                 if !self.defs.can_be_map_key(&key_ty) {
-                    self.diags
-                        .push("map key type is not supported by runtime map", Some(span.clone()));
+                    self.diags.push(
+                        "map key type is not supported by runtime map",
+                        Some(span.clone()),
+                    );
                 }
                 let cap_ty = self
                     .check_expr_expected(&args[0], &Type::Builtin(BuiltinType::I64))?
                     .ty;
-                if !matches!(
-                    cap_ty,
-                    Type::Builtin(BuiltinType::I64 | BuiltinType::I32)
-                ) {
+                if !matches!(cap_ty, Type::Builtin(BuiltinType::I64 | BuiltinType::I32)) {
                     self.diags
                         .push("make_map expects i64 cap", Some(args[0].span.clone()));
                 }
@@ -5211,7 +5296,8 @@ impl<'a> FunctionChecker<'a> {
                 let map_ty = self.check_expr(&args[0])?.ty;
                 match map_ty {
                     Type::Ref(inner) | Type::MutRef(inner)
-                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                        if *inner
+                            == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
                     _ => {
                         self.diags
                             .push("map_get expects ref map[K,V]", Some(args[0].span.clone()));
@@ -5243,10 +5329,13 @@ impl<'a> FunctionChecker<'a> {
                 let map_ty = self.check_expr(&args[0])?.ty;
                 match map_ty {
                     Type::MutRef(inner)
-                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                        if *inner
+                            == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
                     _ => {
-                        self.diags
-                            .push("map_set expects mutref map[K,V]", Some(args[0].span.clone()));
+                        self.diags.push(
+                            "map_set expects mutref map[K,V]",
+                            Some(args[0].span.clone()),
+                        );
                     }
                 }
                 let arg_ty = self.check_expr(&args[1])?.ty;
@@ -5280,10 +5369,13 @@ impl<'a> FunctionChecker<'a> {
                 let map_ty = self.check_expr(&args[0])?.ty;
                 match map_ty {
                     Type::MutRef(inner)
-                        if *inner == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
+                        if *inner
+                            == Type::Map(Box::new(key_ty.clone()), Box::new(val_ty.clone())) => {}
                     _ => {
-                        self.diags
-                            .push("map_del expects mutref map[K,V]", Some(args[0].span.clone()));
+                        self.diags.push(
+                            "map_del expects mutref map[K,V]",
+                            Some(args[0].span.clone()),
+                        );
                     }
                 }
                 let arg_ty = self.check_expr(&args[1])?.ty;
@@ -5349,12 +5441,12 @@ impl<'a> FunctionChecker<'a> {
     }
 
     fn can_borrow_mut(&self, expr: &Expr) -> bool {
-        if let Some(base) = self.borrow_base_ident(expr) {
-            if let Some(info) = self.env.vars.get(&base) {
-                // if the base is a shared view, don't allow &mut
-                if info.view_of.is_some() && !info.view_is_mut {
-                    return false;
-                }
+        if let Some(base) = self.borrow_base_ident(expr)
+            && let Some(info) = self.env.vars.get(&base)
+        {
+            // if the base is a shared view, don't allow &mut
+            if info.view_of.is_some() && !info.view_is_mut {
+                return false;
             }
         }
         true
@@ -5369,36 +5461,34 @@ impl<'a> FunctionChecker<'a> {
             }
             ExprKind::Field { base, name } => {
                 let base_res = self.check_expr_no_move(base)?;
-                if let Type::Named(type_name) = base_res.ty {
-                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
-                        if let Some(field) =
-                            def.fields.iter().find(|field| field.name == *name)
-                        {
-                            if !self.can_access_struct_field(&type_name, field) {
-                                self.diag_private_field(&expr.span, &type_name, name);
-                                return None;
-                            }
-                            let base_name = self.borrow_base_ident(base);
-                            return Some((field.ty.clone(), base_name));
+                if let Type::Named(type_name) = base_res.ty
+                    && let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name)
+                {
+                    if let Some(field) = def.fields.iter().find(|field| field.name == *name) {
+                        if !self.can_access_struct_field(&type_name, field) {
+                            self.diag_private_field(&expr.span, &type_name, name);
+                            return None;
                         }
-                        let mut d = Diagnostic::new(
-                            format!("unknown field `{}` on `{}`", name, type_name),
-                            Some(expr.span.clone()),
-                        )
-                        .code(E_UNKNOWN_FIELD)
-                        .label(expr.span.clone(), format!("unknown field `{}`", name))
-                        .note("field names are case-sensitive");
-                        let candidates = def
-                            .fields
-                            .iter()
-                            .map(|field| field.name.clone())
-                            .collect::<Vec<_>>();
-                        if let Some(h) = suggest::did_you_mean(name, candidates) {
-                            d = d.help(h);
-                        }
-                        self.diags.push_diag(d);
-                        return None;
+                        let base_name = self.borrow_base_ident(base);
+                        return Some((field.ty.clone(), base_name));
                     }
+                    let mut d = Diagnostic::new(
+                        format!("unknown field `{}` on `{}`", name, type_name),
+                        Some(expr.span.clone()),
+                    )
+                    .code(E_UNKNOWN_FIELD)
+                    .label(expr.span.clone(), format!("unknown field `{}`", name))
+                    .note("field names are case-sensitive");
+                    let candidates = def
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(h) = suggest::did_you_mean(name, candidates) {
+                        d = d.help(h);
+                    }
+                    self.diags.push_diag(d);
+                    return None;
                 }
                 None
             }
@@ -5411,7 +5501,8 @@ impl<'a> FunctionChecker<'a> {
                         Some((elem, base_name))
                     }
                     None => {
-                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        self.diags
+                            .push("indexing expects a slice", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -5420,11 +5511,10 @@ impl<'a> FunctionChecker<'a> {
                 let inner_res = self.check_expr_no_move(inner)?;
                 let base_name = self.borrow_base_ident(inner);
                 match inner_res.ty {
-                    Type::Ref(inner_ty) | Type::MutRef(inner_ty) => {
-                        Some((*inner_ty, base_name))
-                    }
+                    Type::Ref(inner_ty) | Type::MutRef(inner_ty) => Some((*inner_ty, base_name)),
                     _ => {
-                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        self.diags
+                            .push("deref expects ref type", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -5488,35 +5578,33 @@ impl<'a> FunctionChecker<'a> {
             }
             ExprKind::Field { base, name } => {
                 let base_res = self.check_expr_no_move(base)?;
-                if let Type::Named(type_name) = base_res.ty {
-                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
-                        if let Some(field) =
-                            def.fields.iter().find(|field| field.name == *name)
-                        {
-                            if !self.can_access_struct_field(&type_name, field) {
-                                self.diag_private_field(&expr.span, &type_name, name);
-                                return None;
-                            }
-                            return Some(field.ty.clone());
+                if let Type::Named(type_name) = base_res.ty
+                    && let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name)
+                {
+                    if let Some(field) = def.fields.iter().find(|field| field.name == *name) {
+                        if !self.can_access_struct_field(&type_name, field) {
+                            self.diag_private_field(&expr.span, &type_name, name);
+                            return None;
                         }
-                        let mut d = Diagnostic::new(
-                            format!("unknown field `{}` on `{}`", name, type_name),
-                            Some(expr.span.clone()),
-                        )
-                        .code(E_UNKNOWN_FIELD)
-                        .label(expr.span.clone(), format!("unknown field `{}`", name))
-                        .note("field names are case-sensitive");
-                        let candidates = def
-                            .fields
-                            .iter()
-                            .map(|field| field.name.clone())
-                            .collect::<Vec<_>>();
-                        if let Some(h) = suggest::did_you_mean(name, candidates) {
-                            d = d.help(h);
-                        }
-                        self.diags.push_diag(d);
-                        return None;
+                        return Some(field.ty.clone());
                     }
+                    let mut d = Diagnostic::new(
+                        format!("unknown field `{}` on `{}`", name, type_name),
+                        Some(expr.span.clone()),
+                    )
+                    .code(E_UNKNOWN_FIELD)
+                    .label(expr.span.clone(), format!("unknown field `{}`", name))
+                    .note("field names are case-sensitive");
+                    let candidates = def
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(h) = suggest::did_you_mean(name, candidates) {
+                        d = d.help(h);
+                    }
+                    self.diags.push_diag(d);
+                    return None;
                 }
                 None
             }
@@ -5526,7 +5614,8 @@ impl<'a> FunctionChecker<'a> {
                 match slice_like_elem_type(&base_res.ty) {
                     Some(elem) => Some(elem),
                     None => {
-                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        self.diags
+                            .push("indexing expects a slice", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -5536,14 +5625,17 @@ impl<'a> FunctionChecker<'a> {
                 match inner_res.ty {
                     Type::Ref(inner) | Type::MutRef(inner) => Some(*inner),
                     _ => {
-                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        self.diags
+                            .push("deref expects ref type", Some(expr.span.clone()));
                         None
                     }
                 }
             }
             _ => {
-                self.diags
-                    .push("assignment target must be addressable", Some(expr.span.clone()));
+                self.diags.push(
+                    "assignment target must be addressable",
+                    Some(expr.span.clone()),
+                );
                 None
             }
         }
@@ -5654,17 +5746,17 @@ impl<'a> FunctionChecker<'a> {
                             },
                         );
                     }
-                    if self.enforce_namespaced_only() {
-                        if let Some(alias) = self.namespaced_only_funcs.get(name) {
-                            self.diags.push(
-                                format!(
-                                    "`{}` is imported via `{}`; use `{}.{}(...)`",
-                                    name, alias, alias, name
-                                ),
-                                Some(expr.span.clone()),
-                            );
-                            return None;
-                        }
+                    if self.enforce_namespaced_only()
+                        && let Some(alias) = self.namespaced_only_funcs.get(name)
+                    {
+                        self.diags.push(
+                            format!(
+                                "`{}` is imported via `{}`; use `{}.{}(...)`",
+                                name, alias, alias, name
+                            ),
+                            Some(expr.span.clone()),
+                        );
+                        return None;
                     }
                     if let Some(sig) = self.funcs.get(name) {
                         return self.record_expr(
@@ -5697,8 +5789,7 @@ impl<'a> FunctionChecker<'a> {
                             },
                         );
                     }
-                    let mut candidates: Vec<String> =
-                        self.env.vars.keys().cloned().collect();
+                    let mut candidates: Vec<String> = self.env.vars.keys().cloned().collect();
                     candidates.extend(self.consts.keys().cloned());
                     candidates.extend(self.funcs.keys().cloned());
                     candidates.extend(self.globals.keys().cloned());
@@ -5812,17 +5903,17 @@ impl<'a> FunctionChecker<'a> {
                     Some(Type::Array(elem, len)) => Some(((*elem.clone()), *len)),
                     _ => None,
                 };
-                if let Some((_, expected_len)) = &expected_array {
-                    if *expected_len != items.len() {
-                        self.diags.push(
-                            format!(
-                                "array literal length mismatch (expected {}, found {})",
-                                expected_len,
-                                items.len()
-                            ),
-                            Some(expr.span.clone()),
-                        );
-                    }
+                if let Some((_, expected_len)) = &expected_array
+                    && *expected_len != items.len()
+                {
+                    self.diags.push(
+                        format!(
+                            "array literal length mismatch (expected {}, found {})",
+                            expected_len,
+                            items.len()
+                        ),
+                        Some(expr.span.clone()),
+                    );
                 }
                 let elem_ty = if let Some((expected_elem, _)) = &expected_array {
                     for item in items {
@@ -5898,10 +5989,15 @@ impl<'a> FunctionChecker<'a> {
                 self.unsafe_depth = self.unsafe_depth.saturating_sub(1);
                 ty.map(|ty| ExprResult { ty, borrow: None })
             }
-            ExprKind::If { cond, then_block, else_block } => {
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let cond_ty = self.check_expr(cond)?;
                 if !type_eq(&cond_ty.ty, &Type::Builtin(BuiltinType::Bool)) {
-                    self.diags.push("if condition must be bool", Some(cond.span.clone()));
+                    self.diags
+                        .push("if condition must be bool", Some(cond.span.clone()));
                 }
                 let base_env = self.env.clone();
                 self.env = base_env.clone();
@@ -5916,9 +6012,13 @@ impl<'a> FunctionChecker<'a> {
                 let else_env = self.env.clone();
                 self.env = self.join_env(&then_env, &else_env, &expr.span);
                 if !type_eq(&then_ty, &else_ty) {
-                    self.diags.push("if branches must have same type", Some(expr.span.clone()));
+                    self.diags
+                        .push("if branches must have same type", Some(expr.span.clone()));
                 }
-                Some(ExprResult { ty: then_ty, borrow: None })
+                Some(ExprResult {
+                    ty: then_ty,
+                    borrow: None,
+                })
             }
             ExprKind::Match { scrutinee, arms } => {
                 // Do not consume the scrutinee here; treat as borrow-like use so linear
@@ -5942,12 +6042,10 @@ impl<'a> FunctionChecker<'a> {
                     let arm_expected = expected.or(arm_ty.as_ref());
                     let ty = match &arm.body {
                         BlockOrExpr::Block(block) => self.check_block_expected(block, arm_expected),
-                        BlockOrExpr::Expr(expr) => {
-                            match arm_expected {
-                                Some(exp) => self.check_expr_expected(expr, exp).map(|r| r.ty),
-                                None => self.check_expr(expr).map(|r| r.ty),
-                            }
-                        }
+                        BlockOrExpr::Expr(expr) => match arm_expected {
+                            Some(exp) => self.check_expr_expected(expr, exp).map(|r| r.ty),
+                            None => self.check_expr(expr).map(|r| r.ty),
+                        },
                     };
                     self.drop_scope();
                     let arm_env = self.env.clone();
@@ -6008,15 +6106,24 @@ impl<'a> FunctionChecker<'a> {
                 };
                 Some(ExprResult { ty, borrow: None })
             }
-            ExprKind::Call { callee, type_args, args } => {
-                if let ExprKind::Field { base, name: variant } = &callee.kind {
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                if let ExprKind::Field {
+                    base,
+                    name: variant,
+                } = &callee.kind
+                {
                     if let ExprKind::Ident(pkg_name) = &base.kind {
                         let pkg_prefix = format!("{}.", pkg_name);
                         let has_pkg_namespace = !self.env.vars.contains_key(pkg_name)
                             && self.funcs.keys().any(|k| k.starts_with(&pkg_prefix));
                         let namespaced = format!("{}.{}", pkg_name, variant);
                         if let Some(sig) = self.funcs.get(&namespaced) {
-                            self.expr_types.insert(base.id, Type::Builtin(BuiltinType::Unit));
+                            self.expr_types
+                                .insert(base.id, Type::Builtin(BuiltinType::Unit));
                             self.expr_types
                                 .insert(callee.id, Self::function_ptr_type(sig));
                             if !type_args.is_empty() {
@@ -6031,7 +6138,8 @@ impl<'a> FunctionChecker<'a> {
                             if (!sig.is_variadic && sig.params.len() != args.len())
                                 || (sig.is_variadic && args.len() < sig.params.len())
                             {
-                                self.diags.push("argument count mismatch", Some(expr.span.clone()));
+                                self.diags
+                                    .push("argument count mismatch", Some(expr.span.clone()));
                             }
                             for (idx, arg) in args.iter().enumerate() {
                                 if let Some(param_ty) = sig.params.get(idx) {
@@ -6043,18 +6151,16 @@ impl<'a> FunctionChecker<'a> {
                                         );
                                     }
                                     if !type_eq(&res.ty, param_ty) {
-                                        self.diags.push(
-                                            "argument type mismatch",
-                                            Some(arg.span.clone()),
-                                        );
+                                        self.diags
+                                            .push("argument type mismatch", Some(arg.span.clone()));
                                     }
                                 } else {
                                     let res = self.check_expr(arg)?;
                                     if self.defs.contains_view(&res.ty) {
-                                    self.diags.push(
-                                        "view arguments are not allowed in variadic positions",
-                                        Some(arg.span.clone()),
-                                    );
+                                        self.diags.push(
+                                            "view arguments are not allowed in variadic positions",
+                                            Some(arg.span.clone()),
+                                        );
                                     }
                                 }
                             }
@@ -6107,11 +6213,14 @@ impl<'a> FunctionChecker<'a> {
                                 }
                             };
                             if fields.len() != args.len() {
-                                self.diags
-                                    .push("enum constructor arity mismatch", Some(expr.span.clone()));
+                                self.diags.push(
+                                    "enum constructor arity mismatch",
+                                    Some(expr.span.clone()),
+                                );
                             }
                             for (idx, arg) in args.iter().enumerate() {
-                                let param_ty = fields.get(idx).unwrap_or(&Type::Builtin(BuiltinType::Unit));
+                                let param_ty =
+                                    fields.get(idx).unwrap_or(&Type::Builtin(BuiltinType::Unit));
                                 let res = self.check_expr_expected(arg, param_ty)?;
                                 if view_arg_not_allowed(self.defs, &res.ty, param_ty) {
                                     self.diags.push(
@@ -6120,7 +6229,8 @@ impl<'a> FunctionChecker<'a> {
                                     );
                                 }
                                 if !type_eq(&res.ty, param_ty) {
-                                    self.diags.push("argument type mismatch", Some(arg.span.clone()));
+                                    self.diags
+                                        .push("argument type mismatch", Some(arg.span.clone()));
                                 }
                             }
                             return self.record_expr(
@@ -6133,23 +6243,18 @@ impl<'a> FunctionChecker<'a> {
                         }
                     }
                     // Not an enum ctor: treat as method-like call (recv-first free function).
-                    let recv_res = match self.check_expr_no_move(base) {
-                        Some(res) => res,
-                        None => return None,
-                    };
+                    let recv_res = self.check_expr_no_move(base)?;
                     let recv_ty = recv_res.ty.clone();
                     let method_candidates = self.method_candidates_named(variant);
 
                     if matches!(recv_ty, Type::Interface | Type::Closure { .. }) {
                         if let Some(trait_name) = self.trait_name_from_expr(base) {
-                            let Some(required_sig) =
-                                self.resolve_trait_method_signature_for_call(
-                                    &trait_name,
-                                    variant,
-                                    type_args,
-                                    &callee.span,
-                                )
-                            else {
+                            let Some(required_sig) = self.resolve_trait_method_signature_for_call(
+                                &trait_name,
+                                variant,
+                                type_args,
+                                &callee.span,
+                            ) else {
                                 let mut d = Diagnostic::new(
                                     format!(
                                         "unknown method `{}` on trait object `{}`",
@@ -6158,7 +6263,10 @@ impl<'a> FunctionChecker<'a> {
                                     Some(callee.span.clone()),
                                 )
                                 .code(E_UNKNOWN_METHOD)
-                                .label(callee.span.clone(), format!("unknown method `{}`", variant));
+                                .label(
+                                    callee.span.clone(),
+                                    format!("unknown method `{}`", variant),
+                                );
                                 let candidates = self.trait_method_names(&trait_name);
                                 if let Some(h) = suggest::did_you_mean(variant, candidates) {
                                     d = d.help(h);
@@ -6222,51 +6330,54 @@ impl<'a> FunctionChecker<'a> {
                                     ret,
                                     is_variadic,
                                 } = &recv_ty
+                                    && variant.starts_with("__gost_closure_call_")
                                 {
-                                    if variant.starts_with("__gost_closure_call_") {
-                                        if (!*is_variadic && params.len() != args.len())
-                                            || (*is_variadic && args.len() < params.len())
-                                        {
-                                            self.diags.push(
-                                                "argument count mismatch",
-                                                Some(expr.span.clone()),
-                                            );
-                                        }
-                                        for (idx, arg) in args.iter().enumerate() {
-                                            if let Some(param_ty) = params.get(idx) {
-                                                let res = self.check_expr_expected(arg, param_ty)?;
-                                                if view_arg_not_allowed(self.defs, &res.ty, param_ty) {
-                                                    self.diags.push(
+                                    if (!*is_variadic && params.len() != args.len())
+                                        || (*is_variadic && args.len() < params.len())
+                                    {
+                                        self.diags.push(
+                                            "argument count mismatch",
+                                            Some(expr.span.clone()),
+                                        );
+                                    }
+                                    for (idx, arg) in args.iter().enumerate() {
+                                        if let Some(param_ty) = params.get(idx) {
+                                            let res = self.check_expr_expected(arg, param_ty)?;
+                                            if view_arg_not_allowed(self.defs, &res.ty, param_ty) {
+                                                self.diags.push(
                                                         "view arguments can only be passed to intrinsics",
                                                         Some(arg.span.clone()),
                                                     );
-                                                }
-                                                if !type_eq(&res.ty, param_ty) {
-                                                    self.diags.push(
-                                                        "argument type mismatch",
-                                                        Some(arg.span.clone()),
-                                                    );
-                                                }
-                                            } else {
-                                                let res = self.check_expr(arg)?;
-                                                if self.defs.contains_view(&res.ty) {
-                                                    self.diags.push(
+                                            }
+                                            if !type_eq(&res.ty, param_ty) {
+                                                self.diags.push(
+                                                    "argument type mismatch",
+                                                    Some(arg.span.clone()),
+                                                );
+                                            }
+                                        } else {
+                                            let res = self.check_expr(arg)?;
+                                            if self.defs.contains_view(&res.ty) {
+                                                self.diags.push(
                                                         "view arguments are not allowed in variadic positions",
                                                         Some(arg.span.clone()),
                                                     );
-                                                }
                                             }
                                         }
-                                        return self.record_expr(
-                                            expr,
-                                            ExprResult {
-                                                ty: *ret.clone(),
-                                                borrow: None,
-                                            },
-                                        );
                                     }
+                                    return self.record_expr(
+                                        expr,
+                                        ExprResult {
+                                            ty: *ret.clone(),
+                                            borrow: None,
+                                        },
+                                    );
                                 }
-                                self.diag_unknown_method(callee.span.clone(), Some(recv_ty), variant);
+                                self.diag_unknown_method(
+                                    callee.span.clone(),
+                                    Some(recv_ty),
+                                    variant,
+                                );
                                 return None;
                             }
                             dispatch.sort_by(|a, b| a.0.cmp(&b.0));
@@ -6369,27 +6480,23 @@ impl<'a> FunctionChecker<'a> {
                         .into_iter()
                         .filter(|(cost, _, _)| *cost == best_cost)
                         .collect();
-                    if best.len() > 1 {
-                        if let Some(arg_types) = self.preview_call_arg_types(args) {
-                            let narrowed: Vec<(u8, String, FunctionSig)> = best
-                                .iter()
-                                .filter(|(_, _, sig)| {
-                                    self.call_args_match_sig_types(sig, 1, &arg_types)
-                                })
-                                .cloned()
-                                .collect();
-                            if !narrowed.is_empty() {
-                                best = narrowed;
-                            }
+                    if best.len() > 1
+                        && let Some(arg_types) = self.preview_call_arg_types(args)
+                    {
+                        let narrowed: Vec<(u8, String, FunctionSig)> = best
+                            .iter()
+                            .filter(|(_, _, sig)| {
+                                self.call_args_match_sig_types(sig, 1, &arg_types)
+                            })
+                            .cloned()
+                            .collect();
+                        if !narrowed.is_empty() {
+                            best = narrowed;
                         }
                     }
                     if best.len() > 1 {
                         self.diags.push(
-                            format!(
-                                "ambiguous method `{}` on `{}`",
-                                variant,
-                                recv_ty.pretty()
-                            ),
+                            format!("ambiguous method `{}` on `{}`", variant, recv_ty.pretty()),
                             Some(callee.span.clone()),
                         );
                         return None;
@@ -6420,17 +6527,17 @@ impl<'a> FunctionChecker<'a> {
                     if intrinsic_name {
                         return None;
                     }
-                    if self.enforce_namespaced_only() {
-                        if let Some(alias) = self.namespaced_only_funcs.get(callee_name) {
-                            self.diags.push(
-                                format!(
-                                    "`{}` is imported via `{}`; use `{}.{}(...)`",
-                                    callee_name, alias, alias, callee_name
-                                ),
-                                Some(callee.span.clone()),
-                            );
-                            return None;
-                        }
+                    if self.enforce_namespaced_only()
+                        && let Some(alias) = self.namespaced_only_funcs.get(callee_name)
+                    {
+                        self.diags.push(
+                            format!(
+                                "`{}` is imported via `{}`; use `{}.{}(...)`",
+                                callee_name, alias, alias, callee_name
+                            ),
+                            Some(callee.span.clone()),
+                        );
+                        return None;
                     }
                     if let Some(sig) = self.funcs.get(callee_name) {
                         if !type_args.is_empty() {
@@ -6445,24 +6552,29 @@ impl<'a> FunctionChecker<'a> {
                         if (!sig.is_variadic && sig.params.len() != args.len())
                             || (sig.is_variadic && args.len() < sig.params.len())
                         {
-                            self.diags.push("argument count mismatch", Some(expr.span.clone()));
+                            self.diags
+                                .push("argument count mismatch", Some(expr.span.clone()));
                         }
                         for (idx, arg) in args.iter().enumerate() {
                             if let Some(param_ty) = sig.params.get(idx) {
                                 let res = self.check_expr_expected(arg, param_ty)?;
                                 if view_arg_not_allowed(self.defs, &res.ty, param_ty) {
-                                    self.diags.push("view arguments can only be passed to intrinsics", Some(arg.span.clone()));
+                                    self.diags.push(
+                                        "view arguments can only be passed to intrinsics",
+                                        Some(arg.span.clone()),
+                                    );
                                 }
                                 if !type_eq(&res.ty, param_ty) {
-                                    self.diags.push("argument type mismatch", Some(arg.span.clone()));
+                                    self.diags
+                                        .push("argument type mismatch", Some(arg.span.clone()));
                                 }
                             } else {
                                 let res = self.check_expr(arg)?;
                                 if self.defs.contains_view(&res.ty) {
-                                self.diags.push(
-                                    "view arguments are not allowed in variadic positions",
-                                    Some(arg.span.clone()),
-                                );
+                                    self.diags.push(
+                                        "view arguments are not allowed in variadic positions",
+                                        Some(arg.span.clone()),
+                                    );
                                 }
                             }
                         }
@@ -6491,7 +6603,8 @@ impl<'a> FunctionChecker<'a> {
                         if (!is_variadic && params.len() != args.len())
                             || (is_variadic && args.len() < params.len())
                         {
-                            self.diags.push("argument count mismatch", Some(expr.span.clone()));
+                            self.diags
+                                .push("argument count mismatch", Some(expr.span.clone()));
                         }
                         for (idx, arg) in args.iter().enumerate() {
                             if let Some(param_ty) = params.get(idx) {
@@ -6503,15 +6616,16 @@ impl<'a> FunctionChecker<'a> {
                                     );
                                 }
                                 if !type_eq(&res.ty, param_ty) {
-                                    self.diags.push("argument type mismatch", Some(arg.span.clone()));
+                                    self.diags
+                                        .push("argument type mismatch", Some(arg.span.clone()));
                                 }
                             } else {
                                 let res = self.check_expr(arg)?;
                                 if self.defs.contains_view(&res.ty) {
-                                self.diags.push(
-                                    "view arguments are not allowed in variadic positions",
-                                    Some(arg.span.clone()),
-                                );
+                                    self.diags.push(
+                                        "view arguments are not allowed in variadic positions",
+                                        Some(arg.span.clone()),
+                                    );
                                 }
                             }
                         }
@@ -6529,14 +6643,18 @@ impl<'a> FunctionChecker<'a> {
                     }
                 }
             }
-            ExprKind::Field { base, name: field_name } => {
+            ExprKind::Field {
+                base,
+                name: field_name,
+            } => {
                 if let ExprKind::Ident(pkg_name) = &base.kind {
                     let pkg_prefix = format!("{}.", pkg_name);
                     let has_pkg_namespace = !self.env.vars.contains_key(pkg_name)
                         && self.funcs.keys().any(|k| k.starts_with(&pkg_prefix));
                     let namespaced = format!("{}.{}", pkg_name, field_name);
                     if let Some(sig) = self.funcs.get(&namespaced) {
-                        self.expr_types.insert(base.id, Type::Builtin(BuiltinType::Unit));
+                        self.expr_types
+                            .insert(base.id, Type::Builtin(BuiltinType::Unit));
                         return self.record_expr(
                             expr,
                             ExprResult {
@@ -6547,92 +6665,82 @@ impl<'a> FunctionChecker<'a> {
                     }
                     if has_pkg_namespace {
                         self.diags.push(
-                            format!(
-                                "unknown member `{}` in package `{}`",
-                                field_name, pkg_name
-                            ),
+                            format!("unknown member `{}` in package `{}`", field_name, pkg_name),
                             Some(expr.span.clone()),
                         );
                         return None;
                     }
                 }
-                if let ExprKind::Ident(enum_name) = &base.kind {
-                    if !self.env.vars.contains_key(enum_name) {
-                        if let Some(TypeDefKind::Enum(def)) = self.defs.get(enum_name) {
-                            let fields = match def.variants.iter().find(|(name, _)| name == field_name) {
-                                Some((_, fields)) => fields,
-                                None => {
-                                    let mut d = Diagnostic::new(
-                                        "unknown enum variant",
-                                        Some(expr.span.clone()),
-                                    )
+                if let ExprKind::Ident(enum_name) = &base.kind
+                    && !self.env.vars.contains_key(enum_name)
+                    && let Some(TypeDefKind::Enum(def)) = self.defs.get(enum_name)
+                {
+                    let fields = match def.variants.iter().find(|(name, _)| name == field_name) {
+                        Some((_, fields)) => fields,
+                        None => {
+                            let mut d =
+                                Diagnostic::new("unknown enum variant", Some(expr.span.clone()))
                                     .code(E_UNKNOWN_VARIANT)
                                     .label(expr.span.clone(), "unknown variant");
-                                    let candidates = def
-                                        .variants
-                                        .iter()
-                                        .map(|(name, _)| name.clone())
-                                        .collect::<Vec<_>>();
-                                    if let Some(h) = suggest::did_you_mean(field_name, candidates) {
-                                        d = d.help(h);
-                                    }
-                                    self.diags.push_diag(d);
-                                    return None;
-                                }
-                            };
-                            if !fields.is_empty() {
-                                self.diags.push(
-                                    "enum variant requires arguments",
-                                    Some(expr.span.clone()),
-                                );
-                                return None;
+                            let candidates = def
+                                .variants
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>();
+                            if let Some(h) = suggest::did_you_mean(field_name, candidates) {
+                                d = d.help(h);
                             }
-                            return self.record_expr(
-                                expr,
-                                ExprResult {
-                                    ty: Type::Named(enum_name.clone()),
-                                    borrow: None,
-                                },
-                            );
+                            self.diags.push_diag(d);
+                            return None;
                         }
-                    }
-                }
-                let base_res = self.check_expr_no_move(base)?;
-                if let Type::Named(type_name) = base_res.ty {
-                    if let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name) {
-                        if let Some(field) =
-                            def.fields.iter().find(|field| field.name == *field_name)
-                        {
-                            if !self.can_access_struct_field(&type_name, field) {
-                                self.diag_private_field(&expr.span, &type_name, field_name);
-                                return None;
-                            }
-                            return self.record_expr(
-                                expr,
-                                ExprResult {
-                                    ty: field.ty.clone(),
-                                    borrow: None,
-                                },
-                            );
-                        }
-                        let mut d = Diagnostic::new(
-                            format!("unknown field `{}` on `{}`", field_name, type_name),
-                            Some(expr.span.clone()),
-                        )
-                        .code(E_UNKNOWN_FIELD)
-                        .label(expr.span.clone(), format!("unknown field `{}`", field_name))
-                        .note("field names are case-sensitive");
-                        let candidates = def
-                            .fields
-                            .iter()
-                            .map(|field| field.name.clone())
-                            .collect::<Vec<_>>();
-                        if let Some(h) = suggest::did_you_mean(field_name, candidates) {
-                            d = d.help(h);
-                        }
-                        self.diags.push_diag(d);
+                    };
+                    if !fields.is_empty() {
+                        self.diags
+                            .push("enum variant requires arguments", Some(expr.span.clone()));
                         return None;
                     }
+                    return self.record_expr(
+                        expr,
+                        ExprResult {
+                            ty: Type::Named(enum_name.clone()),
+                            borrow: None,
+                        },
+                    );
+                }
+                let base_res = self.check_expr_no_move(base)?;
+                if let Type::Named(type_name) = base_res.ty
+                    && let Some(TypeDefKind::Struct(def)) = self.defs.get(&type_name)
+                {
+                    if let Some(field) = def.fields.iter().find(|field| field.name == *field_name) {
+                        if !self.can_access_struct_field(&type_name, field) {
+                            self.diag_private_field(&expr.span, &type_name, field_name);
+                            return None;
+                        }
+                        return self.record_expr(
+                            expr,
+                            ExprResult {
+                                ty: field.ty.clone(),
+                                borrow: None,
+                            },
+                        );
+                    }
+                    let mut d = Diagnostic::new(
+                        format!("unknown field `{}` on `{}`", field_name, type_name),
+                        Some(expr.span.clone()),
+                    )
+                    .code(E_UNKNOWN_FIELD)
+                    .label(expr.span.clone(), format!("unknown field `{}`", field_name))
+                    .note("field names are case-sensitive");
+                    let candidates = def
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(h) = suggest::did_you_mean(field_name, candidates) {
+                        d = d.help(h);
+                    }
+                    self.diags.push_diag(d);
+                    return None;
                 }
                 None
             }
@@ -6675,10 +6783,14 @@ impl<'a> FunctionChecker<'a> {
                                 Some(expr.span.clone()),
                             );
                         }
-                        Some(ExprResult { ty: elem, borrow: None })
+                        Some(ExprResult {
+                            ty: elem,
+                            borrow: None,
+                        })
                     }
                     None => {
-                        self.diags.push("indexing expects a slice", Some(expr.span.clone()));
+                        self.diags
+                            .push("indexing expects a slice", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6688,10 +6800,8 @@ impl<'a> FunctionChecker<'a> {
                 match op {
                     UnaryOp::Neg => {
                         if !inner_res.ty.is_numeric() {
-                            self.diags.push(
-                                "unary `-` expects numeric operand",
-                                Some(expr.span.clone()),
-                            );
+                            self.diags
+                                .push("unary `-` expects numeric operand", Some(expr.span.clone()));
                         }
                         Some(ExprResult {
                             ty: inner_res.ty,
@@ -6700,10 +6810,8 @@ impl<'a> FunctionChecker<'a> {
                     }
                     UnaryOp::Not => {
                         if !type_eq(&inner_res.ty, &Type::Builtin(BuiltinType::Bool)) {
-                            self.diags.push(
-                                "unary `!` expects bool operand",
-                                Some(expr.span.clone()),
-                            );
+                            self.diags
+                                .push("unary `!` expects bool operand", Some(expr.span.clone()));
                         }
                         Some(ExprResult {
                             ty: Type::Builtin(BuiltinType::Bool),
@@ -6712,10 +6820,8 @@ impl<'a> FunctionChecker<'a> {
                     }
                     UnaryOp::BitNot => {
                         if !inner_res.ty.is_integer() {
-                            self.diags.push(
-                                "unary `~` expects integer operand",
-                                Some(expr.span.clone()),
-                            );
+                            self.diags
+                                .push("unary `~` expects integer operand", Some(expr.span.clone()));
                         }
                         Some(ExprResult {
                             ty: inner_res.ty,
@@ -6772,10 +6878,8 @@ impl<'a> FunctionChecker<'a> {
                                 Some(expr.span.clone()),
                             );
                         } else if !type_eq(&left_res.ty, &right_res.ty) && promoted.is_none() {
-                            self.diags.push(
-                                "binary operand type mismatch",
-                                Some(expr.span.clone()),
-                            );
+                            self.diags
+                                .push("binary operand type mismatch", Some(expr.span.clone()));
                         }
                         promoted.unwrap_or_else(|| left_res.ty.clone())
                     }
@@ -6805,10 +6909,8 @@ impl<'a> FunctionChecker<'a> {
                                 },
                             );
                         }
-                        let both_int =
-                            left_res.ty.is_integer() && right_res.ty.is_integer();
-                        let both_float =
-                            left_res.ty.is_float() && right_res.ty.is_float();
+                        let both_int = left_res.ty.is_integer() && right_res.ty.is_integer();
+                        let both_float = left_res.ty.is_float() && right_res.ty.is_float();
                         if both_int {
                             promoted.unwrap_or_else(|| left_res.ty.clone())
                         } else if both_float && type_eq(&left_res.ty, &right_res.ty) {
@@ -6833,10 +6935,8 @@ impl<'a> FunctionChecker<'a> {
                                 && right_res.ty.is_float()
                                 && type_eq(&left_res.ty, &right_res.ty));
                         if !comparable {
-                            self.diags.push(
-                                "binary operand type mismatch",
-                                Some(expr.span.clone()),
-                            );
+                            self.diags
+                                .push("binary operand type mismatch", Some(expr.span.clone()));
                         }
                         Type::Builtin(BuiltinType::Bool)
                     }
@@ -6846,7 +6946,10 @@ impl<'a> FunctionChecker<'a> {
                     borrow: None,
                 })
             }
-            ExprKind::Borrow { is_mut, expr: inner } => {
+            ExprKind::Borrow {
+                is_mut,
+                expr: inner,
+            } => {
                 let (target_ty, base_name) = self.check_borrow_target(inner)?;
                 let ty = if *is_mut {
                     Type::MutRef(Box::new(target_ty))
@@ -6871,7 +6974,10 @@ impl<'a> FunctionChecker<'a> {
                     }
                     Some(ExprResult {
                         ty,
-                        borrow: Some(BorrowInfo { base, is_mut: *is_mut }),
+                        borrow: Some(BorrowInfo {
+                            base,
+                            is_mut: *is_mut,
+                        }),
                     })
                 } else {
                     self.diags.push(
@@ -6891,10 +6997,14 @@ impl<'a> FunctionChecker<'a> {
                                 Some(expr.span.clone()),
                             );
                         }
-                        Some(ExprResult { ty: *inner, borrow: None })
+                        Some(ExprResult {
+                            ty: *inner,
+                            borrow: None,
+                        })
                     }
                     _ => {
-                        self.diags.push("deref expects ref type", Some(expr.span.clone()));
+                        self.diags
+                            .push("deref expects ref type", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6928,12 +7038,17 @@ impl<'a> FunctionChecker<'a> {
                     Type::Tuple(items) if items.len() == 2 => {
                         let err_ty = &items[1];
                         if !type_eq(err_ty, &Type::Builtin(BuiltinType::Error)) {
-                            self.diags.push("second value must be error for ?", Some(expr.span.clone()));
+                            self.diags
+                                .push("second value must be error for ?", Some(expr.span.clone()));
                         }
-                        Some(ExprResult { ty: items[0].clone(), borrow: None })
+                        Some(ExprResult {
+                            ty: items[0].clone(),
+                            borrow: None,
+                        })
                     }
                     _ => {
-                        self.diags.push("`?` expects error or (T, error)", Some(expr.span.clone()));
+                        self.diags
+                            .push("`?` expects error or (T, error)", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6947,12 +7062,17 @@ impl<'a> FunctionChecker<'a> {
                             self.diags.push(DIAG_VIEW_ESCAPE, Some(expr.span.clone()));
                         }
                         if !type_eq(&value_res.ty, &inner) {
-                            self.diags.push("send type mismatch", Some(expr.span.clone()));
+                            self.diags
+                                .push("send type mismatch", Some(expr.span.clone()));
                         }
-                        Some(ExprResult { ty: Type::Builtin(BuiltinType::Unit), borrow: None })
+                        Some(ExprResult {
+                            ty: Type::Builtin(BuiltinType::Unit),
+                            borrow: None,
+                        })
                     }
                     _ => {
-                        self.diags.push("send expects chan[T]", Some(expr.span.clone()));
+                        self.diags
+                            .push("send expects chan[T]", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6965,7 +7085,8 @@ impl<'a> FunctionChecker<'a> {
                         borrow: None,
                     }),
                     _ => {
-                        self.diags.push("recv expects chan[T]", Some(expr.span.clone()));
+                        self.diags
+                            .push("recv expects chan[T]", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6973,9 +7094,13 @@ impl<'a> FunctionChecker<'a> {
             ExprKind::Close { chan } => {
                 let chan_res = self.check_expr_no_move(chan)?;
                 match chan_res.ty {
-                    Type::Chan(_) => Some(ExprResult { ty: Type::Builtin(BuiltinType::Error), borrow: None }),
+                    Type::Chan(_) => Some(ExprResult {
+                        ty: Type::Builtin(BuiltinType::Error),
+                        borrow: None,
+                    }),
                     _ => {
-                        self.diags.push("close expects chan[T]", Some(expr.span.clone()));
+                        self.diags
+                            .push("close expects chan[T]", Some(expr.span.clone()));
                         None
                     }
                 }
@@ -6997,15 +7122,14 @@ impl<'a> FunctionChecker<'a> {
     fn drop_scope(&mut self) {
         let locals = self.env.exit_scope();
         for (name, prev) in locals.into_iter().rev() {
-            if let Some(info) = self.env.vars.remove(&name) {
-                if let Some(base) = info.view_of {
-                    if let Some(base_info) = self.env.vars.get_mut(&base) {
-                        if info.view_is_mut {
-                            base_info.borrowed_mut = base_info.borrowed_mut.saturating_sub(1);
-                        } else {
-                            base_info.borrowed_shared = base_info.borrowed_shared.saturating_sub(1);
-                        }
-                    }
+            if let Some(info) = self.env.vars.remove(&name)
+                && let Some(base) = info.view_of
+                && let Some(base_info) = self.env.vars.get_mut(&base)
+            {
+                if info.view_is_mut {
+                    base_info.borrowed_mut = base_info.borrowed_mut.saturating_sub(1);
+                } else {
+                    base_info.borrowed_shared = base_info.borrowed_shared.saturating_sub(1);
                 }
             }
             if let Some(prev_info) = prev {
@@ -7024,12 +7148,9 @@ impl<'a> FunctionChecker<'a> {
                 if left_info.borrowed_mut != right_info.borrowed_mut
                     || left_info.borrowed_shared != right_info.borrowed_shared
                 {
-                    self.diags.push(
-                        "borrow state mismatch across branches",
-                        Some(span.clone()),
-                    );
-                    left_info.borrowed_mut =
-                        left_info.borrowed_mut.max(right_info.borrowed_mut);
+                    self.diags
+                        .push("borrow state mismatch across branches", Some(span.clone()));
+                    left_info.borrowed_mut = left_info.borrowed_mut.max(right_info.borrowed_mut);
                     left_info.borrowed_shared =
                         left_info.borrowed_shared.max(right_info.borrowed_shared);
                 }

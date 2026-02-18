@@ -10,8 +10,8 @@ pub fn cache_root() -> anyhow::Result<PathBuf> {
     if let Ok(p) = std::env::var("GOST_CACHE_DIR") {
         return Ok(PathBuf::from(p));
     }
-    let pd = ProjectDirs::from("dev", "gost", "gost")
-        .context("cannot determine OS cache directory")?;
+    let pd =
+        ProjectDirs::from("dev", "gost", "gost").context("cannot determine OS cache directory")?;
     Ok(pd.cache_dir().to_path_buf())
 }
 
@@ -27,7 +27,7 @@ pub fn url_hash(url: &str) -> String {
 }
 
 pub fn escape_module(m: &str) -> String {
-    m.replace('/', "!").replace('\\', "!")
+    m.replace(['/', '\\'], "!")
 }
 
 pub struct CacheLock {
@@ -40,6 +40,7 @@ impl CacheLock {
         let lock_path = root.join("cache.lock");
         let f = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;

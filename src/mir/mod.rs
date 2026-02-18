@@ -58,8 +58,12 @@ pub struct BasicBlock {
 
 #[derive(Clone, Debug)]
 pub enum MirStmt {
-    EnterScope { scope: ScopeId },
-    ExitScope { scope: ScopeId },
+    EnterScope {
+        scope: ScopeId,
+    },
+    ExitScope {
+        scope: ScopeId,
+    },
     MatchBind {
         pattern: Pattern,
         scrutinee: Expr,

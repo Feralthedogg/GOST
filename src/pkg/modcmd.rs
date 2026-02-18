@@ -1,17 +1,17 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::pkg::import_scan;
 use crate::pkg::cache::{cache_root, escape_module, url_hash};
+use crate::pkg::import_scan;
 use crate::pkg::lockfile::LockFile;
 use crate::pkg::modfile::{ModFile, Require};
 use crate::pkg::resolve::{self, ModMode};
 
 fn read_text(p: &Path) -> anyhow::Result<String> {
-    Ok(fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?)
+    fs::read_to_string(p).with_context(|| format!("read {}", p.display()))
 }
 
 fn write_text(p: &Path, s: &str) -> anyhow::Result<()> {
@@ -38,7 +38,11 @@ fn git(cmd_args: &[&str], cwd: &Path) -> anyhow::Result<String> {
         .output()
         .context("failed to execute git")?;
     if !out.status.success() {
-        bail!("git {:?} failed: {}", cmd_args, String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "git {:?} failed: {}",
+            cmd_args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -59,10 +63,10 @@ fn guess_module_from_git(cwd: &Path) -> Option<String> {
         s = rest.to_string();
     }
 
-    if let Some(idx) = s.find('@') {
-        if s[..idx].contains("git") {
-            s = s[idx + 1..].to_string();
-        }
+    if let Some(idx) = s.find('@')
+        && s[..idx].contains("git")
+    {
+        s = s[idx + 1..].to_string();
     }
 
     if let Some(idx) = s.find(':') {
@@ -126,10 +130,10 @@ fn collect_gs_files_recursive(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             let ent = ent?;
             let p = ent.path();
             if p.is_dir() {
-                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if is_skip_dir(name) {
-                        continue;
-                    }
+                if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                    && is_skip_dir(name)
+                {
+                    continue;
                 }
                 walk(&p, out)?;
             } else if p.extension().and_then(|s| s.to_str()) == Some("gs") {
@@ -229,7 +233,7 @@ pub fn cmd_tidy(cwd: PathBuf, mode: ModMode, offline: bool) -> anyhow::Result<()
 pub fn cmd_download(cwd: PathBuf, offline: bool, online: bool) -> anyhow::Result<()> {
     let root = find_mod_root(cwd).context("gost.mod not found (run `gs mod init` first)")?;
     let want_fetch = online;
-    let offline = if online { false } else { offline || true };
+    let offline = offline || !online;
     let _ = resolve::load_ctx(root, ModMode::Readonly, offline, want_fetch)?;
     eprintln!("download OK");
     Ok(())
@@ -271,10 +275,7 @@ pub fn cmd_graph(cwd: PathBuf, _offline: bool) -> anyhow::Result<()> {
                 let mirror = if l.local.is_some() {
                     false
                 } else {
-                    croot
-                        .join("vcs")
-                        .join(url_hash(&l.source))
-                        .exists()
+                    croot.join("vcs").join(url_hash(&l.source)).exists()
                 };
                 let mod_dir = if l.local.is_some() {
                     false
@@ -321,10 +322,7 @@ pub fn cmd_graph(cwd: PathBuf, _offline: bool) -> anyhow::Result<()> {
                     let mirror = if l.local.is_some() {
                         false
                     } else {
-                        croot
-                            .join("vcs")
-                            .join(url_hash(&l.source))
-                            .exists()
+                        croot.join("vcs").join(url_hash(&l.source)).exists()
                     };
                     let rev = &l.rev[..12.min(l.rev.len())];
                     let mod_dir = if l.local.is_some() {

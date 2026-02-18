@@ -161,10 +161,7 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
             out.push_str(&format!("{:>width$} |\n", "", width = line_w));
 
             for line_no in start_line..=end_line {
-                let line_text = source
-                    .lines()
-                    .nth(line_no.saturating_sub(1))
-                    .unwrap_or("");
+                let line_text = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
                 out.push_str(&format!(
                     "{:>width$} | {}\n",
                     line_no,
@@ -173,7 +170,10 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
                 ));
 
                 if line_no == start_line {
-                    let caret = colorize(&"^".repeat(line_text.len().saturating_sub(start_col - 1).max(1)), "1;31");
+                    let caret = colorize(
+                        &"^".repeat(line_text.len().saturating_sub(start_col - 1).max(1)),
+                        "1;31",
+                    );
                     out.push_str(&format!(
                         "{:>width$} | {}{}",
                         "",
@@ -192,18 +192,13 @@ pub fn format_diagnostic(diag: &Diagnostic, source: &str, file_name: Option<&str
                     ));
                 } else {
                     let wave = colorize(&"~".repeat(line_text.len().max(1)), "1;31");
-                    out.push_str(&format!(
-                        "{:>width$} | {}",
-                        "",
-                        wave,
-                        width = line_w
-                    ));
+                    out.push_str(&format!("{:>width$} | {}", "", wave, width = line_w));
                 }
-                if let Some(label) = &diag.label {
-                    if line_no == start_line {
-                        out.push(' ');
-                        out.push_str(label);
-                    }
+                if let Some(label) = &diag.label
+                    && line_no == start_line
+                {
+                    out.push(' ');
+                    out.push_str(label);
                 }
                 out.push('\n');
             }
@@ -289,9 +284,13 @@ fn colorize(s: &str, code: &str) -> String {
 fn snippet_one_line(source: &str, span: Span) -> String {
     let start = span.start.min(source.len());
     let end = span.end.min(source.len());
-    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     let mut s = source.get(lo..hi).unwrap_or("<expr>").to_string();
-    s = s.replace('\r', " ").replace('\n', " ");
+    s = s.replace(['\r', '\n'], " ");
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     const LIM: usize = 80;
     if s.len() > LIM {

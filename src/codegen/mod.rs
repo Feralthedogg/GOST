@@ -1,7 +1,7 @@
 use crate::frontend::ast::{ExternGlobal, Item};
 use crate::mir::MirModule;
-use crate::sema::{ConstValue, GlobalInit, Program};
 use crate::sema::types::{BuiltinType, Type, TypeDefKind};
+use crate::sema::{ConstValue, GlobalInit, Program};
 use std::fmt;
 
 mod emitter;
@@ -186,8 +186,7 @@ impl<'a> Codegen<'a> {
             .push_str("declare void @__gost_panic(i8*, i64)\n");
         self.output
             .push_str("declare void @__gost_user_panic(i8*, i64)\n");
-        self.output
-            .push_str("declare i32 @__gost_recover()\n");
+        self.output.push_str("declare i32 @__gost_recover()\n");
         self.output
             .push_str("declare i8* @__gost_alloc(i64, i64)\n");
         self.output
@@ -204,8 +203,7 @@ impl<'a> Codegen<'a> {
             .push_str("declare void @__gost_go_spawn(void (i8*)*, i8*)\n");
         self.output
             .push_str("declare %chan* @__gost_after_ms(i64)\n");
-        self.output
-            .push_str("declare i64 @__gost_now_ms()\n");
+        self.output.push_str("declare i64 @__gost_now_ms()\n");
         self.output
             .push_str("declare i32 @__gost_process_exit(i32)\n");
         self.output
@@ -375,12 +373,7 @@ impl<'a> Codegen<'a> {
         if self.program.globals.is_empty() {
             return Ok(());
         }
-        let mut names = self
-            .program
-            .globals
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut names = self.program.globals.keys().cloned().collect::<Vec<_>>();
         names.sort();
         for name in names {
             let sig = self
@@ -428,8 +421,12 @@ impl<'a> Codegen<'a> {
         if sig.is_variadic {
             params_ir.push("...".to_string());
         }
-        self.output
-            .push_str(&format!("define {} @{}({}) {{\n", ret_ty, func.name, params_ir.join(", ")));
+        self.output.push_str(&format!(
+            "define {} @{}({}) {{\n",
+            ret_ty,
+            func.name,
+            params_ir.join(", ")
+        ));
         let mut emitter = FnEmitter::new(
             &func.name,
             &self.program.functions,
@@ -444,7 +441,12 @@ impl<'a> Codegen<'a> {
         emitter.set_mir_mode(true);
         emitter.set_mir_locals(&func.locals)?;
         emitter.set_mir_expr_types(&func.expr_types);
-        if func.name == "main" && self.program.functions.contains_key("__gost_global_init_user") {
+        if func.name == "main"
+            && self
+                .program
+                .functions
+                .contains_key("__gost_global_init_user")
+        {
             emitter.emit_raw("call void @__gost_global_init_user()");
         }
         let mut block_map = Vec::new();
@@ -572,7 +574,12 @@ impl<'a> Codegen<'a> {
         emitter.set_mir_mode(true);
         emitter.set_mir_locals(&func.locals)?;
         emitter.set_mir_expr_types(&func.expr_types);
-        if func.name == "main" && self.program.functions.contains_key("__gost_global_init_user") {
+        if func.name == "main"
+            && self
+                .program
+                .functions
+                .contains_key("__gost_global_init_user")
+        {
             emitter.emit_raw("call void @__gost_global_init_user()");
         }
         let mut block_map = Vec::new();
@@ -857,12 +864,10 @@ pub(crate) fn llvm_type(ty: &Type) -> Result<String, String> {
             format!("{{ {} }}", parts.join(", "))
         }
         Type::Result(ok, err) => llvm_result_type(ok, err)?,
-        Type::Iter(_) => {
-            return Err(
-                "internal codegen invariant violated: iter type reached backend without MIR lowering"
-                    .to_string(),
-            )
-        }
+        Type::Iter(_) => return Err(
+            "internal codegen invariant violated: iter type reached backend without MIR lowering"
+                .to_string(),
+        ),
         Type::Named(name) => format!("%{}", name),
     };
     Ok(s)
@@ -955,11 +960,8 @@ mod tests {
 
     #[test]
     fn invalid_global_const_initializer_is_reported_as_invariant_violation() {
-        let err = llvm_const_value(
-            &Type::Builtin(BuiltinType::Bool),
-            &ConstValue::Int(1),
-        )
-        .expect_err("mismatched const initializer must fail");
+        let err = llvm_const_value(&Type::Builtin(BuiltinType::Bool), &ConstValue::Int(1))
+            .expect_err("mismatched const initializer must fail");
         assert!(
             err.contains("invalid global constant initializer reached codegen"),
             "unexpected error message: {err}"

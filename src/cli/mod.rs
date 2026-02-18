@@ -63,24 +63,20 @@ impl OptLevel {
 }
 
 fn default_opt_level() -> OptLevel {
-    if let Ok(v) = std::env::var("GOST_OPT_LEVEL") {
-        if let Some(level) = OptLevel::from_level_value(&v) {
-            return level;
-        }
+    if let Ok(v) = std::env::var("GOST_OPT_LEVEL")
+        && let Some(level) = OptLevel::from_level_value(&v)
+    {
+        return level;
     }
-    if let Ok(v) = std::env::var("GOST_OPT") {
-        if let Some(level) = OptLevel::from_level_value(&v) {
-            return level;
-        }
+    if let Ok(v) = std::env::var("GOST_OPT")
+        && let Some(level) = OptLevel::from_level_value(&v)
+    {
+        return level;
     }
     let release = std::env::var("GOST_RELEASE")
         .map(|v| v != "0")
         .unwrap_or(true);
-    if release {
-        OptLevel::O3
-    } else {
-        OptLevel::O0
-    }
+    if release { OptLevel::O3 } else { OptLevel::O0 }
 }
 
 pub fn run_cli<I>(args: I) -> i32
@@ -169,7 +165,7 @@ where
         let mut unknown: Vec<String> = Vec::new();
 
         let mut sub_help = false;
-        while let Some(arg) = args.next() {
+        for arg in args.by_ref() {
             if arg == "--help" || arg == "-h" {
                 sub_help = true;
                 continue;
@@ -207,11 +203,15 @@ where
             return 0;
         }
         if offline && online {
-            eprintln!("error: conflicting flags: --offline disables network, so --online can't be used (remove --offline).");
+            eprintln!(
+                "error: conflicting flags: --offline disables network, so --online can't be used (remove --offline)."
+            );
             return 1;
         }
         if global_offline && online {
-            eprintln!("error: --offline is set: network is disabled (remove --offline to use --online).");
+            eprintln!(
+                "error: --offline is set: network is disabled (remove --offline to use --online)."
+            );
             return 1;
         }
         if global_online {
@@ -223,12 +223,8 @@ where
             return 1;
         }
         let result = match sub.as_str() {
-            "init" => {
-                crate::pkg::modcmd::cmd_init(cwd, module_arg)
-            }
-            "tidy" => {
-                crate::pkg::modcmd::cmd_tidy(cwd, mod_mode, offline)
-            }
+            "init" => crate::pkg::modcmd::cmd_init(cwd, module_arg),
+            "tidy" => crate::pkg::modcmd::cmd_tidy(cwd, mod_mode, offline),
             "download" => crate::pkg::modcmd::cmd_download(cwd, offline, online),
             "verify" => crate::pkg::modcmd::cmd_verify(cwd, online, offline),
             "graph" => crate::pkg::modcmd::cmd_graph(cwd, offline),
@@ -439,18 +435,16 @@ where
             return 1;
         }
     };
-    let ll_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| input_path.with_extension("ll"));
+    let ll_path = output.unwrap_or_else(|| input_path.with_extension("ll"));
     if let Err(err) = std::fs::write(&ll_path, llvm) {
         eprintln!("failed to write {}: {}", ll_path.display(), err);
         return 1;
     }
-    if mode == CliMode::Run {
-        if let Err(err) = link_and_run(&input_path, &ll_path, opt_level) {
-            eprintln!("{}", err);
-            return 1;
-        }
+    if mode == CliMode::Run
+        && let Err(err) = link_and_run(&input_path, &ll_path, opt_level)
+    {
+        eprintln!("{}", err);
+        return 1;
     }
     0
 }
@@ -470,14 +464,18 @@ fn print_help_global() {
     eprintln!("  help      Print this message or the help of the given subcommand(s)");
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
-    eprintln!("  --offline         Disallow any network access (git fetch/clone). Highest priority.");
+    eprintln!(
+        "  --offline         Disallow any network access (git fetch/clone). Highest priority."
+    );
     eprintln!("  -V, --version     Print version information");
     eprintln!("  -h, --help        Print help information");
     eprintln!();
     eprintln!("POLICY:");
     eprintln!("  - --offline is global and overrides subcommand-specific online behavior.");
     eprintln!("  - Using --offline together with --online is an error.");
-    eprintln!("  - Network access (fetch/clone) is only allowed when explicitly enabled by subcommands that support it.");
+    eprintln!(
+        "  - Network access (fetch/clone) is only allowed when explicitly enabled by subcommands that support it."
+    );
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  gs run main.gs");
@@ -509,7 +507,9 @@ fn print_help_bindgen() {
 }
 
 fn explain_code(code: &str) -> i32 {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("diagnostics.md");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("diagnostics.md");
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!("error: failed to read {}", path.display());
         return 1;
@@ -547,7 +547,10 @@ fn explain_code(code: &str) -> i32 {
 
     for line in text.lines() {
         let l = line.trim_start();
-        if l.starts_with("- ") && l.to_ascii_lowercase().contains(&target.to_ascii_lowercase()) {
+        if l.starts_with("- ")
+            && l.to_ascii_lowercase()
+                .contains(&target.to_ascii_lowercase())
+        {
             println!("{}:", target);
             println!("{}", l.trim_start_matches("- ").trim());
             println!();
@@ -599,7 +602,9 @@ fn print_help_run() {
     eprintln!();
     eprintln!("NOTES:");
     eprintln!("  - In readonly mode, gost.mod/gost.lock must be consistent.");
-    eprintln!("  - If no gost.mod is found, legacy import resolution is used (no module fetching).");
+    eprintln!(
+        "  - If no gost.mod is found, legacy import resolution is used (no module fetching)."
+    );
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  gs run main.gs");
@@ -673,10 +678,14 @@ fn print_help_mod_init() {
     eprintln!();
     eprintln!("ARGS:");
     eprintln!("  [module]    Module path (e.g. github.com/you/project).");
-    eprintln!("              If omitted, gs tries to infer from git origin, otherwise uses a placeholder.");
+    eprintln!(
+        "              If omitted, gs tries to infer from git origin, otherwise uses a placeholder."
+    );
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
-    eprintln!("  --offline    Disallow any network access (not used by init, but accepted globally).");
+    eprintln!(
+        "  --offline    Disallow any network access (not used by init, but accepted globally)."
+    );
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  gs mod init");
@@ -691,15 +700,21 @@ fn print_help_mod_tidy() {
     eprintln!("  gs mod tidy [OPTIONS]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("  --readonly     Do not modify files; only verify that requirements/lock are consistent.");
+    eprintln!(
+        "  --readonly     Do not modify files; only verify that requirements/lock are consistent."
+    );
     eprintln!("  --offline      Disallow any network access (git fetch/clone).");
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
     eprintln!("  --offline      (same as above; global)");
     eprintln!();
     eprintln!("BEHAVIOR:");
-    eprintln!("  - mod mode:    may update gost.mod and refresh gost.lock (network may be needed unless offline)");
-    eprintln!("  - readonly:    never mutates; fails if required modules are missing or lock mismatched");
+    eprintln!(
+        "  - mod mode:    may update gost.mod and refresh gost.lock (network may be needed unless offline)"
+    );
+    eprintln!(
+        "  - readonly:    never mutates; fails if required modules are missing or lock mismatched"
+    );
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  gs mod tidy");
@@ -715,7 +730,9 @@ fn print_help_mod_verify() {
     eprintln!("  gs mod verify [OPTIONS]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("  --online      Allow network access for resolve check (git fetch/clone) if cache is missing.");
+    eprintln!(
+        "  --online      Allow network access for resolve check (git fetch/clone) if cache is missing."
+    );
     eprintln!("  --offline     Force offline (explicit; also the default).");
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
@@ -725,7 +742,9 @@ fn print_help_mod_verify() {
     eprintln!("  1) strict readonly tidy verification (no edits)");
     eprintln!("  2) resolve check:");
     eprintln!("     - default: offline (cache-only)");
-    eprintln!("     - --online: allows fetch/clone if needed (still readonly; does not write lock)");
+    eprintln!(
+        "     - --online: allows fetch/clone if needed (still readonly; does not write lock)"
+    );
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  gs mod verify");
@@ -740,7 +759,9 @@ fn print_help_mod_download() {
     eprintln!("  gs mod download [OPTIONS]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("  --online      Allow network access (git fetch/clone) if cache/mirrors are missing.");
+    eprintln!(
+        "  --online      Allow network access (git fetch/clone) if cache/mirrors are missing."
+    );
     eprintln!("                Without --online, download is cache-only (offline) by default.");
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
@@ -764,7 +785,9 @@ fn print_help_mod_graph() {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("  --offline     Default. Prints graph without any network access.");
-    eprintln!("  --online      Optional: may additionally show local cache status (if implemented),");
+    eprintln!(
+        "  --online      Optional: may additionally show local cache status (if implemented),"
+    );
     eprintln!("                but must not fetch/clone unless explicitly allowed by your policy.");
     eprintln!();
     eprintln!("GLOBAL OPTIONS:");
@@ -791,10 +814,7 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
-    let mut link_args = vec![
-        obj_path.display().to_string(),
-        rt_lib.display().to_string(),
-    ];
+    let mut link_args = vec![obj_path.display().to_string(), rt_lib.display().to_string()];
     link_args.push(opt_level.clang_flag());
     if opt_level.is_optimized() && native {
         link_args.push("-march=native".into());
@@ -832,9 +852,7 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
     link_args.push("-o".into());
     link_args.push(exe_path.display().to_string());
     run_cmd(&cc, &link_args)?;
-    let exe_cmd = exe_path
-        .canonicalize()
-        .unwrap_or_else(|_| exe_path.clone());
+    let exe_cmd = exe_path.canonicalize().unwrap_or_else(|_| exe_path.clone());
     run_cmd(exe_cmd.to_string_lossy().as_ref(), &[])?;
     Ok(())
 }
@@ -847,7 +865,11 @@ fn build_runtime(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Result<Pa
     build_runtime_rust(runtime_dir, cc, opt_level)
 }
 
-fn build_runtime_rust(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Result<PathBuf, String> {
+fn build_runtime_rust(
+    runtime_dir: &Path,
+    cc: &str,
+    opt_level: OptLevel,
+) -> Result<PathBuf, String> {
     let release = opt_level.is_optimized();
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
@@ -897,7 +919,9 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Resu
         cmd.env("RUSTFLAGS", rustflags);
     }
     cmd.env("CC", cc);
-    let status = cmd.status().map_err(|e| format!("failed to run cargo: {}", e))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run cargo: {}", e))?;
     if !status.success() {
         return Err("failed to build Rust runtime (is target installed?)".to_string());
     }
@@ -908,12 +932,19 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Resu
     };
     let profile = if release { "release" } else { "debug" };
     let lib_path = if let Some(target) = target {
-        runtime_dir.join("target").join(target).join(profile).join(lib_name)
+        runtime_dir
+            .join("target")
+            .join(target)
+            .join(profile)
+            .join(lib_name)
     } else {
         runtime_dir.join("target").join(profile).join(lib_name)
     };
     if !lib_path.exists() {
-        return Err(format!("Rust runtime output not found: {}", lib_path.display()));
+        return Err(format!(
+            "Rust runtime output not found: {}",
+            lib_path.display()
+        ));
     }
     Ok(lib_path)
 }
@@ -929,15 +960,14 @@ fn resolve_cc() -> String {
 }
 
 fn ensure_native_compiler(cc: &str) -> Result<(), String> {
-    if is_clang(cc) {
-        if let Some(target) = compiler_target(cc) {
-            if target.contains("wasm32") {
-                return Err(format!(
-                    "compiler target is {}; install a native clang and set GOST_CC to its path",
-                    target
-                ));
-            }
-        }
+    if is_clang(cc)
+        && let Some(target) = compiler_target(cc)
+        && target.contains("wasm32")
+    {
+        return Err(format!(
+            "compiler target is {}; install a native clang and set GOST_CC to its path",
+            target
+        ));
     }
     Ok(())
 }
@@ -973,10 +1003,7 @@ fn compile_ll_to_obj(
         if opt_level.is_optimized() && native {
             args.push("-march=native".into());
         }
-        return run_cmd(
-            cc,
-            &args,
-        );
+        return run_cmd(cc, &args);
     }
     let llc = resolve_llc();
     if !command_exists(&llc) {
@@ -1003,10 +1030,10 @@ fn resolve_llc() -> String {
     if let Ok(llc) = std::env::var("GOST_LLC") {
         return llc;
     }
-    if let Ok(cc) = std::env::var("GOST_CC") {
-        if let Some(path) = tool_in_cc_dir(&cc, "llc") {
-            return path;
-        }
+    if let Ok(cc) = std::env::var("GOST_CC")
+        && let Some(path) = tool_in_cc_dir(&cc, "llc")
+    {
+        return path;
     }
     "llc".to_string()
 }
@@ -1118,11 +1145,7 @@ fn run_bindgen(header: &Path, out: &Path, module: &str, abi: &str) -> Result<(),
             params.push(format!("{}: {}", name, ty));
         }
         if f.variadic {
-            if !params.is_empty() {
-                params.push("...".to_string());
-            } else {
-                params.push("...".to_string());
-            }
+            params.push("...".to_string());
         }
         generated.push_str(&format!(
             "extern \"{}\" fn {}({}) -> {};\n",
@@ -1190,9 +1213,10 @@ fn split_c_statements(input: &str) -> Vec<String> {
     out
 }
 
-fn parse_c_function_decl(
-    stmt: &str,
-) -> Option<(String, String, Vec<(String, String)>, bool)> {
+type CParamDecl = (String, String);
+type CFunctionDecl = (String, String, Vec<CParamDecl>, bool);
+
+fn parse_c_function_decl(stmt: &str) -> Option<CFunctionDecl> {
     let open = stmt.find('(')?;
     let close = stmt.rfind(')')?;
     if close <= open {
@@ -1317,7 +1341,6 @@ fn map_c_type_to_gs(c_ty: &str) -> String {
         _ => "i64".to_string(),
     }
 }
-
 
 fn run_cmd(cmd: &str, args: &[String]) -> Result<(), String> {
     let status = Command::new(cmd)

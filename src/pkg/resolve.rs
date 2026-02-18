@@ -1,10 +1,10 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use strsim::jaro_winkler;
 
-use crate::pkg::cache::{cache_root, CacheLock, ensure_dir};
+use crate::pkg::cache::{CacheLock, cache_root, ensure_dir};
 use crate::pkg::lockfile::{LockFile, LockedModule};
 use crate::pkg::modfile::{ModFile, Require};
 use crate::pkg::vcs;
@@ -41,7 +41,7 @@ pub struct Package {
 }
 
 fn read_text(p: &Path) -> anyhow::Result<String> {
-    Ok(fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?)
+    fs::read_to_string(p).with_context(|| format!("read {}", p.display()))
 }
 
 fn find_project_root(mut p: PathBuf) -> anyhow::Result<PathBuf> {
@@ -134,8 +134,9 @@ pub fn load_ctx(
         }
 
         if let Some(local_path) = module_replace_path(&mf, &req.module, &main_root) {
-            let root =
-                local_path.canonicalize().with_context(|| format!("replace path {}", local_path.display()))?;
+            let root = local_path
+                .canonicalize()
+                .with_context(|| format!("replace path {}", local_path.display()))?;
             resolved.insert(
                 req.module.clone(),
                 ResolvedModule {
@@ -159,10 +160,10 @@ pub fn load_ctx(
 
         let source_url = module_source_url(&mf, &req.module);
 
-        if let ModMode::Readonly = mode {
-            if lock.get(&req.module).is_none() {
-                bail!("missing {} in gost.lock (readonly mode)", req.module);
-            }
+        if let ModMode::Readonly = mode
+            && lock.get(&req.module).is_none()
+        {
+            bail!("missing {} in gost.lock (readonly mode)", req.module);
         }
 
         let (mut rev, requested) = if let Some(lm) = lock.get(&req.module) {
@@ -261,10 +262,10 @@ pub fn find_module_for_import<'a>(
 ) -> Option<(&'a str, &'a ResolvedModule)> {
     let mut best: Option<(&str, &ResolvedModule)> = None;
     for (m, rm) in ctx.modules.iter() {
-        if import == m || import.starts_with(&(m.clone() + "/")) {
-            if best.as_ref().map(|(bm, _)| bm.len()).unwrap_or(0) < m.len() {
-                best = Some((m.as_str(), rm));
-            }
+        if (import == m || import.starts_with(&(m.clone() + "/")))
+            && best.as_ref().map(|(bm, _)| bm.len()).unwrap_or(0) < m.len()
+        {
+            best = Some((m.as_str(), rm));
         }
     }
     best
@@ -278,10 +279,10 @@ fn list_subdirs(dir: &Path) -> anyhow::Result<Vec<String>> {
     for ent in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let ent = ent?;
         let p = ent.path();
-        if p.is_dir() {
-            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                out.push(name.to_string());
-            }
+        if p.is_dir()
+            && let Some(name) = p.file_name().and_then(|s| s.to_str())
+        {
+            out.push(name.to_string());
         }
     }
     out.sort();
@@ -329,11 +330,7 @@ fn collect_gs_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(v)
 }
 
-fn err_import_not_found(
-    import: &str,
-    dir: &Path,
-    base_list_dir: &Path,
-) -> anyhow::Error {
+fn err_import_not_found(import: &str, dir: &Path, base_list_dir: &Path) -> anyhow::Error {
     let (_parent_imp, leaf) = import_parent_and_leaf(import);
     let candidates = list_subdirs(base_list_dir).unwrap_or_default();
     if let Some(best) = best_name_match(&leaf, &candidates) {

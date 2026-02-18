@@ -3,14 +3,14 @@ use crate::frontend::ast::{
 };
 use std::collections::{HashMap, HashSet};
 
-use crate::frontend::ast::{BlockOrExpr, ExprId};
-use crate::frontend::symbols::logical_method_name;
-use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
-use crate::sema::{FunctionSig, Program};
 use super::{
     BasicBlock, CleanupItem, Local, LocalId, MirFunction, MirModule, MirStmt, ScopeFrame, ScopeId,
     Terminator,
 };
+use crate::frontend::ast::{BlockOrExpr, ExprId};
+use crate::frontend::symbols::logical_method_name;
+use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
+use crate::sema::{FunctionSig, Program};
 
 pub fn lower_program(program: &Program) -> Result<MirModule, String> {
     let mut module = MirModule::default();
@@ -109,8 +109,15 @@ struct IterChain {
 
 #[derive(Clone, Debug)]
 enum IterStage {
-    Filter { func: String, span: Span },
-    Map { func: String, out_ty: Type, span: Span },
+    Filter {
+        func: String,
+        span: Span,
+    },
+    Map {
+        func: String,
+        out_ty: Type,
+        span: Span,
+    },
 }
 
 impl Lowerer {
@@ -441,10 +448,8 @@ impl Lowerer {
                             span: case.span.clone(),
                         });
                     } else {
-                        let tuple_ty = Type::Tuple(vec![
-                            elem_ty.clone(),
-                            Type::Builtin(BuiltinType::Bool),
-                        ]);
+                        let tuple_ty =
+                            Type::Tuple(vec![elem_ty.clone(), Type::Builtin(BuiltinType::Bool)]);
                         let (tmp_local, _tmp_name) = self.new_temp_local(tuple_ty)?;
                         self.blocks[self.current].stmts.push(MirStmt::Eval {
                             expr: recv_expr,
@@ -491,7 +496,12 @@ impl Lowerer {
 
         if let Some(wait_bb) = wait_bb {
             self.set_current(wait_bb);
-            let wait_span = Span { start: 0, end: 0, line: 0, column: 0 };
+            let wait_span = Span {
+                start: 0,
+                end: 0,
+                line: 0,
+                column: 0,
+            };
             let wait_callee = self.new_expr(
                 ExprKind::Ident("__gost_select_wait".to_string()),
                 wait_span.clone(),
@@ -518,7 +528,11 @@ impl Lowerer {
                     crate::frontend::ast::SelectArmKind::Send { .. } => 1,
                     _ => 0,
                 };
-                wait_args.push(self.int_expr(op, case.span.clone(), Type::Builtin(BuiltinType::I32)));
+                wait_args.push(self.int_expr(
+                    op,
+                    case.span.clone(),
+                    Type::Builtin(BuiltinType::I32),
+                ));
             }
             let wait_expr = self.new_expr(
                 ExprKind::Call {
@@ -541,7 +555,8 @@ impl Lowerer {
 
     fn new_block(&mut self) -> usize {
         let id = self.blocks.len();
-        self.blocks.push(BasicBlock::new(Terminator::Return { value: None }));
+        self.blocks
+            .push(BasicBlock::new(Terminator::Return { value: None }));
         self.block_depths.push(self.current_depth);
         self.block_scopes.push(self.current_scope);
         self.block_exit_scopes.push(None);
@@ -635,10 +650,12 @@ impl Lowerer {
         if let Some(ty) = self.synthetic_expr_types.get(&expr.id) {
             return Ok(ty.clone());
         }
-        self.expr_types
-            .get(&expr.id)
-            .cloned()
-            .ok_or_else(|| format!("missing expression type for {:?} (id {})", expr.kind, expr.id))
+        self.expr_types.get(&expr.id).cloned().ok_or_else(|| {
+            format!(
+                "missing expression type for {:?} (id {})",
+                expr.kind, expr.id
+            )
+        })
     }
 
     fn is_local_name(&self, name: &str) -> bool {
@@ -839,10 +856,10 @@ impl Lowerer {
             ty,
             class,
         });
-        if let Some(ty) = self.locals.get(local_id).map(|local| local.ty.clone()) {
-            if self.needs_drop(&ty) {
-                self.register_drop_local(local_id);
-            }
+        if let Some(ty) = self.locals.get(local_id).map(|local| local.ty.clone())
+            && self.needs_drop(&ty)
+        {
+            self.register_drop_local(local_id);
         }
         Ok((local_id, name))
     }
@@ -875,10 +892,10 @@ impl Lowerer {
             ty,
             class,
         });
-        if let Some(ty) = self.locals.get(local_id).map(|local| local.ty.clone()) {
-            if self.needs_drop(&ty) {
-                self.register_drop_local(local_id);
-            }
+        if let Some(ty) = self.locals.get(local_id).map(|local| local.ty.clone())
+            && self.needs_drop(&ty)
+        {
+            self.register_drop_local(local_id);
         }
         self.bind_name(name, local_id);
         Ok((local_id, unique))
@@ -887,7 +904,7 @@ impl Lowerer {
     fn bind_name(&mut self, name: String, local: LocalId) {
         self.name_bindings
             .entry(name.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(local);
         if let Some(scope) = self.scope_bindings.last_mut() {
             scope.push(name);
@@ -906,14 +923,18 @@ impl Lowerer {
             tail: None,
             span: span.clone(),
         };
-        self.new_expr(ExprKind::Block(Box::new(block)), span, Some(Type::Builtin(BuiltinType::Unit)))
+        self.new_expr(
+            ExprKind::Block(Box::new(block)),
+            span,
+            Some(Type::Builtin(BuiltinType::Unit)),
+        )
     }
 
     fn register_cleanup_item(&mut self, item: CleanupItem) {
-        if let Some(scope_id) = self.current_scope {
-            if let Some(scope) = self.scopes.get_mut(scope_id) {
-                scope.items.push(item);
-            }
+        if let Some(scope_id) = self.current_scope
+            && let Some(scope) = self.scopes.get_mut(scope_id)
+        {
+            scope.items.push(item);
         }
     }
 
@@ -936,7 +957,9 @@ impl Lowerer {
             | Type::Own(_)
             | Type::Alias(_)
             | Type::Shared(_) => true,
-            Type::Tuple(items) => items.iter().any(|item| self.needs_drop_inner(item, visiting)),
+            Type::Tuple(items) => items
+                .iter()
+                .any(|item| self.needs_drop_inner(item, visiting)),
             Type::Result(ok, err) => {
                 self.needs_drop_inner(ok, visiting) || self.needs_drop_inner(err, visiting)
             }
@@ -950,9 +973,13 @@ impl Lowerer {
                         .fields
                         .iter()
                         .any(|field| self.needs_drop_inner(&field.ty, visiting)),
-                    Some(crate::sema::types::TypeDefKind::Enum(def)) => def.variants.iter().any(
-                        |(_, fields)| fields.iter().any(|field_ty| self.needs_drop_inner(field_ty, visiting)),
-                    ),
+                    Some(crate::sema::types::TypeDefKind::Enum(def)) => {
+                        def.variants.iter().any(|(_, fields)| {
+                            fields
+                                .iter()
+                                .any(|field_ty| self.needs_drop_inner(field_ty, visiting))
+                        })
+                    }
                     None => false,
                 };
                 visiting.remove(name);
@@ -1090,7 +1117,9 @@ impl Lowerer {
                 _ => Err("for-in expects iterable (slice/array/map/bytes/string/iter)".to_string()),
             },
             Type::MutRef(inner) => match &**inner {
-                Type::Slice(elem) | Type::Array(elem, _) => Ok(((**elem).clone(), ForInMode::MutRef)),
+                Type::Slice(elem) | Type::Array(elem, _) => {
+                    Ok(((**elem).clone(), ForInMode::MutRef))
+                }
                 Type::Builtin(BuiltinType::Bytes) => {
                     let elem = Type::Builtin(BuiltinType::U32);
                     Ok((elem, ForInMode::MutRef))
@@ -1148,8 +1177,8 @@ impl Lowerer {
                     ExprKind::Ident(name) => name.as_str(),
                     _ => {
                         return Err(
-                            "iterator chain expects iter/iter_mut/filter/map calls".to_string(),
-                        )
+                            "iterator chain expects iter/iter_mut/filter/map calls".to_string()
+                        );
                     }
                 };
                 match callee_name {
@@ -1170,11 +1199,7 @@ impl Lowerer {
                         let mut chain = self.parse_iter_chain_inner(&args[0])?;
                         let func = match &args[1].kind {
                             ExprKind::Ident(name) => name.clone(),
-                            _ => {
-                                return Err(
-                                    "filter expects a direct function symbol".to_string(),
-                                )
-                            }
+                            _ => return Err("filter expects a direct function symbol".to_string()),
                         };
                         chain.stages.push(IterStage::Filter {
                             func,
@@ -1189,11 +1214,7 @@ impl Lowerer {
                         let mut chain = self.parse_iter_chain_inner(&args[0])?;
                         let func = match &args[1].kind {
                             ExprKind::Ident(name) => name.clone(),
-                            _ => {
-                                return Err(
-                                    "map expects a direct function symbol".to_string(),
-                                )
-                            }
+                            _ => return Err("map expects a direct function symbol".to_string()),
                         };
                         let out_ty = match self.expr_type(expr)? {
                             Type::Iter(inner) => *inner,
@@ -1218,36 +1239,36 @@ impl Lowerer {
         self.push_scope();
         if is_fn_body {
             for local_id in 0..self.param_count {
-                if let Some(local) = self.locals.get(local_id) {
-                    if self.needs_drop(&local.ty) {
-                        self.register_drop_local(local_id);
-                    }
+                if let Some(local) = self.locals.get(local_id)
+                    && self.needs_drop(&local.ty)
+                {
+                    self.register_drop_local(local_id);
                 }
             }
         }
         let mut idx = 0usize;
-        let implicit_return_from_last_stmt = is_fn_body
-            && self.ret_ty != Type::Builtin(BuiltinType::Unit)
-            && block.tail.is_none();
+        let implicit_return_from_last_stmt =
+            is_fn_body && self.ret_ty != Type::Builtin(BuiltinType::Unit) && block.tail.is_none();
         while idx < block.stmts.len() {
-            if implicit_return_from_last_stmt && idx + 1 == block.stmts.len() {
-                if let Stmt::Expr { expr, .. } = &block.stmts[idx] {
-                    self.ensure_open_block();
-                    let value = self.lower_expr_value(expr)?;
-                    if let Ok(value_ty) = self.expr_type(&value) {
-                        let (local_id, local_name) = self.new_temp_local_no_drop(value_ty.clone())?;
-                        self.blocks[self.current].stmts.push(MirStmt::Eval {
-                            expr: value,
-                            out: vec![local_id],
-                        });
-                        let ident = self.ident_expr(local_name, expr.span.clone(), value_ty);
-                        self.set_terminator(Terminator::Return { value: Some(ident) });
-                    } else {
-                        self.set_terminator(Terminator::Return { value: Some(value) });
-                    }
-                    self.pop_scope_bindings_only();
-                    return Ok(());
+            if implicit_return_from_last_stmt
+                && idx + 1 == block.stmts.len()
+                && let Stmt::Expr { expr, .. } = &block.stmts[idx]
+            {
+                self.ensure_open_block();
+                let value = self.lower_expr_value(expr)?;
+                if let Ok(value_ty) = self.expr_type(&value) {
+                    let (local_id, local_name) = self.new_temp_local_no_drop(value_ty.clone())?;
+                    self.blocks[self.current].stmts.push(MirStmt::Eval {
+                        expr: value,
+                        out: vec![local_id],
+                    });
+                    let ident = self.ident_expr(local_name, expr.span.clone(), value_ty);
+                    self.set_terminator(Terminator::Return { value: Some(ident) });
+                } else {
+                    self.set_terminator(Terminator::Return { value: Some(value) });
                 }
+                self.pop_scope_bindings_only();
+                return Ok(());
             }
             self.lower_stmt(&block.stmts[idx])?;
             idx += 1;
@@ -1346,18 +1367,18 @@ impl Lowerer {
                 *inclusive,
                 body,
             ),
-            Stmt::While { label, cond, body, .. } => {
-                self.lower_while(label.clone(), cond, body)
-            }
-            Stmt::Loop { label, body, .. } => {
-                self.lower_loop(label.clone(), body)
-            }
-            Stmt::Select { arms, .. } => {
-                self.lower_select_stmt(arms)
-            }
+            Stmt::While {
+                label, cond, body, ..
+            } => self.lower_while(label.clone(), cond, body),
+            Stmt::Loop { label, body, .. } => self.lower_loop(label.clone(), body),
+            Stmt::Select { arms, .. } => self.lower_select_stmt(arms),
             Stmt::Go { expr, .. } => {
                 let (callee, type_args, args) = match &expr.kind {
-                    ExprKind::Call { callee, type_args, args } => (callee, type_args, args),
+                    ExprKind::Call {
+                        callee,
+                        type_args,
+                        args,
+                    } => (callee, type_args, args),
                     _ => return Err("go expects a call expression".to_string()),
                 };
                 if !type_args.is_empty() {
@@ -1382,8 +1403,11 @@ impl Lowerer {
                     let ident = self.ident_expr(local_name, arg.span.clone(), arg_ty);
                     lowered_args.push(ident);
                 }
-                let callee_ident =
-                    self.ident_expr(callee_name, expr.span.clone(), Type::Builtin(BuiltinType::Unit));
+                let callee_ident = self.ident_expr(
+                    callee_name,
+                    expr.span.clone(),
+                    Type::Builtin(BuiltinType::Unit),
+                );
                 let go_call = self.new_expr(
                     ExprKind::Call {
                         callee: Box::new(callee_ident),
@@ -1400,9 +1424,11 @@ impl Lowerer {
             }
             Stmt::Defer { expr, span } => {
                 let (callee, type_args, args) = match &expr.kind {
-                    ExprKind::Call { callee, type_args, args } => {
-                        (callee, type_args, args)
-                    }
+                    ExprKind::Call {
+                        callee,
+                        type_args,
+                        args,
+                    } => (callee, type_args, args),
                     _ => return Err("defer expects a call expression".to_string()),
                 };
                 let callee_name = match &callee.kind {
@@ -1424,8 +1450,11 @@ impl Lowerer {
                     let ident = self.ident_expr(local_name, arg.span.clone(), arg_ty);
                     lowered_args.push(ident);
                 }
-                let callee_ident =
-                    self.ident_expr(callee_name, expr.span.clone(), Type::Builtin(BuiltinType::Unit));
+                let callee_ident = self.ident_expr(
+                    callee_name,
+                    expr.span.clone(),
+                    Type::Builtin(BuiltinType::Unit),
+                );
                 let call_expr = self.new_expr(
                     ExprKind::Call {
                         callee: Box::new(callee_ident),
@@ -1438,25 +1467,33 @@ impl Lowerer {
                 self.register_cleanup_item(CleanupItem::DeferCall { call: call_expr });
                 Ok(())
             }
-            Stmt::Let { name, ty: _, init, .. } => {
+            Stmt::Let {
+                name, ty: _, init, ..
+            } => {
                 let value = self.lower_expr_value(init)?;
                 let init_ty = self.expr_type(&value)?;
                 let (local_id, _local_name) = self.new_named_local(name.clone(), init_ty)?;
-                self.blocks[self.current]
-                    .stmts
-                    .push(MirStmt::Eval { expr: value, out: vec![local_id] });
+                self.blocks[self.current].stmts.push(MirStmt::Eval {
+                    expr: value,
+                    out: vec![local_id],
+                });
                 Ok(())
             }
-            Stmt::Const { name, ty: _, init, .. } => {
+            Stmt::Const {
+                name, ty: _, init, ..
+            } => {
                 let value = self.lower_expr_value(init)?;
                 let init_ty = self.expr_type(&value)?;
                 let (local_id, _local_name) = self.new_named_local(name.clone(), init_ty)?;
-                self.blocks[self.current]
-                    .stmts
-                    .push(MirStmt::Eval { expr: value, out: vec![local_id] });
+                self.blocks[self.current].stmts.push(MirStmt::Eval {
+                    expr: value,
+                    out: vec![local_id],
+                });
                 Ok(())
             }
-            Stmt::Assign { op, target, value, .. } => {
+            Stmt::Assign {
+                op, target, value, ..
+            } => {
                 let target_expr = self.lower_expr_value(target)?;
                 let value_expr = self.lower_expr_value(value)?;
                 self.blocks[self.current].stmts.push(MirStmt::Assign {
@@ -1471,7 +1508,8 @@ impl Lowerer {
                 if let Some(expr) = expr {
                     let value = self.lower_expr_value(expr)?;
                     if let Ok(value_ty) = self.expr_type(&value) {
-                        let (local_id, local_name) = self.new_temp_local_no_drop(value_ty.clone())?;
+                        let (local_id, local_name) =
+                            self.new_temp_local_no_drop(value_ty.clone())?;
                         self.blocks[self.current].stmts.push(MirStmt::Eval {
                             expr: value,
                             out: vec![local_id],
@@ -1591,15 +1629,7 @@ impl Lowerer {
         let iter_ty = self.expr_type(&iter_expr)?;
         if let Some((key_ty, value_ty)) = Self::map_for_in_types(&iter_ty) {
             return self.lower_for_in_map(
-                label,
-                name,
-                index,
-                iter,
-                body,
-                iter_expr,
-                iter_ty,
-                key_ty,
-                value_ty,
+                label, name, index, iter, body, iter_expr, iter_ty, key_ty, value_ty,
             );
         }
         let (elem_ty, mode) = self.for_in_mode(&iter_ty, iter.span.clone())?;
@@ -1627,14 +1657,15 @@ impl Lowerer {
             );
             let iter_ident = self.ident_expr(iter_name.clone(), iter.span.clone(), iter_ty.clone());
             let arg = match &iter_ty {
-                Type::Slice(_) | Type::Array(_, _) | Type::Builtin(BuiltinType::Bytes) => self.new_expr(
-                    ExprKind::Borrow {
-                        is_mut: false,
-                        expr: Box::new(iter_ident),
-                    },
-                    iter.span.clone(),
-                    None,
-                ),
+                Type::Slice(_) | Type::Array(_, _) | Type::Builtin(BuiltinType::Bytes) => self
+                    .new_expr(
+                        ExprKind::Borrow {
+                            is_mut: false,
+                            expr: Box::new(iter_ident),
+                        },
+                        iter.span.clone(),
+                        None,
+                    ),
                 _ => iter_ident,
             };
             let type_arg = self.type_to_ast(&elem_ty, iter.span.clone());
@@ -1785,6 +1816,7 @@ impl Lowerer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_for_in_map(
         &mut self,
         label: Option<String>,
@@ -1826,11 +1858,8 @@ impl Lowerer {
                 iter.span.clone(),
                 None,
             );
-            let arg = self.build_for_in_map_arg_expr(
-                iter_name.clone(),
-                &iter_ty,
-                iter.span.clone(),
-            );
+            let arg =
+                self.build_for_in_map_arg_expr(iter_name.clone(), &iter_ty, iter.span.clone());
             let slot_ident = self.ident_expr(slot_name.clone(), iter.span.clone(), slot_ty.clone());
             let type_arg = self.type_to_ast(&key_ty, iter.span.clone());
             self.new_expr(
@@ -1873,11 +1902,8 @@ impl Lowerer {
                 iter.span.clone(),
                 None,
             );
-            let arg = self.build_for_in_map_arg_expr(
-                iter_name.clone(),
-                &iter_ty,
-                iter.span.clone(),
-            );
+            let arg =
+                self.build_for_in_map_arg_expr(iter_name.clone(), &iter_ty, iter.span.clone());
             let type_arg = self.type_to_ast(&key_ty, iter.span.clone());
             self.new_expr(
                 ExprKind::Call {
@@ -1895,11 +1921,8 @@ impl Lowerer {
                 iter.span.clone(),
                 None,
             );
-            let arg = self.build_for_in_map_arg_expr(
-                iter_name.clone(),
-                &iter_ty,
-                iter.span.clone(),
-            );
+            let arg =
+                self.build_for_in_map_arg_expr(iter_name.clone(), &iter_ty, iter.span.clone());
             let type_arg = self.type_to_ast(&value_ty, iter.span.clone());
             self.new_expr(
                 ExprKind::Call {
@@ -1941,6 +1964,7 @@ impl Lowerer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_for_range(
         &mut self,
         label: Option<String>,
@@ -2124,14 +2148,15 @@ impl Lowerer {
             let iter_ident =
                 self.ident_expr(iter_name.clone(), chain.base_span.clone(), base_ty.clone());
             let arg = match &base_ty {
-                Type::Slice(_) | Type::Array(_, _) | Type::Builtin(BuiltinType::Bytes) => self.new_expr(
-                    ExprKind::Borrow {
-                        is_mut: false,
-                        expr: Box::new(iter_ident),
-                    },
-                    chain.base_span.clone(),
-                    None,
-                ),
+                Type::Slice(_) | Type::Array(_, _) | Type::Builtin(BuiltinType::Bytes) => self
+                    .new_expr(
+                        ExprKind::Borrow {
+                            is_mut: false,
+                            expr: Box::new(iter_ident),
+                        },
+                        chain.base_span.clone(),
+                        None,
+                    ),
                 _ => iter_ident,
             };
             let type_arg = self.type_to_ast(&elem_ty, chain.base_span.clone());
@@ -2184,7 +2209,8 @@ impl Lowerer {
             ForInMode::ValueCopy | ForInMode::ValueMove => elem_ty.clone(),
         };
         let elem_expr = {
-            let idx_expr = self.ident_expr(idx_name.clone(), chain.base_span.clone(), idx_ty.clone());
+            let idx_expr =
+                self.ident_expr(idx_name.clone(), chain.base_span.clone(), idx_ty.clone());
             let iter_ident =
                 self.ident_expr(iter_name.clone(), chain.base_span.clone(), base_ty.clone());
             let (callee_name, arg_expr) = match mode {
@@ -2264,11 +2290,7 @@ impl Lowerer {
             self.set_current(stage_bb);
             match stage {
                 IterStage::Filter { func, span } => {
-                    let callee = self.new_expr(
-                        ExprKind::Ident(func.clone()),
-                        span.clone(),
-                        None,
-                    );
+                    let callee = self.new_expr(ExprKind::Ident(func.clone()), span.clone(), None);
                     let arg = self.ident_expr(cur_name.clone(), span.clone(), cur_ty.clone());
                     let cond_expr = self.new_expr(
                         ExprKind::Call {
@@ -2286,11 +2308,7 @@ impl Lowerer {
                     });
                 }
                 IterStage::Map { func, out_ty, span } => {
-                    let callee = self.new_expr(
-                        ExprKind::Ident(func.clone()),
-                        span.clone(),
-                        None,
-                    );
+                    let callee = self.new_expr(ExprKind::Ident(func.clone()), span.clone(), None);
                     let arg = self.ident_expr(cur_name.clone(), span.clone(), cur_ty.clone());
                     let call_expr = self.new_expr(
                         ExprKind::Call {
@@ -2406,9 +2424,10 @@ impl Lowerer {
                 };
                 let (err_local, err_name) = self.new_temp_local(err_ty.clone())?;
                 out.push(err_local);
-                self.blocks[self.current]
-                    .stmts
-                    .push(MirStmt::Eval { expr: lowered_inner, out });
+                self.blocks[self.current].stmts.push(MirStmt::Eval {
+                    expr: lowered_inner,
+                    out,
+                });
                 let err_expr = self.ident_expr(
                     err_name.clone(),
                     expr.span.clone(),
@@ -2458,7 +2477,11 @@ impl Lowerer {
                 }
                 Ok(self.ident_expr(local_name, expr.span.clone(), block_ty))
             }
-            ExprKind::If { cond, then_block, else_block } => {
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let result_ty = self.expr_type(expr)?;
                 let (result_local, result_name) = self.new_temp_local(result_ty.clone())?;
                 let cond_expr = self.lower_expr_value(cond)?;
@@ -2500,16 +2523,14 @@ impl Lowerer {
                 let (result_local, result_name) = self.new_temp_local(result_ty.clone())?;
                 let scrutinee_expr = self.lower_expr_value(scrutinee)?;
                 let scrutinee_ty = self.expr_type(&scrutinee_expr)?;
-                let (scrutinee_local, scrutinee_name) = self.new_temp_local(scrutinee_ty.clone())?;
+                let (scrutinee_local, scrutinee_name) =
+                    self.new_temp_local(scrutinee_ty.clone())?;
                 self.blocks[self.current].stmts.push(MirStmt::Eval {
                     expr: scrutinee_expr,
                     out: vec![scrutinee_local],
                 });
-                let scrutinee_ident = self.ident_expr(
-                    scrutinee_name,
-                    scrutinee.span.clone(),
-                    scrutinee_ty.clone(),
-                );
+                let scrutinee_ident =
+                    self.ident_expr(scrutinee_name, scrutinee.span.clone(), scrutinee_ty.clone());
                 let join_bb = self.new_block();
 
                 if arms.is_empty() {
@@ -2569,9 +2590,9 @@ impl Lowerer {
 
                         self.set_current(guard_else_bb);
                         if !self.is_terminated(self.current) {
-                            self.blocks[self.current]
-                                .stmts
-                                .push(MirStmt::ExitScope { scope: arm_scope_id });
+                            self.blocks[self.current].stmts.push(MirStmt::ExitScope {
+                                scope: arm_scope_id,
+                            });
                             self.current_scope = arm_parent_scope;
                             self.current_depth = arm_parent_depth;
                             self.set_terminator(Terminator::Goto(next_stage_bb));
@@ -2662,42 +2683,46 @@ impl Lowerer {
                     span: expr.span.clone(),
                 })
             }
-            ExprKind::Call { callee, type_args, args } => {
-                if let ExprKind::Field { base, name } = &callee.kind {
-                    if let ExprKind::Ident(pkg_name) = &base.kind {
-                        let namespaced = format!("{}.{}", pkg_name, name);
-                        if !self.is_local_name(pkg_name) && self.funcs.contains_key(&namespaced) {
-                            let mut lowered_args = Vec::with_capacity(args.len());
-                            for arg in args {
-                                lowered_args.push(self.lower_expr_value(arg)?);
-                            }
-                            let callee_ident = self.ident_expr(
-                                namespaced,
-                                expr.span.clone(),
-                                Type::Builtin(BuiltinType::Unit),
-                            );
-                            return Ok(Expr {
-                                id: expr.id,
-                                kind: ExprKind::Call {
-                                    callee: Box::new(callee_ident),
-                                    type_args: type_args.clone(),
-                                    args: lowered_args,
-                                },
-                                span: expr.span.clone(),
-                            });
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                if let ExprKind::Field { base, name } = &callee.kind
+                    && let ExprKind::Ident(pkg_name) = &base.kind
+                {
+                    let namespaced = format!("{}.{}", pkg_name, name);
+                    if !self.is_local_name(pkg_name) && self.funcs.contains_key(&namespaced) {
+                        let mut lowered_args = Vec::with_capacity(args.len());
+                        for arg in args {
+                            lowered_args.push(self.lower_expr_value(arg)?);
                         }
+                        let callee_ident = self.ident_expr(
+                            namespaced,
+                            expr.span.clone(),
+                            Type::Builtin(BuiltinType::Unit),
+                        );
+                        return Ok(Expr {
+                            id: expr.id,
+                            kind: ExprKind::Call {
+                                callee: Box::new(callee_ident),
+                                type_args: type_args.clone(),
+                                args: lowered_args,
+                            },
+                            span: expr.span.clone(),
+                        });
                     }
                 }
 
                 // method-call lowering: p.foo(args...) -> foo(<adj recv>, args...)
                 if let ExprKind::Field { base, name } = &callee.kind {
-                    if let ExprKind::Ident(enum_name) = &base.kind {
-                        if !self.is_local_name(enum_name) {
-                            if let Some(TypeDefKind::Enum(_)) = self.defs.get(enum_name) {
-                                // enum constructor: keep as-is
-                            } else {
-                                // not enum, continue to method lowering
-                            }
+                    if let ExprKind::Ident(enum_name) = &base.kind
+                        && !self.is_local_name(enum_name)
+                    {
+                        if let Some(TypeDefKind::Enum(_)) = self.defs.get(enum_name) {
+                            // enum constructor: keep as-is
+                        } else {
+                            // not enum, continue to method lowering
                         }
                     }
 
@@ -2712,34 +2737,33 @@ impl Lowerer {
 
                     if !is_enum_ctor {
                         let recv_ty = self.expr_type(base)?;
-                        if !matches!(recv_ty, Type::Interface | Type::Closure { .. }) {
-                            if let Some((method_symbol, param0_ty)) =
+                        if !matches!(recv_ty, Type::Interface | Type::Closure { .. })
+                            && let Some((method_symbol, param0_ty)) =
                                 self.resolve_method_symbol(name, &recv_ty, args)?
+                        {
+                            let recv_expr = self.lower_expr_value(base)?;
+                            if let Some(adj_recv) =
+                                self.adjust_receiver_expr(recv_expr, &param0_ty)?
                             {
-                                let recv_expr = self.lower_expr_value(base)?;
-                                if let Some(adj_recv) =
-                                    self.adjust_receiver_expr(recv_expr, &param0_ty)?
-                                {
-                                    let mut lowered_args = Vec::with_capacity(args.len() + 1);
-                                    lowered_args.push(adj_recv);
-                                    for arg in args {
-                                        lowered_args.push(self.lower_expr_value(arg)?);
-                                    }
-                                    let callee_ident = self.ident_expr(
-                                        method_symbol,
-                                        expr.span.clone(),
-                                        Type::Builtin(BuiltinType::Unit),
-                                    );
-                                    return Ok(Expr {
-                                        id: expr.id,
-                                        kind: ExprKind::Call {
-                                            callee: Box::new(callee_ident),
-                                            type_args: type_args.clone(),
-                                            args: lowered_args,
-                                        },
-                                        span: expr.span.clone(),
-                                    });
+                                let mut lowered_args = Vec::with_capacity(args.len() + 1);
+                                lowered_args.push(adj_recv);
+                                for arg in args {
+                                    lowered_args.push(self.lower_expr_value(arg)?);
                                 }
+                                let callee_ident = self.ident_expr(
+                                    method_symbol,
+                                    expr.span.clone(),
+                                    Type::Builtin(BuiltinType::Unit),
+                                );
+                                return Ok(Expr {
+                                    id: expr.id,
+                                    kind: ExprKind::Call {
+                                        callee: Box::new(callee_ident),
+                                        type_args: type_args.clone(),
+                                        args: lowered_args,
+                                    },
+                                    span: expr.span.clone(),
+                                });
                             }
                         }
                     }
@@ -2790,7 +2814,10 @@ impl Lowerer {
                     span: expr.span.clone(),
                 })
             }
-            ExprKind::Borrow { is_mut, expr: inner } => {
+            ExprKind::Borrow {
+                is_mut,
+                expr: inner,
+            } => {
                 let inner_expr = self.lower_expr_value(inner)?;
                 Ok(Expr {
                     id: expr.id,
@@ -2854,16 +2881,15 @@ impl Lowerer {
                 })
             }
             ExprKind::Ident(name) => {
-                if let Some(local_id) = self.resolve_name(name) {
-                    if let Some(local) = self.locals.get(local_id) {
-                        if let Some(local_name) = &local.name {
-                            return Ok(self.ident_expr(
-                                local_name.clone(),
-                                expr.span.clone(),
-                                local.ty.clone(),
-                            ));
-                        }
-                    }
+                if let Some(local_id) = self.resolve_name(name)
+                    && let Some(local) = self.locals.get(local_id)
+                    && let Some(local_name) = &local.name
+                {
+                    return Ok(self.ident_expr(
+                        local_name.clone(),
+                        expr.span.clone(),
+                        local.ty.clone(),
+                    ));
                 }
                 Ok(expr.clone())
             }
@@ -2903,16 +2929,15 @@ impl Lowerer {
     ) -> Expr {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                if let Some(Some(local_id)) = env.get(name) {
-                    if let Some(local) = self.locals.get(*local_id) {
-                        if let Some(local_name) = &local.name {
-                            return Expr {
-                                id: expr.id,
-                                kind: ExprKind::Ident(local_name.clone()),
-                                span: expr.span.clone(),
-                            };
-                        }
-                    }
+                if let Some(Some(local_id)) = env.get(name)
+                    && let Some(local) = self.locals.get(*local_id)
+                    && let Some(local_name) = &local.name
+                {
+                    return Expr {
+                        id: expr.id,
+                        kind: ExprKind::Ident(local_name.clone()),
+                        span: expr.span.clone(),
+                    };
                 }
                 expr.clone()
             }
@@ -2930,7 +2955,11 @@ impl Lowerer {
                     span: expr.span.clone(),
                 }
             }
-            ExprKind::If { cond, then_block, else_block } => {
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let cond_expr = self.rewrite_expr_with_env(cond, env);
                 let mut then_env = env.clone();
                 let then_block = self.rewrite_block_with_env(then_block, &mut then_env);
@@ -3014,10 +3043,7 @@ impl Lowerer {
             ExprKind::StructLit { name, fields } => {
                 let mut new_fields = Vec::with_capacity(fields.len());
                 for (fname, fexpr) in fields {
-                    new_fields.push((
-                        fname.clone(),
-                        self.rewrite_expr_with_env(fexpr, env),
-                    ));
+                    new_fields.push((fname.clone(), self.rewrite_expr_with_env(fexpr, env)));
                 }
                 Expr {
                     id: expr.id,
@@ -3028,7 +3054,11 @@ impl Lowerer {
                     span: expr.span.clone(),
                 }
             }
-            ExprKind::Call { callee, type_args, args } => {
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
                 let callee_expr = self.rewrite_expr_with_env(callee, env);
                 let mut new_args = Vec::with_capacity(args.len());
                 for arg in args {
@@ -3060,7 +3090,10 @@ impl Lowerer {
                 },
                 span: expr.span.clone(),
             },
-            ExprKind::Borrow { is_mut, expr: inner } => Expr {
+            ExprKind::Borrow {
+                is_mut,
+                expr: inner,
+            } => Expr {
                 id: expr.id,
                 kind: ExprKind::Borrow {
                     is_mut: *is_mut,
@@ -3154,7 +3187,12 @@ impl Lowerer {
         env: &mut HashMap<String, Option<LocalId>>,
     ) -> Stmt {
         match stmt {
-            Stmt::Let { name, ty, init, span } => {
+            Stmt::Let {
+                name,
+                ty,
+                init,
+                span,
+            } => {
                 let init_expr = self.rewrite_expr_with_env(init, env);
                 env.insert(name.clone(), None);
                 Stmt::Let {
@@ -3164,7 +3202,12 @@ impl Lowerer {
                     span: span.clone(),
                 }
             }
-            Stmt::Const { name, ty, init, span } => {
+            Stmt::Const {
+                name,
+                ty,
+                init,
+                span,
+            } => {
                 let init_expr = self.rewrite_expr_with_env(init, env);
                 env.insert(name.clone(), None);
                 Stmt::Const {
@@ -3174,7 +3217,12 @@ impl Lowerer {
                     span: span.clone(),
                 }
             }
-            Stmt::Assign { op, target, value, span } => Stmt::Assign {
+            Stmt::Assign {
+                op,
+                target,
+                value,
+                span,
+            } => Stmt::Assign {
                 op: *op,
                 target: self.rewrite_expr_with_env(target, env),
                 value: self.rewrite_expr_with_env(value, env),
@@ -3185,7 +3233,9 @@ impl Lowerer {
                 span: span.clone(),
             },
             Stmt::Return { expr, span } => Stmt::Return {
-                expr: expr.as_ref().map(|inner| self.rewrite_expr_with_env(inner, env)),
+                expr: expr
+                    .as_ref()
+                    .map(|inner| self.rewrite_expr_with_env(inner, env)),
                 span: span.clone(),
             },
             Stmt::Break { label, span } => Stmt::Break {
@@ -3403,10 +3453,7 @@ impl Lowerer {
                         if name == "_" {
                             name.clone()
                         } else {
-                            renames
-                                .get(name)
-                                .cloned()
-                                .unwrap_or_else(|| name.clone())
+                            renames.get(name).cloned().unwrap_or_else(|| name.clone())
                         }
                     })
                     .collect(),
@@ -3453,10 +3500,10 @@ impl Lowerer {
                         "Err" | "err" => err_ty.as_ref().clone(),
                         _ => return Err(format!("unknown enum variant `{}`", variant)),
                     };
-                    if let Some(name) = binds.first() {
-                        if name != "_" {
-                            out.insert(name.clone(), field_ty);
-                        }
+                    if let Some(name) = binds.first()
+                        && name != "_"
+                    {
+                        out.insert(name.clone(), field_ty);
                     }
                     return Ok(out);
                 }
@@ -3478,10 +3525,10 @@ impl Lowerer {
                     _ => return Err("enum pattern expects enum".to_string()),
                 };
                 for (idx, field_ty) in fields.iter().enumerate() {
-                    if let Some(name) = binds.get(idx) {
-                        if name != "_" {
-                            out.insert(name.clone(), field_ty.clone());
-                        }
+                    if let Some(name) = binds.get(idx)
+                        && name != "_"
+                    {
+                        out.insert(name.clone(), field_ty.clone());
                     }
                 }
                 Ok(out)
@@ -3495,9 +3542,8 @@ impl Lowerer {
                     let candidate = self.infer_match_pattern_binding_types(item, scrutinee_ty)?;
                     if let Some(expected) = &canonical {
                         if expected.len() != candidate.len() {
-                            return Err(
-                                "or-pattern bindings must have identical names and types".to_string(),
-                            );
+                            return Err("or-pattern bindings must have identical names and types"
+                                .to_string());
                         }
                         for (name, ty) in expected {
                             match candidate.get(name) {
@@ -3506,7 +3552,7 @@ impl Lowerer {
                                     return Err(
                                         "or-pattern bindings must have identical names and types"
                                             .to_string(),
-                                    )
+                                    );
                                 }
                             }
                         }
@@ -3630,7 +3676,11 @@ fn visit_expr(expr: &Expr, max_id: &mut ExprId) {
             }
         }
         ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => visit_block(block, max_id),
-        ExprKind::If { cond, then_block, else_block } => {
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
             visit_expr(cond, max_id);
             visit_block(then_block, max_id);
             if let Some(block) = else_block {
@@ -3696,7 +3746,11 @@ fn expr_contains_try(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Try { .. } => true,
         ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => block_contains_try(block),
-        ExprKind::If { cond, then_block, else_block } => {
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
             expr_contains_try(cond)
                 || block_contains_try(then_block)
                 || else_block
@@ -3748,15 +3802,9 @@ fn expr_contains_try(expr: &Expr) -> bool {
         | ExprKind::Recv { chan: base }
         | ExprKind::Close { chan: base }
         | ExprKind::After { ms: base } => expr_contains_try(base),
-        ExprKind::Index { base, index } => {
-            expr_contains_try(base) || expr_contains_try(index)
-        }
-        ExprKind::Binary { left, right, .. } => {
-            expr_contains_try(left) || expr_contains_try(right)
-        }
-        ExprKind::Send { chan, value } => {
-            expr_contains_try(chan) || expr_contains_try(value)
-        }
+        ExprKind::Index { base, index } => expr_contains_try(base) || expr_contains_try(index),
+        ExprKind::Binary { left, right, .. } => expr_contains_try(left) || expr_contains_try(right),
+        ExprKind::Send { chan, value } => expr_contains_try(chan) || expr_contains_try(value),
         ExprKind::Bool(_)
         | ExprKind::Int(_)
         | ExprKind::Float(_)
@@ -3783,22 +3831,14 @@ fn stmt_contains_try(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Let { init, .. } => expr_contains_try(init),
         Stmt::Const { init, .. } => expr_contains_try(init),
-        Stmt::Assign { target, value, .. } => {
-            expr_contains_try(target) || expr_contains_try(value)
-        }
+        Stmt::Assign { target, value, .. } => expr_contains_try(target) || expr_contains_try(value),
         Stmt::Expr { expr, .. } => expr_contains_try(expr),
         Stmt::Return { .. } => false,
-        Stmt::ForIn { iter, body, .. } => {
-            expr_contains_try(iter) || block_contains_try(body)
-        }
+        Stmt::ForIn { iter, body, .. } => expr_contains_try(iter) || block_contains_try(body),
         Stmt::ForRange {
             start, end, body, ..
-        } => {
-            expr_contains_try(start) || expr_contains_try(end) || block_contains_try(body)
-        }
-        Stmt::While { cond, body, .. } => {
-            expr_contains_try(cond) || block_contains_try(body)
-        }
+        } => expr_contains_try(start) || expr_contains_try(end) || block_contains_try(body),
+        Stmt::While { cond, body, .. } => expr_contains_try(cond) || block_contains_try(body),
         Stmt::Loop { body, .. } => block_contains_try(body),
         Stmt::Select { arms, .. } => {
             for arm in arms {

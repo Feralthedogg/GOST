@@ -52,46 +52,37 @@ pub fn build_cleanup_chains(func: &mut MirFunction) -> Result<(), String> {
                         .items
                         .clone();
                     emit_cleanup_items_from(&items, &mut func.blocks[bb].stmts);
-                    func.blocks[bb]
-                        .stmts
-                        .push(MirStmt::ExitScope { scope });
+                    func.blocks[bb].stmts.push(MirStmt::ExitScope { scope });
                 }
             }
             Terminator::Goto(target) => {
                 let to_scope = func.block_scopes.get(target).copied().flatten();
-                let new_target = edge_cleanup_target(
-                    func,
-                    &mut cleanup_cache,
-                    from_scope,
-                    to_scope,
-                    target,
-                )?;
+                let new_target =
+                    edge_cleanup_target(func, &mut cleanup_cache, from_scope, to_scope, target)?;
                 func.blocks[bb].term = Terminator::Goto(new_target);
             }
-            Terminator::If { cond, then_bb, else_bb } => {
+            Terminator::If {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
                 let then_scope = func.block_scopes.get(then_bb).copied().flatten();
                 let else_scope = func.block_scopes.get(else_bb).copied().flatten();
-                let then_target = edge_cleanup_target(
-                    func,
-                    &mut cleanup_cache,
-                    from_scope,
-                    then_scope,
-                    then_bb,
-                )?;
-                let else_target = edge_cleanup_target(
-                    func,
-                    &mut cleanup_cache,
-                    from_scope,
-                    else_scope,
-                    else_bb,
-                )?;
+                let then_target =
+                    edge_cleanup_target(func, &mut cleanup_cache, from_scope, then_scope, then_bb)?;
+                let else_target =
+                    edge_cleanup_target(func, &mut cleanup_cache, from_scope, else_scope, else_bb)?;
                 func.blocks[bb].term = Terminator::If {
                     cond,
                     then_bb: then_target,
                     else_bb: else_target,
                 };
             }
-            Terminator::Match { scrutinee, arms, default } => {
+            Terminator::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
                 let mut new_arms = Vec::new();
                 for (pat, target) in arms {
                     let to_scope = func.block_scopes.get(target).copied().flatten();
@@ -187,7 +178,8 @@ fn scope_chain(
     let mut out = Vec::new();
     let mut cursor = from_scope;
     while cursor != to_scope {
-        let scope_id = cursor.ok_or_else(|| "scope mismatch across control-flow edge".to_string())?;
+        let scope_id =
+            cursor.ok_or_else(|| "scope mismatch across control-flow edge".to_string())?;
         out.push(scope_id);
         cursor = func
             .scopes
@@ -294,9 +286,7 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
         worklist.push_back(entry);
     }
     while let Some(bb) = worklist.pop_front() {
-        let mut state = if bb == func.entry {
-            in_state[bb].clone()
-        } else if preds[bb].is_empty() {
+        let mut state = if bb == func.entry || preds[bb].is_empty() {
             in_state[bb].clone()
         } else {
             join_states(
@@ -352,14 +342,8 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
                 }
                 _ => {}
             }
-            apply_stmt_effects(
-                stmt,
-                &mut state,
-                &name_to_local,
-                &linear_mask,
-                &local_names,
-            )
-            .map_err(|e| format!("{}: {}", func.name, e))?;
+            apply_stmt_effects(stmt, &mut state, &name_to_local, &linear_mask, &local_names)
+                .map_err(|e| format!("{}: {}", func.name, e))?;
             new_stmts.push(stmt.clone());
         }
         block.stmts = new_stmts;
@@ -432,21 +416,21 @@ pub fn verify_mir_strict(func: &MirFunction) -> Result<(), String> {
                 func.name, bb_idx
             ));
         }
-        if let Some(scope_id) = func.block_scopes[bb_idx] {
-            if scope_id >= func.scopes.len() {
-                return Err(format!(
-                    "MIR-only violation: function {} bb {} has invalid scope {}",
-                    func.name, bb_idx, scope_id
-                ));
-            }
+        if let Some(scope_id) = func.block_scopes[bb_idx]
+            && scope_id >= func.scopes.len()
+        {
+            return Err(format!(
+                "MIR-only violation: function {} bb {} has invalid scope {}",
+                func.name, bb_idx, scope_id
+            ));
         }
-        if let Some(scope_id) = func.block_exit_scopes[bb_idx] {
-            if scope_id >= func.scopes.len() {
-                return Err(format!(
-                    "MIR-only violation: function {} bb {} has invalid exit scope {}",
-                    func.name, bb_idx, scope_id
-                ));
-            }
+        if let Some(scope_id) = func.block_exit_scopes[bb_idx]
+            && scope_id >= func.scopes.len()
+        {
+            return Err(format!(
+                "MIR-only violation: function {} bb {} has invalid exit scope {}",
+                func.name, bb_idx, scope_id
+            ));
         }
 
         let check_target = |target: usize, func_name: &str, bb_idx: usize| -> Result<(), String> {
@@ -479,7 +463,9 @@ pub fn verify_mir_strict(func: &MirFunction) -> Result<(), String> {
             Terminator::Goto(target) => {
                 check_target(*target, &func.name, bb_idx)?;
             }
-            Terminator::If { then_bb, else_bb, .. } => {
+            Terminator::If {
+                then_bb, else_bb, ..
+            } => {
                 check_target(*then_bb, &func.name, bb_idx)?;
                 check_target(*else_bb, &func.name, bb_idx)?;
             }
@@ -567,7 +553,7 @@ fn check_backend_ready_stmt(
             return Err(format!(
                 "backend-ready MIR violation: function {} bb {} contains high-level statement in {}",
                 func_name, bb_idx, context
-            ))
+            ));
         }
     }
     Ok(())
@@ -584,13 +570,13 @@ fn check_backend_ready_expr(
             return Err(format!(
                 "backend-ready MIR violation: function {} bb {} contains ExprKind::Try in {}",
                 func_name, bb_idx, context
-            ))
+            ));
         }
         ExprKind::Closure { .. } => {
             return Err(format!(
                 "backend-ready MIR violation: function {} bb {} contains closure expression in {}",
                 func_name, bb_idx, context
-            ))
+            ));
         }
         ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
             check_backend_ready_block(block, func_name, bb_idx, context)?;
@@ -645,7 +631,9 @@ fn check_backend_ready_expr(
         | ExprKind::Deref { expr, .. }
         | ExprKind::Recv { chan: expr }
         | ExprKind::Close { chan: expr }
-        | ExprKind::After { ms: expr } => check_backend_ready_expr(expr, func_name, bb_idx, context)?,
+        | ExprKind::After { ms: expr } => {
+            check_backend_ready_expr(expr, func_name, bb_idx, context)?
+        }
         ExprKind::Binary { left, right, .. } => {
             check_backend_ready_expr(left, func_name, bb_idx, context)?;
             check_backend_ready_expr(right, func_name, bb_idx, context)?;
@@ -706,13 +694,13 @@ pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
                     return Err(format!(
                         "backend-ready MIR violation: function {} bb {} contains high-level MIR statement",
                         func.name, bb_idx
-                    ))
+                    ));
                 }
                 MirStmt::Let { .. } => {
                     return Err(format!(
                         "backend-ready MIR violation: function {} bb {} still contains MirStmt::Let",
                         func.name, bb_idx
-                    ))
+                    ));
                 }
                 MirStmt::MatchBind { pattern, scrutinee } => {
                     if !pattern_backend_supported(pattern) {
@@ -727,7 +715,12 @@ pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
                     check_backend_ready_expr(expr, &func.name, bb_idx, "MirStmt::Go")?;
                 }
                 MirStmt::Assign { target, value, .. } => {
-                    check_backend_ready_expr(target, &func.name, bb_idx, "MirStmt::Assign(target)")?;
+                    check_backend_ready_expr(
+                        target,
+                        &func.name,
+                        bb_idx,
+                        "MirStmt::Assign(target)",
+                    )?;
                     check_backend_ready_expr(value, &func.name, bb_idx, "MirStmt::Assign(value)")?;
                 }
                 MirStmt::Expr { expr }
@@ -748,7 +741,12 @@ pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
             Terminator::Match {
                 scrutinee, arms, ..
             } => {
-                check_backend_ready_expr(scrutinee, &func.name, bb_idx, "Terminator::Match(scrutinee)")?;
+                check_backend_ready_expr(
+                    scrutinee,
+                    &func.name,
+                    bb_idx,
+                    "Terminator::Match(scrutinee)",
+                )?;
                 for (pattern, _) in arms {
                     if !pattern_backend_supported(pattern) {
                         return Err(format!(
@@ -775,7 +773,9 @@ pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
 fn successors(term: &Terminator) -> Vec<usize> {
     match term {
         Terminator::Goto(target) => vec![*target],
-        Terminator::If { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Terminator::If {
+            then_bb, else_bb, ..
+        } => vec![*then_bb, *else_bb],
         Terminator::Match { arms, default, .. } => {
             let mut out = Vec::new();
             for (_, bb) in arms {
@@ -818,9 +818,7 @@ where
                     if *item == next {
                         continue;
                     }
-                    let name = local_names[idx]
-                        .as_deref()
-                        .unwrap_or("<linear>");
+                    let name = local_names[idx].as_deref().unwrap_or("<linear>");
                     return Err(format!(
                         "ownership differs across control-flow paths for {}",
                         name
@@ -848,10 +846,11 @@ fn apply_block_effects(
                 continue;
             }
             MirStmt::DropName { name, .. } => {
-                if let Some(local) = name_to_local.get(name).copied() {
-                    if linear_mask[local] && state[local] == LinState::Alive {
-                        state[local] = LinState::Moved;
-                    }
+                if let Some(local) = name_to_local.get(name).copied()
+                    && linear_mask[local]
+                    && state[local] == LinState::Alive
+                {
+                    state[local] = LinState::Moved;
                 }
                 continue;
             }
@@ -902,12 +901,11 @@ fn apply_stmt_effects(
                 local_names,
             )?;
             // Re-initialize moved linear locals on assignment to an identifier.
-            if let ExprKind::Ident(name) = &target.kind {
-                if let Some(local) = name_to_local.get(name).copied() {
-                    if linear_mask[local] {
-                        state[local] = LinState::Alive;
-                    }
-                }
+            if let ExprKind::Ident(name) = &target.kind
+                && let Some(local) = name_to_local.get(name).copied()
+                && linear_mask[local]
+            {
+                state[local] = LinState::Alive;
             }
             Ok(())
         }
@@ -1169,7 +1167,9 @@ fn apply_ast_stmt_moves(
             )?;
             apply_block_moves(body, state, name_to_local, linear_mask, local_names)
         }
-        Stmt::Loop { body, .. } => apply_block_moves(body, state, name_to_local, linear_mask, local_names),
+        Stmt::Loop { body, .. } => {
+            apply_block_moves(body, state, name_to_local, linear_mask, local_names)
+        }
         Stmt::Select { arms, .. } => {
             for arm in arms {
                 match &arm.kind {
@@ -1268,42 +1268,93 @@ fn apply_expr_moves(
                     return Ok(());
                 }
                 if state[local] != LinState::Alive {
-                    let name = local_names[local]
-                        .as_deref()
-                        .unwrap_or("<linear>");
+                    let name = local_names[local].as_deref().unwrap_or("<linear>");
                     return Err(format!("use after move: {}", name));
                 }
                 state[local] = LinState::Moved;
             }
             Ok(())
         }
-        ExprKind::Borrow { expr: inner, .. } => {
-            apply_expr_moves(inner, ExprCtx::Place, state, name_to_local, linear_mask, local_names)
-        }
-        ExprKind::Field { base, .. } => {
-            apply_expr_moves(base, ExprCtx::Place, state, name_to_local, linear_mask, local_names)
-        }
+        ExprKind::Borrow { expr: inner, .. } => apply_expr_moves(
+            inner,
+            ExprCtx::Place,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
+        ExprKind::Field { base, .. } => apply_expr_moves(
+            base,
+            ExprCtx::Place,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         ExprKind::Index { base, index } => {
-            apply_expr_moves(base, ExprCtx::Place, state, name_to_local, linear_mask, local_names)?;
-            apply_expr_moves(index, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
+            apply_expr_moves(
+                base,
+                ExprCtx::Place,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
+            apply_expr_moves(
+                index,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )
         }
-        ExprKind::Deref { expr: inner } => {
-            apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
-        }
+        ExprKind::Deref { expr: inner } => apply_expr_moves(
+            inner,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         ExprKind::StructLit { fields, .. } => {
             for (_, expr) in fields {
-                apply_expr_moves(expr, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
+                apply_expr_moves(
+                    expr,
+                    ExprCtx::Value,
+                    state,
+                    name_to_local,
+                    linear_mask,
+                    local_names,
+                )?;
             }
             Ok(())
         }
-        ExprKind::Unary { expr: inner, .. } => {
-            apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
-        }
-        ExprKind::Cast { expr: inner, .. } => {
-            apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
-        }
+        ExprKind::Unary { expr: inner, .. } => apply_expr_moves(
+            inner,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
+        ExprKind::Cast { expr: inner, .. } => apply_expr_moves(
+            inner,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         ExprKind::Binary { left, right, .. } => {
-            apply_expr_moves(left, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
+            apply_expr_moves(
+                left,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
             apply_expr_moves(
                 right,
                 ExprCtx::Value,
@@ -1349,27 +1400,43 @@ fn apply_expr_moves(
                 }
             }
             for arg in args {
-                apply_expr_moves(
-                    arg,
-                    arg_ctx,
-                    state,
-                    name_to_local,
-                    linear_mask,
-                    local_names,
-                )?;
+                apply_expr_moves(arg, arg_ctx, state, name_to_local, linear_mask, local_names)?;
             }
             Ok(())
         }
         ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
             apply_block_moves(block, state, name_to_local, linear_mask, local_names)
         }
-        ExprKind::If { cond, then_block, else_block } => {
-            apply_expr_moves(cond, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            apply_expr_moves(
+                cond,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
             let mut then_state = state.to_vec();
-            apply_block_moves(then_block, &mut then_state, name_to_local, linear_mask, local_names)?;
+            apply_block_moves(
+                then_block,
+                &mut then_state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
             let mut else_state = state.to_vec();
             if let Some(block) = else_block {
-                apply_block_moves(block, &mut else_state, name_to_local, linear_mask, local_names)?;
+                apply_block_moves(
+                    block,
+                    &mut else_state,
+                    name_to_local,
+                    linear_mask,
+                    local_names,
+                )?;
             }
             let joined = join_states(
                 vec![&then_state, &else_state].into_iter(),
@@ -1403,7 +1470,13 @@ fn apply_expr_moves(
                 }
                 match &arm.body {
                     crate::frontend::ast::BlockOrExpr::Block(block) => {
-                        apply_block_moves(block, &mut arm_state, name_to_local, linear_mask, local_names)?;
+                        apply_block_moves(
+                            block,
+                            &mut arm_state,
+                            name_to_local,
+                            linear_mask,
+                            local_names,
+                        )?;
                     }
                     crate::frontend::ast::BlockOrExpr::Expr(expr) => {
                         apply_expr_moves(
@@ -1430,30 +1503,57 @@ fn apply_expr_moves(
             crate::frontend::ast::BlockOrExpr::Block(block) => {
                 apply_block_moves(block, state, name_to_local, linear_mask, local_names)
             }
-            crate::frontend::ast::BlockOrExpr::Expr(expr) => {
-                apply_expr_moves(
-                    expr,
-                    ExprCtx::Value,
-                    state,
-                    name_to_local,
-                    linear_mask,
-                    local_names,
-                )
-            }
+            crate::frontend::ast::BlockOrExpr::Expr(expr) => apply_expr_moves(
+                expr,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            ),
         },
-        ExprKind::Try { expr: inner } => {
-            apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
-        }
+        ExprKind::Try { expr: inner } => apply_expr_moves(
+            inner,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         ExprKind::Send { chan, value } => {
-            apply_expr_moves(chan, ExprCtx::Place, state, name_to_local, linear_mask, local_names)?;
-            apply_expr_moves(value, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
+            apply_expr_moves(
+                chan,
+                ExprCtx::Place,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
+            apply_expr_moves(
+                value,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )
         }
-        ExprKind::Recv { chan } | ExprKind::Close { chan } => {
-            apply_expr_moves(chan, ExprCtx::Place, state, name_to_local, linear_mask, local_names)
-        }
-        ExprKind::After { ms } => {
-            apply_expr_moves(ms, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
-        }
+        ExprKind::Recv { chan } | ExprKind::Close { chan } => apply_expr_moves(
+            chan,
+            ExprCtx::Place,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
+        ExprKind::After { ms } => apply_expr_moves(
+            ms,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         ExprKind::Bool(_)
         | ExprKind::Int(_)
         | ExprKind::Float(_)
@@ -1478,7 +1578,9 @@ fn needs_drop_inner(defs: &TypeDefs, ty: &Type, visiting: &mut HashSet<String>) 
         | Type::Own(_)
         | Type::Alias(_)
         | Type::Shared(_) => true,
-        Type::Tuple(items) => items.iter().any(|item| needs_drop_inner(defs, item, visiting)),
+        Type::Tuple(items) => items
+            .iter()
+            .any(|item| needs_drop_inner(defs, item, visiting)),
         Type::Result(ok, err) => {
             needs_drop_inner(defs, ok, visiting) || needs_drop_inner(defs, err, visiting)
         }

@@ -4,8 +4,8 @@ use crate::frontend::ast::{Block, Expr, ExprId, ExprKind, Stmt, TypeAst};
 use crate::frontend::symbols::logical_method_name;
 use crate::intrinsics::{intrinsic_args_error, intrinsic_type_args_error};
 use crate::mir::{MirStmt, Terminator};
+use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs, builtin_from_name};
 use crate::sema::{ConstSig, ConstValue, ExternGlobalSig, FunctionSig, GlobalVarSig};
-use crate::sema::types::{builtin_from_name, BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
 
 use super::{
     is_float_type, llvm_call_conv, llvm_storage_type, llvm_type, llvm_type_for_tuple_elem,
@@ -363,15 +363,31 @@ impl<'a> FnEmitter<'a> {
         self.current = idx;
     }
 
-    pub(crate) fn emit_prologue(&mut self, params: &[Type], names: &[String]) -> Result<(), String> {
+    pub(crate) fn emit_prologue(
+        &mut self,
+        params: &[Type],
+        names: &[String],
+    ) -> Result<(), String> {
         for (idx, ty) in params.iter().enumerate() {
             let alloca = self.new_temp();
             self.emit(format!("{} = alloca {}", alloca, llvm_type(ty)?));
-            self.emit(format!("store {} %arg{}, {}* {}", llvm_type(ty)?, idx, llvm_type(ty)?, alloca));
-            let name = names.get(idx).cloned().unwrap_or_else(|| format!("arg{}", idx));
+            self.emit(format!(
+                "store {} %arg{}, {}* {}",
+                llvm_type(ty)?,
+                idx,
+                llvm_type(ty)?,
+                alloca
+            ));
+            let name = names
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| format!("arg{}", idx));
             self.locals.insert(name, (ty.clone(), alloca));
             if self.is_linear_type(ty) {
-                let name = names.get(idx).cloned().unwrap_or_else(|| format!("arg{}", idx));
+                let name = names
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("arg{}", idx));
                 self.linear_states.insert(name, true);
             }
         }
@@ -409,7 +425,8 @@ impl<'a> FnEmitter<'a> {
                     self.linear_states.entry(name.clone()).or_insert(true);
                 }
             }
-            self.mir_local_ptrs.push(Some(MirLocalInfo { name, ty, ptr }));
+            self.mir_local_ptrs
+                .push(Some(MirLocalInfo { name, ty, ptr }));
         }
         Ok(())
     }
@@ -443,8 +460,9 @@ impl<'a> FnEmitter<'a> {
         result_tag: Option<&String>,
     ) -> Result<String, String> {
         match pattern {
-            crate::frontend::ast::Pattern::Wildcard
-            | crate::frontend::ast::Pattern::Ident(_) => Ok("1".to_string()),
+            crate::frontend::ast::Pattern::Wildcard | crate::frontend::ast::Pattern::Ident(_) => {
+                Ok("1".to_string())
+            }
             crate::frontend::ast::Pattern::Bool(value) => {
                 let lit = if *value { "1" } else { "0" };
                 let tmp = self.new_temp();
@@ -469,9 +487,7 @@ impl<'a> FnEmitter<'a> {
                 Ok(tmp)
             }
             crate::frontend::ast::Pattern::Variant {
-                enum_name,
-                variant,
-                ..
+                enum_name, variant, ..
             } => {
                 if let Some(tag_ir) = result_tag {
                     self.require_not_invariant(
@@ -484,10 +500,7 @@ impl<'a> FnEmitter<'a> {
                         _ => return self.invariant_err("unknown enum variant"),
                     };
                     let tmp = self.new_temp();
-                    self.emit(format!(
-                        "{} = icmp eq i8 {}, {}",
-                        tmp, tag_ir, variant_idx
-                    ));
+                    self.emit(format!("{} = icmp eq i8 {}, {}", tmp, tag_ir, variant_idx));
                     Ok(tmp)
                 } else {
                     let info = enum_info
@@ -550,18 +563,15 @@ impl<'a> FnEmitter<'a> {
             shared_slots: Option<&HashMap<String, String>>,
         ) -> Result<(), String> {
             let storage_ty = llvm_type_for_tuple_elem(ty)?;
-            if this.mir_mode {
-                if let Some((existing_ty, existing_ptr)) = this.locals.get(name).cloned() {
-                    this.require_invariant(
-                        existing_ty == *ty,
-                        "match binding local type mismatch",
-                    )?;
-                    this.emit(format!(
-                        "store {} {}, {}* {}",
-                        storage_ty, value_ir, storage_ty, existing_ptr
-                    ));
-                    return Ok(());
-                }
+            if this.mir_mode
+                && let Some((existing_ty, existing_ptr)) = this.locals.get(name).cloned()
+            {
+                this.require_invariant(existing_ty == *ty, "match binding local type mismatch")?;
+                this.emit(format!(
+                    "store {} {}, {}* {}",
+                    storage_ty, value_ir, storage_ty, existing_ptr
+                ));
+                return Ok(());
             }
             if let Some(slot) = shared_slots.and_then(|slots| slots.get(name)) {
                 this.emit(format!(
@@ -613,10 +623,10 @@ impl<'a> FnEmitter<'a> {
                             "Err" | "err" => err_ty.as_ref().clone(),
                             _ => return this.invariant_err("unknown enum variant"),
                         };
-                        if let Some(bind) = binds.get(0) {
-                            if bind != "_" {
-                                out.insert(bind.clone(), field_ty);
-                            }
+                        if let Some(bind) = binds.first()
+                            && bind != "_"
+                        {
+                            out.insert(bind.clone(), field_ty);
                         }
                         return Ok(out);
                     }
@@ -630,17 +640,18 @@ impl<'a> FnEmitter<'a> {
                     )?;
                     let (_, field_tys) = this.resolve_enum_variant(enum_name, variant)?;
                     for (idx, field_ty) in field_tys.iter().enumerate() {
-                        if let Some(bind) = binds.get(idx) {
-                            if bind != "_" {
-                                out.insert(bind.clone(), field_ty.clone());
-                            }
+                        if let Some(bind) = binds.get(idx)
+                            && bind != "_"
+                        {
+                            out.insert(bind.clone(), field_ty.clone());
                         }
                     }
                     Ok(out)
                 }
                 crate::frontend::ast::Pattern::Or(items) => {
                     if items.is_empty() {
-                        return this.invariant_err("or-pattern must contain at least one alternative");
+                        return this
+                            .invariant_err("or-pattern must contain at least one alternative");
                     }
                     let mut canonical: Option<HashMap<String, Type>> = None;
                     for item in items {
@@ -690,23 +701,23 @@ impl<'a> FnEmitter<'a> {
                         "Err" | "err" => (err_ty.as_ref().clone(), 2usize),
                         _ => return self.invariant_err("unknown enum variant"),
                     };
-                    if let Some(bind) = binds.get(0).cloned() {
-                        if bind != "_" {
-                            let tmp = self.new_temp();
-                            self.emit(format!(
-                                "{} = extractvalue {} {}, {}",
-                                tmp,
-                                llvm_type(&scrut.ty)?,
-                                scrut.ir,
-                                field_idx
-                            ));
-                            let val = Value {
-                                ty: field_ty.clone(),
-                                ir: tmp.clone(),
-                            };
-                            self.emit_shared_inc_value(&val)?;
-                            store_binding_value(self, &bind, &field_ty, &tmp, shared_slots)?;
-                        }
+                    if let Some(bind) = binds.first().cloned()
+                        && bind != "_"
+                    {
+                        let tmp = self.new_temp();
+                        self.emit(format!(
+                            "{} = extractvalue {} {}, {}",
+                            tmp,
+                            llvm_type(&scrut.ty)?,
+                            scrut.ir,
+                            field_idx
+                        ));
+                        let val = Value {
+                            ty: field_ty.clone(),
+                            ir: tmp.clone(),
+                        };
+                        self.emit_shared_inc_value(&val)?;
+                        store_binding_value(self, &bind, &field_ty, &tmp, shared_slots)?;
                     }
                     return Ok(());
                 }
@@ -730,10 +741,7 @@ impl<'a> FnEmitter<'a> {
                         payload_ptr, payload_ir, payload_ty
                     ));
                     for (idx, field_ty) in field_tys.iter().enumerate() {
-                        let bind = binds
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| "_".to_string());
+                        let bind = binds.get(idx).cloned().unwrap_or_else(|| "_".to_string());
                         if bind == "_" {
                             continue;
                         }
@@ -773,9 +781,9 @@ impl<'a> FnEmitter<'a> {
                     names.sort();
                     let mut slots = HashMap::new();
                     for name in names {
-                        let ty = inferred
-                            .remove(&name)
-                            .ok_or_else(|| Self::invariant_violation("missing inferred binding type"))?;
+                        let ty = inferred.remove(&name).ok_or_else(|| {
+                            Self::invariant_violation("missing inferred binding type")
+                        })?;
                         let alloca = self.new_temp();
                         self.emit(format!(
                             "{} = alloca {}",
@@ -790,7 +798,7 @@ impl<'a> FnEmitter<'a> {
                     }
                     owned_slots = Some(slots);
                 }
-                let active_slots = shared_slots.or_else(|| owned_slots.as_ref());
+                let active_slots = shared_slots.or(owned_slots.as_ref());
                 let done_name = self.new_block("match_or_bind_done");
                 let done_idx = self.add_block(done_name.clone());
                 for (idx, item) in items.iter().enumerate() {
@@ -845,15 +853,20 @@ impl<'a> FnEmitter<'a> {
     ) -> Result<bool, String> {
         match pattern {
             crate::frontend::ast::Pattern::Bool(value) => {
-                out.push(if *value { "1".to_string() } else { "0".to_string() });
+                out.push(if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                });
                 Ok(false)
             }
             crate::frontend::ast::Pattern::Int(value) => {
                 out.push(value.clone());
                 Ok(false)
             }
-            crate::frontend::ast::Pattern::Wildcard
-            | crate::frontend::ast::Pattern::Ident(_) => Ok(true),
+            crate::frontend::ast::Pattern::Wildcard | crate::frontend::ast::Pattern::Ident(_) => {
+                Ok(true)
+            }
             crate::frontend::ast::Pattern::Or(items) => {
                 self.require_not_invariant(
                     items.is_empty(),
@@ -878,7 +891,11 @@ impl<'a> FnEmitter<'a> {
                     self.emit_shared_inc_value(&value)?;
                 }
                 let alloca = self.new_temp();
-                self.emit(format!("{} = alloca {}", alloca, llvm_storage_type(&value.ty)?));
+                self.emit(format!(
+                    "{} = alloca {}",
+                    alloca,
+                    llvm_storage_type(&value.ty)?
+                ));
                 if value.ty == Type::Builtin(BuiltinType::Unit) {
                     self.emit(format!("store i8 0, i8* {}", alloca));
                 } else {
@@ -899,7 +916,9 @@ impl<'a> FnEmitter<'a> {
                 }
                 Ok(())
             }
-            Stmt::Assign { op, target, value, .. } => {
+            Stmt::Assign {
+                op, target, value, ..
+            } => {
                 let (target_ty, target_ptr) = self.emit_place_ptr(target)?;
                 let target_name = match &target.kind {
                     ExprKind::Ident(name) => Some(name.as_str()),
@@ -926,9 +945,11 @@ impl<'a> FnEmitter<'a> {
                 if *op != crate::frontend::ast::AssignOp::Assign {
                     val = self.emit_compound_assign_value(op, &target_ty, &target_ptr, val)?;
                 }
-                if target_ty != val.ty && self.is_int_type(&target_ty) && self.is_int_type(&val.ty) {
+                if target_ty != val.ty && self.is_int_type(&target_ty) && self.is_int_type(&val.ty)
+                {
                     val = self.cast_int_value(val, &target_ty)?;
-                } else if target_ty != val.ty && is_float_type(&target_ty) && is_float_type(&val.ty) {
+                } else if target_ty != val.ty && is_float_type(&target_ty) && is_float_type(&val.ty)
+                {
                     val = self.cast_value(val, &target_ty)?;
                 }
                 if target_ty != Type::Builtin(BuiltinType::Unit) {
@@ -940,10 +961,10 @@ impl<'a> FnEmitter<'a> {
                         target_ptr
                     ));
                 }
-                if let Some(name) = target_name {
-                    if self.is_linear_type(&target_ty) {
-                        self.mark_assigned(name);
-                    }
+                if let Some(name) = target_name
+                    && self.is_linear_type(&target_ty)
+                {
+                    self.mark_assigned(name);
                 }
                 Ok(())
             }
@@ -1012,7 +1033,10 @@ impl<'a> FnEmitter<'a> {
         match &ret_type {
             Type::Builtin(BuiltinType::Error) => self.emit_return_value(Some(err_val)),
             Type::Result(ok_ty, err_ty) => {
-                self.require_not_invariant(**err_ty != Type::Builtin(BuiltinType::Error), "`?` expects function return type error or (T, error)")?;
+                self.require_not_invariant(
+                    **err_ty != Type::Builtin(BuiltinType::Error),
+                    "`?` expects function return type error or (T, error)",
+                )?;
                 let result_ty = Type::Result(ok_ty.clone(), err_ty.clone());
                 let llvm_result = llvm_type(&result_ty)?;
                 let zero = if **ok_ty == Type::Builtin(BuiltinType::Unit) {
@@ -1043,12 +1067,18 @@ impl<'a> FnEmitter<'a> {
                     llvm_type_for_tuple_elem(err_ty)?,
                     err_val.ir
                 ));
-                self.emit_return_value(Some(Value { ty: result_ty, ir: err_tmp }))
+                self.emit_return_value(Some(Value {
+                    ty: result_ty,
+                    ir: err_tmp,
+                }))
             }
             Type::Tuple(items) if items.len() == 2 => {
                 let ok_ty = &items[0];
                 let err_ty = &items[1];
-                self.require_not_invariant(*err_ty != Type::Builtin(BuiltinType::Error), "`?` expects function return type error or (T, error)")?;
+                self.require_not_invariant(
+                    *err_ty != Type::Builtin(BuiltinType::Error),
+                    "`?` expects function return type error or (T, error)",
+                )?;
                 let tuple_ty = Type::Tuple(items.clone());
                 let llvm_tuple = llvm_type(&tuple_ty)?;
                 let zero = if *ok_ty == Type::Builtin(BuiltinType::Unit) {
@@ -1073,7 +1103,10 @@ impl<'a> FnEmitter<'a> {
                     llvm_type(err_ty)?,
                     err_val.ir
                 ));
-                self.emit_return_value(Some(Value { ty: tuple_ty, ir: tmp1 }))
+                self.emit_return_value(Some(Value {
+                    ty: tuple_ty,
+                    ir: tmp1,
+                }))
             }
             _ => self.invariant_err("`?` expects function return type error or (T, error)"),
         }
@@ -1087,7 +1120,11 @@ impl<'a> FnEmitter<'a> {
         let ty = sig.ty.clone();
         let ir = match (&sig.ty, &sig.value) {
             (Type::Builtin(BuiltinType::Bool), ConstValue::Bool(v)) => {
-                if *v { "1".to_string() } else { "0".to_string() }
+                if *v {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
             }
             (Type::Builtin(BuiltinType::I8), ConstValue::Int(v))
             | (Type::Builtin(BuiltinType::I16), ConstValue::Int(v))
@@ -1116,7 +1153,11 @@ impl<'a> FnEmitter<'a> {
         match &expr.kind {
             ExprKind::Bool(value) => Ok(Value {
                 ty: Type::Builtin(BuiltinType::Bool),
-                ir: if *value { "1".to_string() } else { "0".to_string() },
+                ir: if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
             }),
             ExprKind::Int(value) => Ok(Value {
                 ty: self
@@ -1142,7 +1183,10 @@ impl<'a> FnEmitter<'a> {
             ExprKind::Ident(name) => {
                 if let Some((ty, ptr)) = self.locals.get(name).cloned() {
                     if ty == Type::Builtin(BuiltinType::Unit) {
-                        return Ok(Value { ty, ir: String::new() });
+                        return Ok(Value {
+                            ty,
+                            ir: String::new(),
+                        });
                     }
                     let tmp = self.new_temp();
                     self.emit(format!(
@@ -1227,14 +1271,12 @@ impl<'a> FnEmitter<'a> {
                 let mut cur = "undef".to_string();
                 let mut have_any = false;
                 for (idx, field) in def.fields.iter().enumerate() {
-                    let fexpr = map
-                        .get(&field.name)
-                        .ok_or_else(|| {
-                            Self::invariant_violation(&format!(
-                                "missing field {} in {}",
-                                field.name, name
-                            ))
-                        })?;
+                    let fexpr = map.get(&field.name).ok_or_else(|| {
+                        Self::invariant_violation(&format!(
+                            "missing field {} in {}",
+                            field.name, name
+                        ))
+                    })?;
                     let val = self.emit_expr(fexpr)?;
                     if !self.is_rc_fresh_expr(fexpr) {
                         self.emit_shared_inc_value(&val)?;
@@ -1244,7 +1286,11 @@ impl<'a> FnEmitter<'a> {
                     } else {
                         val.ir.clone()
                     };
-                    let base = if have_any { cur.clone() } else { "undef".to_string() };
+                    let base = if have_any {
+                        cur.clone()
+                    } else {
+                        "undef".to_string()
+                    };
                     let tmp = self.new_temp();
                     self.emit(format!(
                         "{} = insertvalue {} {}, {} {}, {}",
@@ -1258,7 +1304,10 @@ impl<'a> FnEmitter<'a> {
                     cur = tmp;
                     have_any = true;
                 }
-                Ok(Value { ty: struct_ty, ir: cur })
+                Ok(Value {
+                    ty: struct_ty,
+                    ir: cur,
+                })
             }
             ExprKind::ArrayLit(items) => {
                 let mut values = Vec::new();
@@ -1286,7 +1335,9 @@ impl<'a> FnEmitter<'a> {
                     }
                     values.push(val);
                 }
-                let elem_ty = elem_ty.ok_or_else(|| Self::invariant_violation("cannot infer type of empty array literal"))?;
+                let elem_ty = elem_ty.ok_or_else(|| {
+                    Self::invariant_violation("cannot infer type of empty array literal")
+                })?;
                 let array_len = target_len.unwrap_or(values.len());
                 let array_ty = Type::Array(Box::new(elem_ty.clone()), array_len);
                 if values.is_empty() {
@@ -1350,19 +1401,20 @@ impl<'a> FnEmitter<'a> {
                         Type::Result(ok, err) => (ok.as_ref().clone(), err.as_ref().clone()),
                         _ => unreachable!(),
                     };
-                    self.require_not_invariant(err_ty != Type::Builtin(BuiltinType::Error), "Result tuple literal requires error in second position")?;
-                    let ok_val = values.get(0).ok_or_else(|| Self::invariant_violation("missing ok value"))?;
-                    let err_val = values.get(1).ok_or_else(|| Self::invariant_violation("missing err value"))?;
+                    self.require_not_invariant(
+                        err_ty != Type::Builtin(BuiltinType::Error),
+                        "Result tuple literal requires error in second position",
+                    )?;
+                    let ok_val = values
+                        .first()
+                        .ok_or_else(|| Self::invariant_violation("missing ok value"))?;
+                    let err_val = values
+                        .get(1)
+                        .ok_or_else(|| Self::invariant_violation("missing err value"))?;
                     let is_ok = self.new_temp();
-                    self.emit(format!(
-                        "{} = icmp eq i32 {}, 0",
-                        is_ok, err_val.ir
-                    ));
+                    self.emit(format!("{} = icmp eq i32 {}, 0", is_ok, err_val.ir));
                     let tag_val = self.new_temp();
-                    self.emit(format!(
-                        "{} = select i1 {}, i8 0, i8 1",
-                        tag_val, is_ok
-                    ));
+                    self.emit(format!("{} = select i1 {}, i8 0, i8 1", tag_val, is_ok));
                     let llvm_result = llvm_type(&result_ty)?;
                     let tag_tmp = self.new_temp();
                     self.emit(format!(
@@ -1397,7 +1449,10 @@ impl<'a> FnEmitter<'a> {
                         llvm_type_for_tuple_elem(&err_ty)?,
                         err_ir
                     ));
-                    return Ok(Value { ty: result_ty, ir: err_tmp });
+                    return Ok(Value {
+                        ty: result_ty,
+                        ir: err_tmp,
+                    });
                 }
                 let tuple_ty = Type::Tuple(tys);
                 if values.is_empty() {
@@ -1445,7 +1500,11 @@ impl<'a> FnEmitter<'a> {
                     ir: String::new(),
                 }))
             }
-            ExprKind::If { cond, then_block, else_block } => {
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let cond_val = self.emit_expr(cond)?;
                 let then_name = self.new_block("then");
                 let else_name = self.new_block("else");
@@ -1582,8 +1641,12 @@ impl<'a> FnEmitter<'a> {
                         self.switch_to(body_idx);
                     }
                     let arm_val = match &arm.body {
-                        crate::frontend::ast::BlockOrExpr::Block(block) => self.emit_block(block)?,
-                        crate::frontend::ast::BlockOrExpr::Expr(expr) => Some(self.emit_expr(expr)?),
+                        crate::frontend::ast::BlockOrExpr::Block(block) => {
+                            self.emit_block(block)?
+                        }
+                        crate::frontend::ast::BlockOrExpr::Expr(expr) => {
+                            Some(self.emit_expr(expr)?)
+                        }
                     };
                     self.exit_scope()?;
                     if let Some(value) = arm_val {
@@ -1632,7 +1695,10 @@ impl<'a> FnEmitter<'a> {
                             llvm_type(&res_ty)?,
                             incoming_ir.join(", ")
                         ));
-                        Ok(Value { ty: res_ty, ir: phi })
+                        Ok(Value {
+                            ty: res_ty,
+                            ir: phi,
+                        })
                     }
                 } else {
                     Ok(Value {
@@ -1641,41 +1707,45 @@ impl<'a> FnEmitter<'a> {
                     })
                 }
             }
-            ExprKind::Closure { .. } => {
-                self.unreachable_internal(
-                    "MIR lowering invariant: closure literal must be lowered before backend",
-                )
-            }
-            ExprKind::Call { callee, type_args, args } => {
-                if let ExprKind::Field { base, name } = &callee.kind {
-                    if let ExprKind::Ident(pkg_name) = &base.kind {
-                        let namespaced = format!("{}.{}", pkg_name, name);
-                        if self.fn_sigs.contains_key(&namespaced) {
-                            let mut resolved_args = Vec::new();
-                            for arg in args {
-                                resolved_args.push(self.emit_expr(arg)?);
-                            }
-                            let mut resolved_types = Vec::new();
-                            for arg in type_args {
-                                resolved_types.push(self.resolve_type_ast(arg)?);
-                            }
-                            return self.emit_call_by_name(&namespaced, &resolved_types, resolved_args);
+            ExprKind::Closure { .. } => self.unreachable_internal(
+                "MIR lowering invariant: closure literal must be lowered before backend",
+            ),
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                if let ExprKind::Field { base, name } = &callee.kind
+                    && let ExprKind::Ident(pkg_name) = &base.kind
+                {
+                    let namespaced = format!("{}.{}", pkg_name, name);
+                    if self.fn_sigs.contains_key(&namespaced) {
+                        let mut resolved_args = Vec::new();
+                        for arg in args {
+                            resolved_args.push(self.emit_expr(arg)?);
                         }
+                        let mut resolved_types = Vec::new();
+                        for arg in type_args {
+                            resolved_types.push(self.resolve_type_ast(arg)?);
+                        }
+                        return self.emit_call_by_name(&namespaced, &resolved_types, resolved_args);
                     }
                 }
-                if let ExprKind::Field { base, name: variant } = &callee.kind {
-                    if let ExprKind::Ident(enum_name) = &base.kind {
-                        if !self.locals.contains_key(enum_name) {
-                            if enum_name == "Result" || enum_name == "result" {
-                                let mut resolved_types = Vec::new();
-                                for arg in type_args {
-                                    resolved_types.push(self.resolve_type_ast(arg)?);
-                                }
-                                return self.emit_result_ctor(expr, variant, &resolved_types, args);
-                            }
-                            return self.emit_enum_ctor(enum_name, variant, args);
+                if let ExprKind::Field {
+                    base,
+                    name: variant,
+                } = &callee.kind
+                    && let ExprKind::Ident(enum_name) = &base.kind
+                    && !self.locals.contains_key(enum_name)
+                {
+                    if enum_name == "Result" || enum_name == "result" {
+                        let mut resolved_types = Vec::new();
+                        for arg in type_args {
+                            resolved_types.push(self.resolve_type_ast(arg)?);
                         }
+                        return self.emit_result_ctor(expr, variant, &resolved_types, args);
                     }
+                    return self.emit_enum_ctor(enum_name, variant, args);
                 }
                 if let ExprKind::Field { base, name: method } = &callee.kind {
                     let base_val = self.emit_expr(base)?;
@@ -1720,14 +1790,20 @@ impl<'a> FnEmitter<'a> {
                 let callee_val = self.emit_expr(callee)?;
                 self.emit_call_ptr(callee_val, resolved_args)
             }
-            ExprKind::Borrow { is_mut, expr: inner } => {
+            ExprKind::Borrow {
+                is_mut,
+                expr: inner,
+            } => {
                 let (ty, ptr) = self.emit_place_ptr(inner)?;
                 let ref_ty = if *is_mut {
                     Type::MutRef(Box::new(ty))
                 } else {
                     Type::Ref(Box::new(ty))
                 };
-                Ok(Value { ty: ref_ty, ir: ptr })
+                Ok(Value {
+                    ty: ref_ty,
+                    ir: ptr,
+                })
             }
             ExprKind::Deref { expr: inner } => {
                 let inner_val = self.emit_expr(inner)?;
@@ -1741,7 +1817,10 @@ impl<'a> FnEmitter<'a> {
                             llvm_type(&inner)?,
                             inner_val.ir
                         ));
-                        Ok(Value { ty: *inner, ir: tmp })
+                        Ok(Value {
+                            ty: *inner,
+                            ir: tmp,
+                        })
                     }
                     _ => self.invariant_err("deref expects ref type"),
                 }
@@ -1754,10 +1833,7 @@ impl<'a> FnEmitter<'a> {
                 match &value.ty {
                     Type::Builtin(BuiltinType::Error) => {
                         let is_err = self.new_temp();
-                        self.emit(format!(
-                            "{} = icmp ne i32 {}, 0",
-                            is_err, value.ir
-                        ));
+                        self.emit(format!("{} = icmp ne i32 {}, 0", is_err, value.ir));
                         let ok_name = self.new_block("try_ok");
                         let err_name = self.new_block("try_err");
                         let cont_name = self.new_block("try_cont");
@@ -1779,7 +1855,10 @@ impl<'a> FnEmitter<'a> {
                         })
                     }
                     Type::Result(ok_ty, err_ty) => {
-                        self.require_not_invariant(**err_ty != Type::Builtin(BuiltinType::Error), "`?` expects Result[T, error]")?;
+                        self.require_not_invariant(
+                            **err_ty != Type::Builtin(BuiltinType::Error),
+                            "`?` expects Result[T, error]",
+                        )?;
                         let err_tmp = self.new_temp();
                         self.emit(format!(
                             "{} = extractvalue {} {}, 2",
@@ -1788,10 +1867,7 @@ impl<'a> FnEmitter<'a> {
                             value.ir
                         ));
                         let is_err = self.new_temp();
-                        self.emit(format!(
-                            "{} = icmp ne i32 {}, 0",
-                            is_err, err_tmp
-                        ));
+                        self.emit(format!("{} = icmp ne i32 {}, 0", is_err, err_tmp));
                         let ok_name = self.new_block("try_ok");
                         let err_name = self.new_block("try_err");
                         let cont_name = self.new_block("try_cont");
@@ -1827,7 +1903,10 @@ impl<'a> FnEmitter<'a> {
                         }
                     }
                     Type::Tuple(items) if items.len() == 2 => {
-                        self.require_not_invariant(items[1] != Type::Builtin(BuiltinType::Error), "`?` expects (T, error)")?;
+                        self.require_not_invariant(
+                            items[1] != Type::Builtin(BuiltinType::Error),
+                            "`?` expects (T, error)",
+                        )?;
                         let err_tmp = self.new_temp();
                         self.emit(format!(
                             "{} = extractvalue {} {}, 1",
@@ -1836,10 +1915,7 @@ impl<'a> FnEmitter<'a> {
                             value.ir
                         ));
                         let is_err = self.new_temp();
-                        self.emit(format!(
-                            "{} = icmp ne i32 {}, 0",
-                            is_err, err_tmp
-                        ));
+                        self.emit(format!("{} = icmp ne i32 {}, 0", is_err, err_tmp));
                         let ok_name = self.new_block("try_ok");
                         let err_name = self.new_block("try_err");
                         let cont_name = self.new_block("try_cont");
@@ -1910,10 +1986,7 @@ impl<'a> FnEmitter<'a> {
                     status, chan_val.ir, elem_ptr
                 ));
                 let ok = self.new_temp();
-                self.emit(format!(
-                    "{} = icmp eq i32 {}, 0",
-                    ok, status
-                ));
+                self.emit(format!("{} = icmp eq i32 {}, 0", ok, status));
                 let ready_val = if elem_ty == Type::Builtin(BuiltinType::Unit) {
                     "0".to_string()
                 } else {
@@ -1936,12 +2009,7 @@ impl<'a> FnEmitter<'a> {
                 let selected_val = self.new_temp();
                 self.emit(format!(
                     "{} = select i1 {}, {} {}, {} {}",
-                    selected_val,
-                    ok,
-                    elem_llvm,
-                    ready_val,
-                    elem_llvm,
-                    closed_val
+                    selected_val, ok, elem_llvm, ready_val, elem_llvm, closed_val
                 ));
                 let tuple_ty = Type::Tuple(vec![elem_ty_clone, Type::Builtin(BuiltinType::Bool)]);
                 let llvm_tuple = llvm_type(&tuple_ty)?;
@@ -1956,16 +2024,19 @@ impl<'a> FnEmitter<'a> {
                 let tmp1 = self.new_temp();
                 self.emit(format!(
                     "{} = insertvalue {} {}, i1 {}, 1",
-                    tmp1,
-                    llvm_tuple,
-                    tmp0,
-                    ok
+                    tmp1, llvm_tuple, tmp0, ok
                 ));
-                Ok(Value { ty: tuple_ty, ir: tmp1 })
+                Ok(Value {
+                    ty: tuple_ty,
+                    ir: tmp1,
+                })
             }
             ExprKind::Close { chan } => {
                 let chan_val = self.emit_expr(chan)?;
-                self.require_not_invariant(!matches!(chan_val.ty, Type::Chan(_)), "close expects chan[T]")?;
+                self.require_not_invariant(
+                    !matches!(chan_val.ty, Type::Chan(_)),
+                    "close expects chan[T]",
+                )?;
                 let tmp = self.new_temp();
                 self.emit(format!(
                     "{} = call i32 @__gost_chan_close(%chan* {})",
@@ -2012,15 +2083,16 @@ impl<'a> FnEmitter<'a> {
                             });
                         }
                     }
-                    if let ExprKind::Ident(enum_name) = &base.kind {
-                        if !self.locals.contains_key(enum_name) {
-                            if let Ok((variant_idx, fields)) =
-                                self.resolve_enum_variant(enum_name, name)
-                            {
-                                self.require_not_invariant(!fields.is_empty(), "enum variant requires arguments")?;
-                                return self.emit_enum_value(enum_name, variant_idx, None);
-                            }
-                        }
+                    if let ExprKind::Ident(enum_name) = &base.kind
+                        && !self.locals.contains_key(enum_name)
+                        && let Ok((variant_idx, fields)) =
+                            self.resolve_enum_variant(enum_name, name)
+                    {
+                        self.require_not_invariant(
+                            !fields.is_empty(),
+                            "enum variant requires arguments",
+                        )?;
+                        return self.emit_enum_value(enum_name, variant_idx, None);
                     }
                 }
                 let (field_ty, field_ptr) = self.emit_place_ptr(expr)?;
@@ -2039,7 +2111,10 @@ impl<'a> FnEmitter<'a> {
                     storage_ty,
                     field_ptr
                 ));
-                let val = Value { ty: field_ty, ir: tmp };
+                let val = Value {
+                    ty: field_ty,
+                    ir: tmp,
+                };
                 self.emit_shared_inc_value(&val)?;
                 Ok(val)
             }
@@ -2051,11 +2126,12 @@ impl<'a> FnEmitter<'a> {
                             ExprKind::Int(v) => v.parse::<usize>().ok(),
                             _ => None,
                         }
-                        .ok_or_else(|| Self::invariant_violation("tuple index must be integer literal"))?;
-                        let elem_ty = items
-                            .get(idx)
-                            .cloned()
-                            .ok_or_else(|| Self::invariant_violation("tuple index out of bounds"))?;
+                        .ok_or_else(|| {
+                            Self::invariant_violation("tuple index must be integer literal")
+                        })?;
+                        let elem_ty = items.get(idx).cloned().ok_or_else(|| {
+                            Self::invariant_violation("tuple index out of bounds")
+                        })?;
                         if elem_ty == Type::Builtin(BuiltinType::Unit) {
                             return Ok(Value {
                                 ty: elem_ty,
@@ -2070,7 +2146,10 @@ impl<'a> FnEmitter<'a> {
                             base_val.ir,
                             idx
                         ));
-                        let val = Value { ty: elem_ty, ir: tmp };
+                        let val = Value {
+                            ty: elem_ty,
+                            ir: tmp,
+                        };
                         self.emit_shared_inc_value(&val)?;
                         return Ok(val);
                     }
@@ -2091,7 +2170,10 @@ impl<'a> FnEmitter<'a> {
                     storage_ty,
                     elem_ptr
                 ));
-                let val = Value { ty: elem_ty, ir: tmp };
+                let val = Value {
+                    ty: elem_ty,
+                    ir: tmp,
+                };
                 self.emit_shared_inc_value(&val)?;
                 Ok(val)
             }
@@ -2107,15 +2189,29 @@ impl<'a> FnEmitter<'a> {
                                 llvm_type(&value.ty)?,
                                 value.ir
                             ));
-                            Ok(Value { ty: value.ty, ir: tmp })
+                            Ok(Value {
+                                ty: value.ty,
+                                ir: tmp,
+                            })
                         } else {
                             let tmp = self.new_temp();
-                            self.emit(format!("{} = sub {} 0, {}", tmp, llvm_type(&value.ty)?, value.ir));
-                            Ok(Value { ty: value.ty, ir: tmp })
+                            self.emit(format!(
+                                "{} = sub {} 0, {}",
+                                tmp,
+                                llvm_type(&value.ty)?,
+                                value.ir
+                            ));
+                            Ok(Value {
+                                ty: value.ty,
+                                ir: tmp,
+                            })
                         }
                     }
                     crate::frontend::ast::UnaryOp::Not => {
-                        self.require_not_invariant(value.ty != Type::Builtin(BuiltinType::Bool), "`!` expects bool")?;
+                        self.require_not_invariant(
+                            value.ty != Type::Builtin(BuiltinType::Bool),
+                            "`!` expects bool",
+                        )?;
                         let tmp = self.new_temp();
                         self.emit(format!("{} = xor i1 {}, true", tmp, value.ir));
                         Ok(Value {
@@ -2124,7 +2220,10 @@ impl<'a> FnEmitter<'a> {
                         })
                     }
                     crate::frontend::ast::UnaryOp::BitNot => {
-                        self.require_not_invariant(!self.is_int_type(&value.ty), "`~` expects integer")?;
+                        self.require_not_invariant(
+                            !self.is_int_type(&value.ty),
+                            "`~` expects integer",
+                        )?;
                         let tmp = self.new_temp();
                         self.emit(format!(
                             "{} = xor {} {}, -1",
@@ -2132,7 +2231,10 @@ impl<'a> FnEmitter<'a> {
                             llvm_type(&value.ty)?,
                             value.ir
                         ));
-                        Ok(Value { ty: value.ty, ir: tmp })
+                        Ok(Value {
+                            ty: value.ty,
+                            ir: tmp,
+                        })
                     }
                 }
             }
@@ -2209,24 +2311,48 @@ impl<'a> FnEmitter<'a> {
                         crate::frontend::ast::BinaryOp::Sub => "sub",
                         crate::frontend::ast::BinaryOp::Mul => "mul",
                         crate::frontend::ast::BinaryOp::Div => {
-                            if self.is_signed_int_type(&lhs.ty) { "sdiv" } else { "udiv" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "sdiv"
+                            } else {
+                                "udiv"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::Rem => {
-                            if self.is_signed_int_type(&lhs.ty) { "srem" } else { "urem" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "srem"
+                            } else {
+                                "urem"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::Eq => "icmp eq",
                         crate::frontend::ast::BinaryOp::NotEq => "icmp ne",
                         crate::frontend::ast::BinaryOp::Lt => {
-                            if self.is_signed_int_type(&lhs.ty) { "icmp slt" } else { "icmp ult" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "icmp slt"
+                            } else {
+                                "icmp ult"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::Lte => {
-                            if self.is_signed_int_type(&lhs.ty) { "icmp sle" } else { "icmp ule" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "icmp sle"
+                            } else {
+                                "icmp ule"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::Gt => {
-                            if self.is_signed_int_type(&lhs.ty) { "icmp sgt" } else { "icmp ugt" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "icmp sgt"
+                            } else {
+                                "icmp ugt"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::Gte => {
-                            if self.is_signed_int_type(&lhs.ty) { "icmp sge" } else { "icmp uge" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "icmp sge"
+                            } else {
+                                "icmp uge"
+                            }
                         }
                         crate::frontend::ast::BinaryOp::And => "and",
                         crate::frontend::ast::BinaryOp::Or => "or",
@@ -2235,7 +2361,11 @@ impl<'a> FnEmitter<'a> {
                         crate::frontend::ast::BinaryOp::BitXor => "xor",
                         crate::frontend::ast::BinaryOp::Shl => "shl",
                         crate::frontend::ast::BinaryOp::Shr => {
-                            if self.is_signed_int_type(&lhs.ty) { "ashr" } else { "lshr" }
+                            if self.is_signed_int_type(&lhs.ty) {
+                                "ashr"
+                            } else {
+                                "lshr"
+                            }
                         }
                     };
                     self.emit(format!(
@@ -2276,9 +2406,15 @@ impl<'a> FnEmitter<'a> {
             return self.invariant_err(msg);
         }
         if name == "panic" {
-            self.require_not_invariant(!type_args.is_empty(), "panic does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "panic does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "panic expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "panic expects string message")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "panic expects string message",
+            )?;
             let (msg_ptr, msg_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             self.emit(format!(
                 "call void @__gost_user_panic(i8* {}, i64 {})",
@@ -2290,7 +2426,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "recover" {
-            self.require_not_invariant(!type_args.is_empty(), "recover does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "recover does not take type arguments",
+            )?;
             self.require_not_invariant(!args.is_empty(), "recover expects 0 arguments")?;
             let out = self.new_temp();
             self.emit(format!("{} = call i32 @__gost_recover()", out));
@@ -2314,16 +2453,25 @@ impl<'a> FnEmitter<'a> {
             let len = self.new_temp();
             self.emit(format!("{} = extractvalue %string {}, 0", ptr, arg.ir));
             self.emit(format!("{} = extractvalue %string {}, 1", len, arg.ir));
-            self.emit(format!("call void @__gost_println_str(i8* {}, i64 {})", ptr, len));
+            self.emit(format!(
+                "call void @__gost_println_str(i8* {}, i64 {})",
+                ptr, len
+            ));
             return Ok(Value {
                 ty: Type::Builtin(BuiltinType::Unit),
                 ir: String::new(),
             });
         }
         if name == "string_len" {
-            self.require_not_invariant(!type_args.is_empty(), "string_len does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "string_len does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "string_len expects one argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "string_len expects string")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "string_len expects string",
+            )?;
             let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let tmp = self.new_temp();
             self.emit(format!(
@@ -2336,9 +2484,15 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "string_get" {
-            self.require_not_invariant(!type_args.is_empty(), "string_get does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "string_get does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 2, "string_get expects two arguments")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "string_get expects string as first argument")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "string_get expects string as first argument",
+            )?;
             let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let idx_ir = self.emit_index_i64(&args[1])?;
             let tmp = self.new_temp();
@@ -2352,9 +2506,15 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "string_slice" {
-            self.require_not_invariant(!type_args.is_empty(), "string_slice does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "string_slice does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 3, "string_slice expects three arguments")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "string_slice expects string as first argument")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "string_slice expects string as first argument",
+            )?;
             let (s_ptr, s_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let start_ir = self.emit_index_i64(&args[1])?;
             let len_ir = self.emit_index_i64(&args[2])?;
@@ -2372,7 +2532,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "string_concat" {
-            self.require_not_invariant(!type_args.is_empty(), "string_concat does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "string_concat does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 2, "string_concat expects two arguments")?;
             self.require_not_invariant(
                 args[0].ty != Type::Builtin(BuiltinType::String)
@@ -2395,7 +2558,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "string_from_byte" {
-            self.require_not_invariant(!type_args.is_empty(), "string_from_byte does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "string_from_byte does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "string_from_byte expects one argument")?;
             let b_ir = match args[0].ty {
                 Type::Builtin(BuiltinType::I32) => args[0].ir.clone(),
@@ -2420,7 +2586,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "make_chan" {
-            self.require_not_invariant(type_args.len() != 1, "make_chan MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "make_chan MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "make_chan expects one argument")?;
             let elem_ty = type_args[0].clone();
             let size_val = self.emit_size_of(&elem_ty)?;
@@ -2448,7 +2617,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "make_slice" {
-            self.require_not_invariant(type_args.len() != 1, "make_slice MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "make_slice MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "make_slice expects two arguments")?;
             let elem_ty = type_args[0].clone();
             let len_ir = self.emit_index_i64(&args[0])?;
@@ -2471,7 +2643,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "$for_in_len" {
-            self.require_not_invariant(type_args.len() != 1, "$for_in_len MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "$for_in_len MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "invalid MIR arity for $for_in_len")?;
             let len_ir = self.emit_for_in_container_len(&args[0])?;
             return Ok(Value {
@@ -2480,7 +2655,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "$for_in_get" {
-            self.require_not_invariant(type_args.len() != 1, "$for_in_get MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "$for_in_get MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "invalid MIR arity for $for_in_get")?;
             let elem_ty = type_args[0].clone();
             let is_string_container = match &args[0].ty {
@@ -2531,7 +2709,10 @@ impl<'a> FnEmitter<'a> {
             return Ok(val);
         }
         if name == "$for_in_take" {
-            self.require_not_invariant(type_args.len() != 1, "$for_in_take MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "$for_in_take MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "invalid MIR arity for $for_in_take")?;
             self.require_not_invariant(
                 !matches!(args[0].ty, Type::MutRef(_)),
@@ -2560,10 +2741,16 @@ impl<'a> FnEmitter<'a> {
                     elem_ptr
                 ));
             }
-            return Ok(Value { ty: elem_ty, ir: tmp });
+            return Ok(Value {
+                ty: elem_ty,
+                ir: tmp,
+            });
         }
         if name == "$for_in_ref" {
-            self.require_not_invariant(type_args.len() != 1, "$for_in_ref MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "$for_in_ref MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "invalid MIR arity for $for_in_ref")?;
             let elem_ty = type_args[0].clone();
             let elem_ptr = self.emit_for_in_elem_ptr(&args[0], &elem_ty, &args[1])?;
@@ -2573,7 +2760,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "$for_in_mutref" {
-            self.require_not_invariant(type_args.len() != 1, "$for_in_mutref MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "$for_in_mutref MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "invalid MIR arity for $for_in_mutref")?;
             self.require_not_invariant(
                 !matches!(args[0].ty, Type::MutRef(_)),
@@ -2734,7 +2924,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "slice_len" {
-            self.require_not_invariant(type_args.len() != 1, "slice_len MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_len MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "slice_len expects one argument")?;
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
             let tmp = self.new_temp();
@@ -2748,7 +2941,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "slice_get_copy" {
-            self.require_not_invariant(type_args.len() != 1, "slice_get_copy MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_get_copy MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "slice_get_copy expects two arguments")?;
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
@@ -2762,12 +2958,21 @@ impl<'a> FnEmitter<'a> {
                 storage_ty,
                 elem_ptr
             ));
-            let val = Value { ty: elem_ty.clone(), ir: tmp.clone() };
+            let val = Value {
+                ty: elem_ty.clone(),
+                ir: tmp.clone(),
+            };
             self.emit_shared_inc_value(&val)?;
-            return Ok(Value { ty: elem_ty, ir: tmp });
+            return Ok(Value {
+                ty: elem_ty,
+                ir: tmp,
+            });
         }
         if name == "slice_set" {
-            self.require_not_invariant(type_args.len() != 1, "slice_set MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_set MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 3, "slice_set expects three arguments")?;
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
@@ -2791,7 +2996,10 @@ impl<'a> FnEmitter<'a> {
         if name == "__gost_chan_can_send" {
             self.require_not_invariant(args.len() != 1, "__gost_chan_can_send expects 1 argument")?;
             let chan = &args[0];
-            self.require_not_invariant(!matches!(chan.ty, Type::Chan(_)), "__gost_chan_can_send expects chan[T]")?;
+            self.require_not_invariant(
+                !matches!(chan.ty, Type::Chan(_)),
+                "__gost_chan_can_send expects chan[T]",
+            )?;
             let tmp = self.new_temp();
             self.emit(format!(
                 "{} = call i32 @__gost_chan_can_send(%chan* {})",
@@ -2805,7 +3013,10 @@ impl<'a> FnEmitter<'a> {
         if name == "__gost_chan_can_recv" {
             self.require_not_invariant(args.len() != 1, "__gost_chan_can_recv expects 1 argument")?;
             let chan = &args[0];
-            self.require_not_invariant(!matches!(chan.ty, Type::Chan(_)), "__gost_chan_can_recv expects chan[T]")?;
+            self.require_not_invariant(
+                !matches!(chan.ty, Type::Chan(_)),
+                "__gost_chan_can_recv expects chan[T]",
+            )?;
             let tmp = self.new_temp();
             self.emit(format!(
                 "{} = call i32 @__gost_chan_can_recv(%chan* {})",
@@ -2826,7 +3037,8 @@ impl<'a> FnEmitter<'a> {
                 } else if arg.ty == Type::Builtin(BuiltinType::I32) {
                     op_args.push(arg);
                 } else {
-                    return self.invariant_err("__gost_select_wait expects chan[T] and i32 op arguments");
+                    return self
+                        .invariant_err("__gost_select_wait expects chan[T] and i32 op arguments");
                 }
             }
 
@@ -2836,7 +3048,10 @@ impl<'a> FnEmitter<'a> {
                     tmp
                 ));
             } else {
-                self.require_not_invariant(!op_args.is_empty() && op_args.len() != chan_args.len(), "__gost_select_wait expects one op per channel")?;
+                self.require_not_invariant(
+                    !op_args.is_empty() && op_args.len() != chan_args.len(),
+                    "__gost_select_wait expects one op per channel",
+                )?;
                 let arr_len = chan_args.len();
                 let arr_ty = format!("[{} x %chan*]", arr_len);
                 let arr_ptr = self.new_temp();
@@ -2886,10 +3101,16 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_error_new" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_error_new does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_error_new does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_error_new expects 1 argument")?;
             let arg = &args[0];
-            self.require_not_invariant(arg.ty != Type::Builtin(BuiltinType::String), "__gost_error_new expects string")?;
+            self.require_not_invariant(
+                arg.ty != Type::Builtin(BuiltinType::String),
+                "__gost_error_new expects string",
+            )?;
             let ptr = self.new_temp();
             let len = self.new_temp();
             self.emit(format!("{} = extractvalue %string {}, 0", ptr, arg.ir));
@@ -2905,9 +3126,15 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_error_message" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_error_message does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_error_message does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_error_message expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::Error), "__gost_error_message expects error")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::Error),
+                "__gost_error_message expects error",
+            )?;
             let out_ptr = self.new_temp();
             self.emit(format!("{} = alloca %string", out_ptr));
             self.emit(format!(
@@ -2922,9 +3149,18 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_singleton_acquire" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_singleton_acquire does not take type arguments")?;
-            self.require_not_invariant(args.len() != 1, "__gost_singleton_acquire expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "__gost_singleton_acquire expects string name")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_singleton_acquire does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 1,
+                "__gost_singleton_acquire expects 1 argument",
+            )?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "__gost_singleton_acquire expects string name",
+            )?;
             let (ptr, len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let tmp = self.new_temp();
             self.emit(format!(
@@ -2937,7 +3173,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_now_ms" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_now_ms does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_now_ms does not take type arguments",
+            )?;
             self.require_not_invariant(!args.is_empty(), "__gost_now_ms expects 0 arguments")?;
             let tmp = self.new_temp();
             self.emit(format!("{} = call i64 @__gost_now_ms()", tmp));
@@ -2947,7 +3186,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_process_exit" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_process_exit does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_process_exit does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_process_exit expects 1 argument")?;
             let code_i32 = match args[0].ty {
                 Type::Builtin(BuiltinType::I32) => args[0].ir.clone(),
@@ -2969,8 +3211,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_os_last_status" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_last_status does not take type arguments")?;
-            self.require_not_invariant(!args.is_empty(), "__gost_os_last_status expects 0 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_last_status does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                !args.is_empty(),
+                "__gost_os_last_status expects 0 arguments",
+            )?;
             let tmp = self.new_temp();
             self.emit(format!("{} = call i32 @__gost_os_last_status()", tmp));
             return Ok(Value {
@@ -2983,7 +3231,10 @@ impl<'a> FnEmitter<'a> {
             || name == "__gost_os_getwd"
             || name == "__gost_os_args"
         {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_* does not take type arguments",
+            )?;
             self.require_not_invariant(!args.is_empty(), "__gost_os_* expects 0 arguments")?;
             let out_ptr = self.new_temp();
             self.emit(format!("{} = alloca %string", out_ptr));
@@ -2996,21 +3247,39 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_os_exec" || name == "__gost_os_pipe" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_os_* expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "__gost_os_* expects string argument")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "__gost_os_* expects string argument",
+            )?;
             let (cmd_ptr, cmd_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let tmp = self.new_temp();
-            self.emit(format!("{} = call i32 @{}(i8* {}, i64 {})", tmp, name, cmd_ptr, cmd_len));
+            self.emit(format!(
+                "{} = call i32 @{}(i8* {}, i64 {})",
+                tmp, name, cmd_ptr, cmd_len
+            ));
             return Ok(Value {
                 ty: Type::Builtin(BuiltinType::I32),
                 ir: tmp,
             });
         }
-        if name == "__gost_os_read_file" || name == "__gost_os_readdir" || name == "__gost_os_getenv" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_* does not take type arguments")?;
+        if name == "__gost_os_read_file"
+            || name == "__gost_os_readdir"
+            || name == "__gost_os_getenv"
+        {
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_os_* expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "__gost_os_* expects string argument")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "__gost_os_* expects string argument",
+            )?;
             let (path_ptr, path_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let out_ptr = self.new_temp();
             self.emit(format!("{} = alloca %string", out_ptr));
@@ -3026,7 +3295,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_os_write_file" || name == "__gost_os_setenv" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 2, "__gost_os_* expects 2 arguments")?;
             self.require_not_invariant(
                 args[0].ty != Type::Builtin(BuiltinType::String)
@@ -3055,10 +3327,20 @@ impl<'a> FnEmitter<'a> {
                 ir: tmp,
             });
         }
-        if name == "__gost_os_remove" || name == "__gost_os_mkdir" || name == "__gost_os_chdir" || name == "__gost_os_stat_size" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_os_* does not take type arguments")?;
+        if name == "__gost_os_remove"
+            || name == "__gost_os_mkdir"
+            || name == "__gost_os_chdir"
+            || name == "__gost_os_stat_size"
+        {
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_os_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_os_* expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "__gost_os_* expects string argument")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "__gost_os_* expects string argument",
+            )?;
             let (path_ptr, path_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let tmp = self.new_temp();
             if name == "__gost_os_stat_size" {
@@ -3084,7 +3366,10 @@ impl<'a> FnEmitter<'a> {
             || name == "__gost_sync_waitgroup_new"
             || name == "__gost_sync_once_new"
         {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_sync_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_sync_* does not take type arguments",
+            )?;
             self.require_not_invariant(!args.is_empty(), "__gost_sync_* expects 0 arguments")?;
             let tmp = self.new_temp();
             self.emit(format!("{} = call i64 @{}()", tmp, name));
@@ -3099,7 +3384,10 @@ impl<'a> FnEmitter<'a> {
             || name == "__gost_sync_waitgroup_wait"
             || name == "__gost_sync_once_begin"
         {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_sync_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_sync_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_sync_* expects 1 argument")?;
             let handle = self.emit_index_i64(&args[0])?;
             let tmp = self.new_temp();
@@ -3110,8 +3398,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_sync_waitgroup_add" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_sync_waitgroup_add does not take type arguments")?;
-            self.require_not_invariant(args.len() != 2, "__gost_sync_waitgroup_add expects 2 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_sync_waitgroup_add does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 2,
+                "__gost_sync_waitgroup_add expects 2 arguments",
+            )?;
             let handle = self.emit_index_i64(&args[0])?;
             let delta_i32 = match args[1].ty {
                 Type::Builtin(BuiltinType::I32) => args[1].ir.clone(),
@@ -3133,8 +3427,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_last_status" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_last_status does not take type arguments")?;
-            self.require_not_invariant(!args.is_empty(), "__gost_net_last_status expects 0 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_last_status does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                !args.is_empty(),
+                "__gost_net_last_status expects 0 arguments",
+            )?;
             let tmp = self.new_temp();
             self.emit(format!("{} = call i32 @__gost_net_last_status()", tmp));
             return Ok(Value {
@@ -3143,8 +3443,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_last_http_status" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_last_http_status does not take type arguments")?;
-            self.require_not_invariant(!args.is_empty(), "__gost_net_last_http_status expects 0 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_last_http_status does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                !args.is_empty(),
+                "__gost_net_last_http_status expects 0 arguments",
+            )?;
             let tmp = self.new_temp();
             self.emit(format!("{} = call i32 @__gost_net_last_http_status()", tmp));
             return Ok(Value {
@@ -3153,8 +3459,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_last_error" || name == "__gost_net_last_peer" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_last_error does not take type arguments")?;
-            self.require_not_invariant(!args.is_empty(), "__gost_net_last_error expects 0 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_last_error does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                !args.is_empty(),
+                "__gost_net_last_error expects 0 arguments",
+            )?;
             let out_ptr = self.new_temp();
             self.emit(format!("{} = alloca %string", out_ptr));
             self.emit(format!("call void @{}(%string* {})", name, out_ptr));
@@ -3171,9 +3483,15 @@ impl<'a> FnEmitter<'a> {
             || name == "__gost_net_udp_connect"
             || name == "__gost_net_ws_connect"
         {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_net_* expects 1 argument")?;
-            self.require_not_invariant(args[0].ty != Type::Builtin(BuiltinType::String), "__gost_net_* expects string address")?;
+            self.require_not_invariant(
+                args[0].ty != Type::Builtin(BuiltinType::String),
+                "__gost_net_* expects string address",
+            )?;
             let (ptr, len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let tmp = self.new_temp();
             self.emit(format!(
@@ -3186,8 +3504,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_tcp_accept" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_tcp_accept does not take type arguments")?;
-            self.require_not_invariant(args.len() != 1, "__gost_net_tcp_accept expects 1 argument")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_tcp_accept does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 1,
+                "__gost_net_tcp_accept expects 1 argument",
+            )?;
             let handle = self.emit_index_i64(&args[0])?;
             let tmp = self.new_temp();
             self.emit(format!(
@@ -3199,8 +3523,14 @@ impl<'a> FnEmitter<'a> {
                 ir: tmp,
             });
         }
-        if name == "__gost_net_tcp_close" || name == "__gost_net_udp_close" || name == "__gost_net_ws_close" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_*_close does not take type arguments")?;
+        if name == "__gost_net_tcp_close"
+            || name == "__gost_net_udp_close"
+            || name == "__gost_net_ws_close"
+        {
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_*_close does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 1, "__gost_net_*_close expects 1 argument")?;
             let handle = self.emit_index_i64(&args[0])?;
             let tmp = self.new_temp();
@@ -3211,9 +3541,18 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_ws_send_text" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_ws_send_text does not take type arguments")?;
-            self.require_not_invariant(args.len() != 2, "__gost_net_ws_send_text expects 2 arguments")?;
-            self.require_not_invariant(args[1].ty != Type::Builtin(BuiltinType::String), "__gost_net_ws_send_text expects string payload")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_ws_send_text does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 2,
+                "__gost_net_ws_send_text expects 2 arguments",
+            )?;
+            self.require_not_invariant(
+                args[1].ty != Type::Builtin(BuiltinType::String),
+                "__gost_net_ws_send_text expects string payload",
+            )?;
             let handle = self.emit_index_i64(&args[0])?;
             let (ptr, len) = self.emit_string_ptr_len_from_value(&args[1])?;
             let tmp = self.new_temp();
@@ -3227,9 +3566,15 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_tcp_write" || name == "__gost_net_udp_send" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 2, "__gost_net_* expects 2 arguments")?;
-            self.require_not_invariant(args[1].ty != Type::Builtin(BuiltinType::String), "__gost_net_* expects string payload")?;
+            self.require_not_invariant(
+                args[1].ty != Type::Builtin(BuiltinType::String),
+                "__gost_net_* expects string payload",
+            )?;
             let handle = self.emit_index_i64(&args[0])?;
             let (ptr, len) = self.emit_string_ptr_len_from_value(&args[1])?;
             let tmp = self.new_temp();
@@ -3243,8 +3588,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_udp_send_to" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_udp_send_to does not take type arguments")?;
-            self.require_not_invariant(args.len() != 3, "__gost_net_udp_send_to expects 3 arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_udp_send_to does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 3,
+                "__gost_net_udp_send_to expects 3 arguments",
+            )?;
             self.require_not_invariant(
                 args[1].ty != Type::Builtin(BuiltinType::String)
                     || args[2].ty != Type::Builtin(BuiltinType::String),
@@ -3267,7 +3618,10 @@ impl<'a> FnEmitter<'a> {
             || name == "__gost_net_udp_recv"
             || name == "__gost_net_udp_recv_from"
         {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_* does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_* does not take type arguments",
+            )?;
             self.require_not_invariant(args.len() != 2, "__gost_net_* expects 2 arguments")?;
             let handle = self.emit_index_i64(&args[0])?;
             let max_i32 = match args[1].ty {
@@ -3293,8 +3647,14 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_ws_recv_text" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_ws_recv_text does not take type arguments")?;
-            self.require_not_invariant(args.len() != 1, "__gost_net_ws_recv_text expects 1 argument")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_ws_recv_text does not take type arguments",
+            )?;
+            self.require_not_invariant(
+                args.len() != 1,
+                "__gost_net_ws_recv_text expects 1 argument",
+            )?;
             let handle = self.emit_index_i64(&args[0])?;
             let out_ptr = self.new_temp();
             self.emit(format!("{} = alloca %string", out_ptr));
@@ -3310,7 +3670,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "__gost_net_http_request" || name == "__gost_net_http_request_headers" {
-            self.require_not_invariant(!type_args.is_empty(), "__gost_net_http_request does not take type arguments")?;
+            self.require_not_invariant(
+                !type_args.is_empty(),
+                "__gost_net_http_request does not take type arguments",
+            )?;
             let expected = if name == "__gost_net_http_request_headers" {
                 5
             } else {
@@ -3323,7 +3686,10 @@ impl<'a> FnEmitter<'a> {
             };
             self.require_not_invariant(args.len() != expected, expected_msg)?;
             for arg in args.iter() {
-                self.require_not_invariant(arg.ty != Type::Builtin(BuiltinType::String), "__gost_net_http_request expects string arguments")?;
+                self.require_not_invariant(
+                    arg.ty != Type::Builtin(BuiltinType::String),
+                    "__gost_net_http_request expects string arguments",
+                )?;
             }
             let (m_ptr, m_len) = self.emit_string_ptr_len_from_value(&args[0])?;
             let (u_ptr, u_len) = self.emit_string_ptr_len_from_value(&args[1])?;
@@ -3351,7 +3717,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "slice_ref" || name == "slice_mutref" {
-            self.require_not_invariant(type_args.len() != 1, "slice_ref MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_ref MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "slice_ref expects two arguments")?;
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
@@ -3367,7 +3736,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "slice_push" {
-            self.require_not_invariant(type_args.len() != 1, "slice_push MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_push MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 2, "slice_push expects two arguments")?;
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
@@ -3403,7 +3775,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "slice_pop" {
-            self.require_not_invariant(type_args.len() != 1, "slice_pop MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "slice_pop MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "slice_pop expects one argument")?;
             let elem_ty = type_args[0].clone();
             let slice_obj = self.emit_slice_obj_from_value(&args[0])?;
@@ -3453,7 +3828,10 @@ impl<'a> FnEmitter<'a> {
                 "{} = insertvalue {} {}, i1 {}, 1",
                 tmp1, llvm_tuple, tmp0, ok
             ));
-            return Ok(Value { ty: tuple_ty, ir: tmp1 });
+            return Ok(Value {
+                ty: tuple_ty,
+                ir: tmp1,
+            });
         }
         if name == "shared_new" || name == "own_new" {
             let type_err = if name == "own_new" {
@@ -3516,7 +3894,10 @@ impl<'a> FnEmitter<'a> {
             || name == "alias_borrow"
         {
             let is_mut_borrow = name == "shared_get_mut" || name == "own_borrow_mut";
-            self.require_not_invariant(type_args.len() != 1, "handle intrinsic MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "handle intrinsic MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "invalid MIR arity for handle intrinsic")?;
             let elem_ty = type_args[0].clone();
             let shared_obj = self.emit_shared_obj_from_value(&args[0])?;
@@ -3561,10 +3942,16 @@ impl<'a> FnEmitter<'a> {
             } else {
                 Type::Ref(Box::new(elem_ty))
             };
-            return Ok(Value { ty: ref_ty, ir: cast_ptr });
+            return Ok(Value {
+                ty: ref_ty,
+                ir: cast_ptr,
+            });
         }
         if name == "freeze" {
-            self.require_not_invariant(type_args.len() != 1, "freeze MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "freeze MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "invalid MIR arity for freeze")?;
             let elem_ty = type_args[0].clone();
             self.require_not_invariant(
@@ -3577,7 +3964,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "own_into_value" {
-            self.require_not_invariant(type_args.len() != 1, "handle intrinsic MIR call must carry exactly one type argument")?;
+            self.require_not_invariant(
+                type_args.len() != 1,
+                "handle intrinsic MIR call must carry exactly one type argument",
+            )?;
             self.require_not_invariant(args.len() != 1, "invalid MIR arity for own_into_value")?;
             let elem_ty = type_args[0].clone();
             self.require_not_invariant(
@@ -3634,10 +4024,16 @@ impl<'a> FnEmitter<'a> {
                 storage_ty,
                 alloca
             ));
-            return Ok(Value { ty: elem_ty, ir: out });
+            return Ok(Value {
+                ty: elem_ty,
+                ir: out,
+            });
         }
         if name == "make_map" {
-            self.require_invariant(type_args.len() == 2, "make_map MIR call must carry exactly two type arguments")?;
+            self.require_invariant(
+                type_args.len() == 2,
+                "make_map MIR call must carry exactly two type arguments",
+            )?;
             self.require_invariant(args.len() == 1, "make_map expects one argument")?;
             let key_ty = type_args[0].clone();
             let val_ty = type_args[1].clone();
@@ -3682,7 +4078,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "map_len" {
-            self.require_invariant(type_args.len() == 2, "map_len MIR call must carry exactly two type arguments")?;
+            self.require_invariant(
+                type_args.len() == 2,
+                "map_len MIR call must carry exactly two type arguments",
+            )?;
             self.require_invariant(args.len() == 1, "map_len expects one argument")?;
             let map_obj = self.emit_map_obj_from_value(&args[0])?;
             let tmp = self.new_temp();
@@ -3696,7 +4095,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "map_get" {
-            self.require_invariant(type_args.len() == 2, "map_get MIR call must carry exactly two type arguments")?;
+            self.require_invariant(
+                type_args.len() == 2,
+                "map_get MIR call must carry exactly two type arguments",
+            )?;
             self.require_invariant(args.len() == 2, "map_get expects two arguments")?;
             let key_ty = type_args[0].clone();
             let val_ty = type_args[1].clone();
@@ -3725,7 +4127,10 @@ impl<'a> FnEmitter<'a> {
                 val_storage,
                 val_alloca
             ));
-            let val = Value { ty: val_ty.clone(), ir: val_tmp.clone() };
+            let val = Value {
+                ty: val_ty.clone(),
+                ir: val_tmp.clone(),
+            };
             self.emit_shared_inc_value(&val)?;
             let tuple_ty = Type::Tuple(vec![val_ty.clone(), Type::Builtin(BuiltinType::Bool)]);
             let llvm_tuple = llvm_type(&tuple_ty)?;
@@ -3742,10 +4147,16 @@ impl<'a> FnEmitter<'a> {
                 "{} = insertvalue {} {}, i1 {}, 1",
                 tmp1, llvm_tuple, tmp0, ok
             ));
-            return Ok(Value { ty: tuple_ty, ir: tmp1 });
+            return Ok(Value {
+                ty: tuple_ty,
+                ir: tmp1,
+            });
         }
         if name == "map_set" {
-            self.require_invariant(type_args.len() == 2, "map_set MIR call must carry exactly two type arguments")?;
+            self.require_invariant(
+                type_args.len() == 2,
+                "map_set MIR call must carry exactly two type arguments",
+            )?;
             self.require_invariant(args.len() == 3, "map_set expects three arguments")?;
             let key_ty = type_args[0].clone();
             let val_ty = type_args[1].clone();
@@ -3779,7 +4190,10 @@ impl<'a> FnEmitter<'a> {
             });
         }
         if name == "map_del" {
-            self.require_invariant(type_args.len() == 2, "map_del MIR call must carry exactly two type arguments")?;
+            self.require_invariant(
+                type_args.len() == 2,
+                "map_del MIR call must carry exactly two type arguments",
+            )?;
             self.require_invariant(args.len() == 2, "map_del expects two arguments")?;
             let key_ty = type_args[0].clone();
             let map_obj = self.emit_map_obj_from_value(&args[0])?;
@@ -3864,7 +4278,8 @@ impl<'a> FnEmitter<'a> {
             } => (params.clone(), *ret.clone(), *is_variadic),
             _ => return self.invariant_err("call target must be function pointer"),
         };
-        if (!is_variadic && args.len() != params.len()) || (is_variadic && args.len() < params.len())
+        if (!is_variadic && args.len() != params.len())
+            || (is_variadic && args.len() < params.len())
         {
             return self.invariant_err("argument count mismatch");
         }
@@ -3913,7 +4328,10 @@ impl<'a> FnEmitter<'a> {
         type_args: &[TypeAst],
         args: &[Expr],
     ) -> Result<Value, String> {
-        self.require_not_invariant(type_args.len() > 1, "asm MIR call carried invalid type argument count")?;
+        self.require_not_invariant(
+            type_args.len() > 1,
+            "asm MIR call carried invalid type argument count",
+        )?;
         self.require_not_invariant(args.is_empty(), "asm expects at least 1 argument")?;
         let template = match &args[0].kind {
             ExprKind::String(s) => s.clone(),
@@ -3931,7 +4349,10 @@ impl<'a> FnEmitter<'a> {
         if args.len() >= 3 {
             for arg in args.iter().skip(2) {
                 let val = self.emit_expr(arg)?;
-                self.require_not_invariant(val.ty == Type::Builtin(BuiltinType::Unit), "asm operands cannot be unit")?;
+                self.require_not_invariant(
+                    val.ty == Type::Builtin(BuiltinType::Unit),
+                    "asm operands cannot be unit",
+                )?;
                 operand_values.push(val);
             }
         }
@@ -3953,12 +4374,12 @@ impl<'a> FnEmitter<'a> {
         } else if spec.outputs.len() == 1 {
             if explicit_style {
                 operand_values
-                    .get(0)
+                    .first()
                     .map(|v| v.ty.clone())
                     .unwrap_or(Type::Builtin(BuiltinType::I64))
             } else if spec.readwrite_outputs > 0 {
                 operand_values
-                    .get(0)
+                    .first()
                     .map(|v| v.ty.clone())
                     .unwrap_or(Type::Builtin(BuiltinType::I64))
             } else {
@@ -3993,9 +4414,9 @@ impl<'a> FnEmitter<'a> {
         if explicit_style {
             for (idx, kind) in spec.outputs.iter().enumerate() {
                 if matches!(kind, AsmOutputKind::ReadWrite) {
-                    let val = operand_values
-                        .get(idx)
-                        .ok_or_else(|| Self::invariant_violation("missing asm readwrite output operand"))?;
+                    let val = operand_values.get(idx).ok_or_else(|| {
+                        Self::invariant_violation("missing asm readwrite output operand")
+                    })?;
                     arg_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
                 }
             }
@@ -4040,7 +4461,10 @@ impl<'a> FnEmitter<'a> {
                 escaped_constraints,
                 arg_ir.join(", ")
             ));
-            Ok(Value { ty: ret_ty, ir: tmp })
+            Ok(Value {
+                ty: ret_ty,
+                ir: tmp,
+            })
         }
     }
 
@@ -4099,7 +4523,10 @@ impl<'a> FnEmitter<'a> {
         let mut operand_values = Vec::new();
         for arg in args.iter().skip(3) {
             let val = self.emit_expr(arg)?;
-            self.require_not_invariant(val.ty == Type::Builtin(BuiltinType::Unit), "asm_goto operands cannot be unit")?;
+            self.require_not_invariant(
+                val.ty == Type::Builtin(BuiltinType::Unit),
+                "asm_goto operands cannot be unit",
+            )?;
             operand_values.push(val);
         }
         let spec = parse_asm_constraint_spec(&constraints_raw);
@@ -4120,12 +4547,12 @@ impl<'a> FnEmitter<'a> {
         } else if spec.outputs.len() == 1 {
             if explicit_style {
                 operand_values
-                    .get(0)
+                    .first()
                     .map(|v| v.ty.clone())
                     .unwrap_or(Type::Builtin(BuiltinType::I64))
             } else if spec.readwrite_outputs > 0 {
                 operand_values
-                    .get(0)
+                    .first()
                     .map(|v| v.ty.clone())
                     .unwrap_or(Type::Builtin(BuiltinType::I64))
             } else {
@@ -4160,9 +4587,9 @@ impl<'a> FnEmitter<'a> {
         if explicit_style {
             for (idx, kind) in spec.outputs.iter().enumerate() {
                 if matches!(kind, AsmOutputKind::ReadWrite) {
-                    let val = operand_values
-                        .get(idx)
-                        .ok_or_else(|| Self::invariant_violation("missing asm_goto readwrite output operand"))?;
+                    let val = operand_values.get(idx).ok_or_else(|| {
+                        Self::invariant_violation("missing asm_goto readwrite output operand")
+                    })?;
                     args_ir.push(format!("{} {}", llvm_type(&val.ty)?, val.ir));
                 }
             }
@@ -4254,7 +4681,10 @@ impl<'a> FnEmitter<'a> {
                 ir: String::new(),
             })
         } else {
-            Ok(Value { ty: ret_ty, ir: ret_ir })
+            Ok(Value {
+                ty: ret_ty,
+                ir: ret_ir,
+            })
         }
     }
 
@@ -4331,12 +4761,7 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
-    fn emit_for_in_stmt(
-        &mut self,
-        name: &str,
-        iter: &Expr,
-        body: &Block,
-    ) -> Result<(), String> {
+    fn emit_for_in_stmt(&mut self, name: &str, iter: &Expr, body: &Block) -> Result<(), String> {
         let iter_val = self.emit_expr(iter)?;
         let (elem_ty, loop_var_ty) = match &iter_val.ty {
             Type::Slice(inner) => {
@@ -4360,11 +4785,7 @@ impl<'a> FnEmitter<'a> {
                     let elem = Type::Builtin(BuiltinType::U32);
                     (elem.clone(), Type::Ref(Box::new(elem)))
                 }
-                _ => {
-                    return self.invariant_err(
-                        "invalid MIR iterable container type",
-                    )
-                }
+                _ => return self.invariant_err("invalid MIR iterable container type"),
             },
             Type::MutRef(inner) => match &**inner {
                 Type::Slice(elem) => {
@@ -4375,17 +4796,9 @@ impl<'a> FnEmitter<'a> {
                     let elem = Type::Builtin(BuiltinType::U32);
                     (elem.clone(), Type::MutRef(Box::new(elem)))
                 }
-                _ => {
-                    return self.invariant_err(
-                        "invalid MIR iterable container type",
-                    )
-                }
+                _ => return self.invariant_err("invalid MIR iterable container type"),
             },
-            _ => {
-                return self.invariant_err(
-                    "invalid MIR iterable container type",
-                )
-            }
+            _ => return self.invariant_err("invalid MIR iterable container type"),
         };
         let slice_obj = self.emit_slice_obj_from_value(&iter_val)?;
         let len = self.new_temp();
@@ -4555,34 +4968,32 @@ impl<'a> FnEmitter<'a> {
         } else {
             None
         };
-        let wait_idx = wait_name
-            .as_ref()
-            .map(|name| self.add_block(name.clone()));
-        if non_default.is_empty() {
-            if let Some(default_idx) = default_index {
-                let default_name = default_name
-                    .as_ref()
-                    .ok_or_else(|| Self::invariant_violation("select default missing block"))?;
-                let default_block = default_block
-                    .ok_or_else(|| Self::invariant_violation("select default missing block"))?;
-                self.terminate(format!("br label %{}", default_name));
-                self.switch_to(default_block);
-                let arm = &arms[default_idx];
-                let _ = match &arm.body {
-                    crate::frontend::ast::BlockOrExpr::Block(block) => self.emit_block(block),
-                    crate::frontend::ast::BlockOrExpr::Expr(expr) => self.emit_expr(expr).map(|_| {
-                        Some(Value {
-                            ty: Type::Builtin(BuiltinType::Unit),
-                            ir: String::new(),
-                        })
-                    }),
-                }?;
-                if !self.current_block_terminated() {
-                    self.terminate(format!("br label %{}", end_name));
-                }
-                self.switch_to(end_idx);
-                return Ok(());
+        let wait_idx = wait_name.as_ref().map(|name| self.add_block(name.clone()));
+        if non_default.is_empty()
+            && let Some(default_idx) = default_index
+        {
+            let default_name = default_name
+                .as_ref()
+                .ok_or_else(|| Self::invariant_violation("select default missing block"))?;
+            let default_block = default_block
+                .ok_or_else(|| Self::invariant_violation("select default missing block"))?;
+            self.terminate(format!("br label %{}", default_name));
+            self.switch_to(default_block);
+            let arm = &arms[default_idx];
+            let _ = match &arm.body {
+                crate::frontend::ast::BlockOrExpr::Block(block) => self.emit_block(block),
+                crate::frontend::ast::BlockOrExpr::Expr(expr) => self.emit_expr(expr).map(|_| {
+                    Some(Value {
+                        ty: Type::Builtin(BuiltinType::Unit),
+                        ir: String::new(),
+                    })
+                }),
+            }?;
+            if !self.current_block_terminated() {
+                self.terminate(format!("br label %{}", end_name));
             }
+            self.switch_to(end_idx);
+            return Ok(());
         }
         for (pos, arm_idx) in non_default.iter().enumerate() {
             let is_last = pos + 1 == non_default.len();
@@ -4655,9 +5066,9 @@ impl<'a> FnEmitter<'a> {
                     let chan_val = arm_channels[*arm_idx]
                         .as_ref()
                         .ok_or_else(|| Self::invariant_violation("select send missing channel"))?;
-                    let elem_ty = arm_elem_tys[*arm_idx]
-                        .as_ref()
-                        .ok_or_else(|| Self::invariant_violation("select send missing element type"))?;
+                    let elem_ty = arm_elem_tys[*arm_idx].as_ref().ok_or_else(|| {
+                        Self::invariant_violation("select send missing element type")
+                    })?;
                     self.emit_send_with_value(chan_val, elem_ty, value)?;
                 }
                 crate::frontend::ast::SelectArmKind::Recv { .. }
@@ -4665,9 +5076,9 @@ impl<'a> FnEmitter<'a> {
                     let chan_val = arm_channels[*arm_idx]
                         .as_ref()
                         .ok_or_else(|| Self::invariant_violation("select recv missing channel"))?;
-                    let elem_ty = arm_elem_tys[*arm_idx]
-                        .as_ref()
-                        .ok_or_else(|| Self::invariant_violation("select recv missing element type"))?;
+                    let elem_ty = arm_elem_tys[*arm_idx].as_ref().ok_or_else(|| {
+                        Self::invariant_violation("select recv missing element type")
+                    })?;
                     let storage_ty = llvm_storage_type(elem_ty)?;
                     let val_ptr = self.new_temp();
                     self.emit(format!("{} = alloca {}", val_ptr, storage_ty));
@@ -4725,15 +5136,18 @@ impl<'a> FnEmitter<'a> {
                             llvm_storage_type(elem_ty)?,
                             val_alloca
                         ));
-                        self.locals.insert(name.clone(), (elem_ty.clone(), val_alloca));
+                        self.locals
+                            .insert(name.clone(), (elem_ty.clone(), val_alloca));
                         if let Some(scope) = self.scopes.last_mut() {
                             scope.push(name.clone());
                         }
                         let ok_alloca = self.new_temp();
                         self.emit(format!("{} = alloca i1", ok_alloca));
                         self.emit(format!("store i1 {}, i1* {}", ok_tmp, ok_alloca));
-                        self.locals
-                            .insert(ok_name.clone(), (Type::Builtin(BuiltinType::Bool), ok_alloca));
+                        self.locals.insert(
+                            ok_name.clone(),
+                            (Type::Builtin(BuiltinType::Bool), ok_alloca),
+                        );
                         if let Some(scope) = self.scopes.last_mut() {
                             scope.push(ok_name.clone());
                         }
@@ -4782,7 +5196,8 @@ impl<'a> FnEmitter<'a> {
             }
         }
         if default_index.is_none() {
-            let wait_idx = wait_idx.ok_or_else(|| Self::invariant_violation("select wait missing block"))?;
+            let wait_idx =
+                wait_idx.ok_or_else(|| Self::invariant_violation("select wait missing block"))?;
             self.switch_to(wait_idx);
             if !non_default.is_empty() {
                 let arr_len = non_default.len();
@@ -4836,8 +5251,11 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn emit_go_stmt(&mut self, expr: &Expr) -> Result<(), String> {
-        let (name, type_args, args) =
-            self.extract_direct_call(expr, "go expects a call expression", "go expects a direct call")?;
+        let (name, type_args, args) = self.extract_direct_call(
+            expr,
+            "go expects a call expression",
+            "go expects a direct call",
+        )?;
         self.require_invariant(type_args.is_empty(), "go does not accept type arguments")?;
         self.require_invariant(name != "make_chan", "go does not support intrinsic calls")?;
         let sig = self
@@ -4895,9 +5313,7 @@ impl<'a> FnEmitter<'a> {
                     None,
                 )
             }
-            MirStmt::ForIn { name, iter, body } => {
-                self.emit_for_in_stmt(name, iter, body)
-            }
+            MirStmt::ForIn { name, iter, body } => self.emit_for_in_stmt(name, iter, body),
             MirStmt::Select { arms } => self.emit_select_stmt(arms),
             MirStmt::Go { expr } => self.emit_go_stmt(expr),
             MirStmt::Expr { expr } => {
@@ -4933,19 +5349,24 @@ impl<'a> FnEmitter<'a> {
                     } else {
                         self.emit(format!("store i8 0, i8* {}", info.ptr));
                     }
-                    if let Some(name) = &info.name {
-                        if self.is_linear_type(&info.ty) {
-                            self.mark_assigned(name);
-                        }
+                    if let Some(name) = &info.name
+                        && self.is_linear_type(&info.ty)
+                    {
+                        self.mark_assigned(name);
                     }
                     return Ok(());
                 }
                 let (tuple_items, index_offset) = match &val.ty {
                     Type::Tuple(items) => (items.clone(), 0usize),
-                    Type::Result(ok, err) => (vec![ok.as_ref().clone(), err.as_ref().clone()], 1usize),
+                    Type::Result(ok, err) => {
+                        (vec![ok.as_ref().clone(), err.as_ref().clone()], 1usize)
+                    }
                     _ => return self.invariant_err("mir eval expects tuple for multiple outputs"),
                 };
-                self.require_not_invariant(tuple_items.len() != out.len(), "mir eval output count mismatch")?;
+                self.require_not_invariant(
+                    tuple_items.len() != out.len(),
+                    "mir eval output count mismatch",
+                )?;
                 for (idx, local_id) in out.iter().enumerate() {
                     let info = self
                         .mir_local_ptrs
@@ -4971,10 +5392,10 @@ impl<'a> FnEmitter<'a> {
                     } else {
                         self.emit(format!("store i8 0, i8* {}", info.ptr));
                     }
-                    if let Some(name) = &info.name {
-                        if self.is_linear_type(&info.ty) {
-                            self.mark_assigned(name);
-                        }
+                    if let Some(name) = &info.name
+                        && self.is_linear_type(&info.ty)
+                    {
+                        self.mark_assigned(name);
                     }
                 }
                 Ok(())
@@ -5006,9 +5427,11 @@ impl<'a> FnEmitter<'a> {
                 if *op != crate::frontend::ast::AssignOp::Assign {
                     val = self.emit_compound_assign_value(op, &target_ty, &target_ptr, val)?;
                 }
-                if target_ty != val.ty && self.is_int_type(&target_ty) && self.is_int_type(&val.ty) {
+                if target_ty != val.ty && self.is_int_type(&target_ty) && self.is_int_type(&val.ty)
+                {
                     val = self.cast_int_value(val, &target_ty)?;
-                } else if target_ty != val.ty && is_float_type(&target_ty) && is_float_type(&val.ty) {
+                } else if target_ty != val.ty && is_float_type(&target_ty) && is_float_type(&val.ty)
+                {
                     val = self.cast_value(val, &target_ty)?;
                 }
                 if target_ty != Type::Builtin(BuiltinType::Unit) {
@@ -5020,10 +5443,10 @@ impl<'a> FnEmitter<'a> {
                         target_ptr
                     ));
                 }
-                if let Some(name) = target_name {
-                    if self.is_linear_type(&target_ty) {
-                        self.mark_assigned(name);
-                    }
+                if let Some(name) = target_name
+                    && self.is_linear_type(&target_ty)
+                {
+                    self.mark_assigned(name);
                 }
                 Ok(())
             }
@@ -5031,17 +5454,13 @@ impl<'a> FnEmitter<'a> {
                 self.unreachable_internal("MirStmt::Let must be lowered to Eval before codegen")
             }
             MirStmt::Drop { local } => {
-                let info = self
-                    .mir_local_ptrs
-                    .get(*local)
-                    .and_then(|opt| opt.clone());
+                let info = self.mir_local_ptrs.get(*local).and_then(|opt| opt.clone());
                 if let Some(info) = info {
-                    if let Some(name) = &info.name {
-                        if self.is_linear_type(&info.ty)
-                            && self.linear_states.get(name).copied() == Some(false)
-                        {
-                            return Ok(());
-                        }
+                    if let Some(name) = &info.name
+                        && self.is_linear_type(&info.ty)
+                        && self.linear_states.get(name).copied() == Some(false)
+                    {
+                        return Ok(());
                     }
                     self.emit_drop_for_ptr(&info.ty, &info.ptr)?;
                 }
@@ -5056,10 +5475,7 @@ impl<'a> FnEmitter<'a> {
                     }
                     self.emit_drop_for_ptr(&local_ty, &ptr)?;
                 } else {
-                    return self.invariant_err_fmt(format!(
-                        "unknown local {} for drop",
-                        name
-                    ));
+                    return self.invariant_err_fmt(format!("unknown local {} for drop", name));
                 }
                 Ok(())
             }
@@ -5076,7 +5492,11 @@ impl<'a> FnEmitter<'a> {
                 self.terminate(format!("br label %{}", block_names[*target]));
                 Ok(())
             }
-            Terminator::If { cond, then_bb, else_bb } => {
+            Terminator::If {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
                 let cond_val = self.emit_expr(cond)?;
                 self.terminate(format!(
                     "br i1 {}, label %{}, label %{}",
@@ -5084,9 +5504,14 @@ impl<'a> FnEmitter<'a> {
                 ));
                 Ok(())
             }
-            Terminator::Match { scrutinee, arms, default } => {
+            Terminator::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
                 let scrut_val = self.emit_expr(scrutinee)?;
-                let default_bb = default.ok_or_else(|| Self::invariant_violation("match default missing"))?;
+                let default_bb =
+                    default.ok_or_else(|| Self::invariant_violation("match default missing"))?;
                 if arms.is_empty() {
                     self.terminate(format!("br label %{}", block_names[default_bb]));
                     return Ok(());
@@ -5132,9 +5557,7 @@ impl<'a> FnEmitter<'a> {
                                 }
                                 cases.push(format!(
                                     "{} {}, label %{}",
-                                    scrut_llvm_ty,
-                                    lit,
-                                    block_names[*target]
+                                    scrut_llvm_ty, lit, block_names[*target]
                                 ));
                             }
                         }
@@ -5192,7 +5615,10 @@ impl<'a> FnEmitter<'a> {
                     let val = self.emit_expr(expr)?;
                     self.emit_return_value(Some(val))
                 } else {
-                    self.require_not_invariant(self.ret_type != Type::Builtin(BuiltinType::Unit), "missing return value")?;
+                    self.require_not_invariant(
+                        self.ret_type != Type::Builtin(BuiltinType::Unit),
+                        "missing return value",
+                    )?;
                     self.emit_return_value(None)
                 }
             }
@@ -5227,10 +5653,7 @@ impl<'a> FnEmitter<'a> {
         let mut lines = Vec::new();
         lines.push(format!("define void @{}(i8* %ctx) {{", thunk_name));
         lines.push("entry:".to_string());
-        lines.push(format!(
-            "  %ctx_cast = bitcast i8* %ctx to {}*",
-            ctx_ty
-        ));
+        lines.push(format!("  %ctx_cast = bitcast i8* %ctx to {}*", ctx_ty));
         let mut arg_ir = Vec::new();
         let mut field_slots = Vec::new();
         for (idx, ty) in param_tys.iter().enumerate() {
@@ -5252,19 +5675,13 @@ impl<'a> FnEmitter<'a> {
             ));
             if matches!(ty, Type::Alias(_) | Type::Shared(_)) {
                 let obj = format!("%sh_obj{}", idx);
-                lines.push(format!(
-                    "  {} = extractvalue %shared {}, 0",
-                    obj, tmp
-                ));
+                lines.push(format!("  {} = extractvalue %shared {}, 0", obj, tmp));
                 lines.push(format!(
                     "  call void @__gost_shared_inc(%shared_obj* {})",
                     obj
                 ));
             } else if matches!(ty, Type::Chan(_)) {
-                lines.push(format!(
-                    "  call void @__gost_chan_retain(%chan* {})",
-                    tmp
-                ));
+                lines.push(format!("  call void @__gost_chan_retain(%chan* {})", tmp));
             }
             arg_ir.push(tmp);
         }
@@ -5313,10 +5730,7 @@ impl<'a> FnEmitter<'a> {
             "  %size_ptr = getelementptr {}, {}* null, i32 1",
             ctx_ty, ctx_ty
         ));
-        lines.push(format!(
-            "  %size = ptrtoint {}* %size_ptr to i64",
-            ctx_ty
-        ));
+        lines.push(format!("  %size = ptrtoint {}* %size_ptr to i64", ctx_ty));
         lines.push("  call void @__gost_free(i8* %ctx, i64 %size, i64 1)".to_string());
         lines.push("  ret void".to_string());
         lines.push("}".to_string());
@@ -5338,10 +5752,7 @@ impl<'a> FnEmitter<'a> {
             ptr, llvm_ty, llvm_ty
         ));
         let size = self.new_temp();
-        self.emit(format!(
-            "{} = ptrtoint {}* {} to i64",
-            size, llvm_ty, ptr
-        ));
+        self.emit(format!("{} = ptrtoint {}* {} to i64", size, llvm_ty, ptr));
         Ok(Value {
             ty: Type::Builtin(BuiltinType::I64),
             ir: size,
@@ -5352,24 +5763,15 @@ impl<'a> FnEmitter<'a> {
         match &value.ty {
             Type::Slice(_) | Type::Builtin(BuiltinType::Bytes) => {
                 let obj = self.new_temp();
-                self.emit(format!(
-                    "{} = extractvalue %slice {}, 0",
-                    obj, value.ir
-                ));
+                self.emit(format!("{} = extractvalue %slice {}, 0", obj, value.ir));
                 Ok(obj)
             }
             Type::Ref(inner) | Type::MutRef(inner) => match &**inner {
                 Type::Slice(_) | Type::Builtin(BuiltinType::Bytes) => {
                     let tmp = self.new_temp();
-                    self.emit(format!(
-                        "{} = load %slice, %slice* {}",
-                        tmp, value.ir
-                    ));
+                    self.emit(format!("{} = load %slice, %slice* {}", tmp, value.ir));
                     let obj = self.new_temp();
-                    self.emit(format!(
-                        "{} = extractvalue %slice {}, 0",
-                        obj, tmp
-                    ));
+                    self.emit(format!("{} = extractvalue %slice {}, 0", obj, tmp));
                     Ok(obj)
                 }
                 _ => self.invariant_err("expected ref to slice"),
@@ -5494,7 +5896,10 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
-    fn emit_string_ptr_len_from_value(&mut self, value: &Value) -> Result<(String, String), String> {
+    fn emit_string_ptr_len_from_value(
+        &mut self,
+        value: &Value,
+    ) -> Result<(String, String), String> {
         match &value.ty {
             Type::Builtin(BuiltinType::String) => {
                 let ptr = self.new_temp();
@@ -5523,24 +5928,15 @@ impl<'a> FnEmitter<'a> {
         match &value.ty {
             Type::Map(_, _) => {
                 let obj = self.new_temp();
-                self.emit(format!(
-                    "{} = extractvalue %map {}, 0",
-                    obj, value.ir
-                ));
+                self.emit(format!("{} = extractvalue %map {}, 0", obj, value.ir));
                 Ok(obj)
             }
             Type::Ref(inner) | Type::MutRef(inner) => match &**inner {
                 Type::Map(_, _) => {
                     let tmp = self.new_temp();
-                    self.emit(format!(
-                        "{} = load %map, %map* {}",
-                        tmp, value.ir
-                    ));
+                    self.emit(format!("{} = load %map, %map* {}", tmp, value.ir));
                     let obj = self.new_temp();
-                    self.emit(format!(
-                        "{} = extractvalue %map {}, 0",
-                        obj, tmp
-                    ));
+                    self.emit(format!("{} = extractvalue %map {}, 0", obj, tmp));
                     Ok(obj)
                 }
                 _ => self.unreachable_internal("expected ref to map"),
@@ -5553,24 +5949,15 @@ impl<'a> FnEmitter<'a> {
         match &value.ty {
             Type::Own(_) | Type::Alias(_) | Type::Shared(_) => {
                 let obj = self.new_temp();
-                self.emit(format!(
-                    "{} = extractvalue %shared {}, 0",
-                    obj, value.ir
-                ));
+                self.emit(format!("{} = extractvalue %shared {}, 0", obj, value.ir));
                 Ok(obj)
             }
             Type::Ref(inner) | Type::MutRef(inner) => match &**inner {
                 Type::Own(_) | Type::Alias(_) | Type::Shared(_) => {
                     let tmp = self.new_temp();
-                    self.emit(format!(
-                        "{} = load %shared, %shared* {}",
-                        tmp, value.ir
-                    ));
+                    self.emit(format!("{} = load %shared, %shared* {}", tmp, value.ir));
                     let obj = self.new_temp();
-                    self.emit(format!(
-                        "{} = extractvalue %shared {}, 0",
-                        obj, tmp
-                    ));
+                    self.emit(format!("{} = extractvalue %shared {}, 0", obj, tmp));
                     Ok(obj)
                 }
                 _ => self.invariant_err("expected ref to own/alias/shared"),
@@ -5583,10 +5970,16 @@ impl<'a> FnEmitter<'a> {
         match &value.ty {
             Type::Alias(_) | Type::Shared(_) => {
                 let obj = self.emit_shared_obj_from_value(value)?;
-                self.emit(format!("call void @__gost_shared_inc(%shared_obj* {})", obj));
+                self.emit(format!(
+                    "call void @__gost_shared_inc(%shared_obj* {})",
+                    obj
+                ));
             }
             Type::Chan(_) => {
-                self.emit(format!("call void @__gost_chan_retain(%chan* {})", value.ir));
+                self.emit(format!(
+                    "call void @__gost_chan_retain(%chan* {})",
+                    value.ir
+                ));
             }
             _ => {}
         }
@@ -5820,10 +6213,7 @@ impl<'a> FnEmitter<'a> {
                 rhs_null, rhs_payload
             ));
             let any_null = Self::map_key_tmp("payload_any_null", counter);
-            lines.push(format!(
-                "  {} = or i1 {}, {}",
-                any_null, lhs_null, rhs_null
-            ));
+            lines.push(format!("  {} = or i1 {}, {}", any_null, lhs_null, rhs_null));
 
             let null_label = Self::map_key_label("mk_eq_enum_null", counter);
             let work_label = Self::map_key_label("mk_eq_enum_work", counter);
@@ -5837,10 +6227,13 @@ impl<'a> FnEmitter<'a> {
             phi_incomings.push(format!("[ 0, %{} ]", null_label));
 
             lines.push(format!("{}:", work_label));
-            let payload_ty = self.enum_payload_type_name(enum_name, case_labels
-                .iter()
-                .position(|label| label == case_label)
-                .ok_or_else(|| Self::invariant_violation("enum case index lookup failed"))?);
+            let payload_ty = self.enum_payload_type_name(
+                enum_name,
+                case_labels
+                    .iter()
+                    .position(|label| label == case_label)
+                    .ok_or_else(|| Self::invariant_violation("enum case index lookup failed"))?,
+            );
             let lhs_payload_ptr = Self::map_key_tmp("lhs_payload_ptr", counter);
             lines.push(format!(
                 "  {} = bitcast i8* {} to {}*",
@@ -5879,11 +6272,7 @@ impl<'a> FnEmitter<'a> {
 
         lines.push(format!("{}:", end_label));
         let out = Self::map_key_tmp("enum_eq", counter);
-        lines.push(format!(
-            "  {} = phi i1 {}",
-            out,
-            phi_incomings.join(", ")
-        ));
+        lines.push(format!("  {} = phi i1 {}", out, phi_incomings.join(", ")));
         Ok(out)
     }
 
@@ -5913,8 +6302,7 @@ impl<'a> FnEmitter<'a> {
             "  store {} {}, {}* {}",
             tag_llvm, tag, tag_llvm, tag_alloca
         ));
-        let tag_hash =
-            self.emit_map_key_hash_from_ptr(&tag_ty, &tag_alloca, lines, counter)?;
+        let tag_hash = self.emit_map_key_hash_from_ptr(&tag_ty, &tag_alloca, lines, counter)?;
 
         if def.variants.iter().all(|(_, fields)| fields.is_empty()) {
             return Ok(tag_hash);
@@ -5957,7 +6345,10 @@ impl<'a> FnEmitter<'a> {
             }
 
             let payload = Self::map_key_tmp("enum_payload", counter);
-            lines.push(format!("  {} = extractvalue {} {}, 1", payload, named_ty, val));
+            lines.push(format!(
+                "  {} = extractvalue {} {}, 1",
+                payload, named_ty, val
+            ));
             let payload_null = Self::map_key_tmp("enum_payload_null", counter);
             lines.push(format!(
                 "  {} = icmp eq i8* {}, null",
@@ -5989,8 +6380,7 @@ impl<'a> FnEmitter<'a> {
                     "  {} = getelementptr {}, {}* {}, i32 0, i32 {}",
                     field_ptr, payload_ty, payload_ty, payload_ptr, field_idx
                 ));
-                let part =
-                    self.emit_map_key_hash_from_ptr(field_ty, &field_ptr, lines, counter)?;
+                let part = self.emit_map_key_hash_from_ptr(field_ty, &field_ptr, lines, counter)?;
                 acc = Self::mix_hash_ir(lines, counter, acc, part);
             }
             lines.push(format!("  br label %{}", end_label));
@@ -5999,11 +6389,7 @@ impl<'a> FnEmitter<'a> {
 
         lines.push(format!("{}:", end_label));
         let out = Self::map_key_tmp("enum_hash", counter);
-        lines.push(format!(
-            "  {} = phi i64 {}",
-            out,
-            phi_incomings.join(", ")
-        ));
+        lines.push(format!("  {} = phi i64 {}", out, phi_incomings.join(", ")));
         Ok(out)
     }
 
@@ -6281,7 +6667,10 @@ impl<'a> FnEmitter<'a> {
                 let rhs_bits = Self::map_key_tmp("rhs_bits", counter);
                 lines.push(format!("  {} = bitcast float {} to i32", rhs_bits, rhs_val));
                 let cmp = Self::map_key_tmp("eq", counter);
-                lines.push(format!("  {} = icmp eq i32 {}, {}", cmp, lhs_bits, rhs_bits));
+                lines.push(format!(
+                    "  {} = icmp eq i32 {}, {}",
+                    cmp, lhs_bits, rhs_bits
+                ));
                 Ok(cmp)
             }
             Type::Builtin(BuiltinType::F64) => {
@@ -6297,11 +6686,20 @@ impl<'a> FnEmitter<'a> {
                     rhs_val, storage_ty, rhs_ptr
                 ));
                 let lhs_bits = Self::map_key_tmp("lhs_bits", counter);
-                lines.push(format!("  {} = bitcast double {} to i64", lhs_bits, lhs_val));
+                lines.push(format!(
+                    "  {} = bitcast double {} to i64",
+                    lhs_bits, lhs_val
+                ));
                 let rhs_bits = Self::map_key_tmp("rhs_bits", counter);
-                lines.push(format!("  {} = bitcast double {} to i64", rhs_bits, rhs_val));
+                lines.push(format!(
+                    "  {} = bitcast double {} to i64",
+                    rhs_bits, rhs_val
+                ));
                 let cmp = Self::map_key_tmp("eq", counter);
-                lines.push(format!("  {} = icmp eq i64 {}, {}", cmp, lhs_bits, rhs_bits));
+                lines.push(format!(
+                    "  {} = icmp eq i64 {}, {}",
+                    cmp, lhs_bits, rhs_bits
+                ));
                 Ok(cmp)
             }
             Type::FnPtr { .. } => {
@@ -6387,8 +6785,13 @@ impl<'a> FnEmitter<'a> {
                         "  {} = getelementptr {}, {}* {}, i32 0, i64 {}",
                         rhs_elem_ptr, arr_ty, arr_ty, rhs_ptr, idx
                     ));
-                    let eq =
-                        self.emit_map_key_eq_from_ptr(inner, &lhs_elem_ptr, &rhs_elem_ptr, lines, counter)?;
+                    let eq = self.emit_map_key_eq_from_ptr(
+                        inner,
+                        &lhs_elem_ptr,
+                        &rhs_elem_ptr,
+                        lines,
+                        counter,
+                    )?;
                     acc = Self::combine_i1_and(lines, counter, acc, eq);
                 }
                 Ok(acc)
@@ -6433,8 +6836,13 @@ impl<'a> FnEmitter<'a> {
                     "  {} = getelementptr {}, {}* {}, i32 0, i32 0",
                     rhs_tag_ptr, result_ty, result_ty, rhs_ptr
                 ));
-                let tag_eq =
-                    self.emit_map_key_eq_from_ptr(&tag_ty, &lhs_tag_ptr, &rhs_tag_ptr, lines, counter)?;
+                let tag_eq = self.emit_map_key_eq_from_ptr(
+                    &tag_ty,
+                    &lhs_tag_ptr,
+                    &rhs_tag_ptr,
+                    lines,
+                    counter,
+                )?;
                 acc = Self::combine_i1_and(lines, counter, acc, tag_eq);
 
                 let lhs_ok_ptr = Self::map_key_tmp("lhs_ok_ptr", counter);
@@ -6574,7 +6982,8 @@ impl<'a> FnEmitter<'a> {
                     return Ok(out);
                 }
                 let Some((signed, bits)) = self.int_info(ty) else {
-                    return self.invariant_err("map key callbacks support aggregate scalar keys only");
+                    return self
+                        .invariant_err("map key callbacks support aggregate scalar keys only");
                 };
                 if bits == 64 {
                     return Ok(loaded);
@@ -6644,7 +7053,10 @@ impl<'a> FnEmitter<'a> {
                     loaded, llvm_ty, storage_ty, ptr
                 ));
                 let out = Self::map_key_tmp("hashptr", counter);
-                lines.push(format!("  {} = ptrtoint {} {} to i64", out, llvm_ty, loaded));
+                lines.push(format!(
+                    "  {} = ptrtoint {} {} to i64",
+                    out, llvm_ty, loaded
+                ));
                 Ok(out)
             }
             Type::Alias(_) | Type::Shared(_) => {
@@ -6657,10 +7069,7 @@ impl<'a> FnEmitter<'a> {
                 let obj = Self::map_key_tmp("hash_obj", counter);
                 lines.push(format!("  {} = extractvalue %shared {}, 0", obj, loaded));
                 let out = Self::map_key_tmp("hashptr", counter);
-                lines.push(format!(
-                    "  {} = ptrtoint %shared_obj* {} to i64",
-                    out, obj
-                ));
+                lines.push(format!("  {} = ptrtoint %shared_obj* {} to i64", out, obj));
                 Ok(out)
             }
             Type::Chan(_) => {
@@ -6672,7 +7081,10 @@ impl<'a> FnEmitter<'a> {
                     loaded, llvm_ty, storage_ty, ptr
                 ));
                 let out = Self::map_key_tmp("hashptr", counter);
-                lines.push(format!("  {} = ptrtoint {} {} to i64", out, llvm_ty, loaded));
+                lines.push(format!(
+                    "  {} = ptrtoint {} {} to i64",
+                    out, llvm_ty, loaded
+                ));
                 Ok(out)
             }
             Type::Array(inner, len) => {
@@ -6731,8 +7143,7 @@ impl<'a> FnEmitter<'a> {
                     "  {} = getelementptr {}, {}* {}, i32 0, i32 2",
                     err_ptr, result_ty, result_ty, ptr
                 ));
-                let err_part =
-                    self.emit_map_key_hash_from_ptr(err_ty, &err_ptr, lines, counter)?;
+                let err_part = self.emit_map_key_hash_from_ptr(err_ty, &err_ptr, lines, counter)?;
                 acc = Self::mix_hash_ir(lines, counter, acc, err_part);
                 Ok(acc)
             }
@@ -6751,10 +7162,7 @@ impl<'a> FnEmitter<'a> {
                                 field_ptr, named_ty, named_ty, ptr, idx
                             ));
                             let part = self.emit_map_key_hash_from_ptr(
-                                &field.ty,
-                                &field_ptr,
-                                lines,
-                                counter,
+                                &field.ty, &field_ptr, lines, counter,
                             )?;
                             acc = Self::mix_hash_ir(lines, counter, acc, part);
                         }
@@ -6833,7 +7241,10 @@ impl<'a> FnEmitter<'a> {
                 ));
                 let obj = Self::map_key_tmp("clone_obj", counter);
                 lines.push(format!("  {} = extractvalue %shared {}, 0", obj, loaded));
-                lines.push(format!("  call void @__gost_shared_inc(%shared_obj* {})", obj));
+                lines.push(format!(
+                    "  call void @__gost_shared_inc(%shared_obj* {})",
+                    obj
+                ));
                 Ok(())
             }
             Type::Chan(_) => {
@@ -6848,7 +7259,10 @@ impl<'a> FnEmitter<'a> {
                     "  store {} {}, {}* {}",
                     llvm_ty, loaded, storage_ty, dst_ptr
                 ));
-                lines.push(format!("  call void @__gost_chan_retain(%chan* {})", loaded));
+                lines.push(format!(
+                    "  call void @__gost_chan_retain(%chan* {})",
+                    loaded
+                ));
                 Ok(())
             }
             Type::Array(inner, len) => {
@@ -6929,13 +7343,7 @@ impl<'a> FnEmitter<'a> {
                     "  {} = getelementptr {}, {}* {}, i32 0, i32 1",
                     src_ok_ptr, result_ty, result_ty, src_ptr
                 ));
-                self.emit_map_key_clone_from_ptr(
-                    ok_ty,
-                    &dst_ok_ptr,
-                    &src_ok_ptr,
-                    lines,
-                    counter,
-                )?;
+                self.emit_map_key_clone_from_ptr(ok_ty, &dst_ok_ptr, &src_ok_ptr, lines, counter)?;
 
                 let dst_err_ptr = Self::map_key_tmp("clone_dst_err_ptr", counter);
                 lines.push(format!(
@@ -6958,9 +7366,8 @@ impl<'a> FnEmitter<'a> {
             }
             Type::Named(name) => {
                 if let Some(alias) = self.types.get_alias(name) {
-                    return self.emit_map_key_clone_from_ptr(
-                        alias, dst_ptr, src_ptr, lines, counter,
-                    );
+                    return self
+                        .emit_map_key_clone_from_ptr(alias, dst_ptr, src_ptr, lines, counter);
                 }
                 match self.types.get(name) {
                     Some(TypeDefKind::Struct(def)) => {
@@ -7029,7 +7436,10 @@ impl<'a> FnEmitter<'a> {
                 sanitized.push('_');
             }
         }
-        let prefix = format!("__gost_map_keyop_{}_{}", sanitized, self.map_key_ops_counter);
+        let prefix = format!(
+            "__gost_map_keyop_{}_{}",
+            sanitized, self.map_key_ops_counter
+        );
         self.map_key_ops_counter += 1;
         prefix
     }
@@ -7049,14 +7459,8 @@ impl<'a> FnEmitter<'a> {
         let mut eq_lines = Vec::new();
         eq_lines.push(format!("define i32 @{}(i8* %lhs, i8* %rhs) {{", eq_fn));
         eq_lines.push("entry:".to_string());
-        eq_lines.push(format!(
-            "  %lhs_ptr = bitcast i8* %lhs to {}*",
-            storage_ty
-        ));
-        eq_lines.push(format!(
-            "  %rhs_ptr = bitcast i8* %rhs to {}*",
-            storage_ty
-        ));
+        eq_lines.push(format!("  %lhs_ptr = bitcast i8* %lhs to {}*", storage_ty));
+        eq_lines.push(format!("  %rhs_ptr = bitcast i8* %rhs to {}*", storage_ty));
         let mut eq_counter = 0usize;
         let eq_i1 = self.emit_map_key_eq_from_ptr(
             key_ty,
@@ -7080,10 +7484,7 @@ impl<'a> FnEmitter<'a> {
         let mut hash_lines = Vec::new();
         hash_lines.push(format!("define i64 @{}(i8* %key) {{", hash_fn));
         hash_lines.push("entry:".to_string());
-        hash_lines.push(format!(
-            "  %key_ptr = bitcast i8* %key to {}*",
-            storage_ty
-        ));
+        hash_lines.push(format!("  %key_ptr = bitcast i8* %key to {}*", storage_ty));
         let mut hash_counter = 0usize;
         let hash = self.emit_map_key_hash_from_ptr(
             key_ty,
@@ -7096,19 +7497,10 @@ impl<'a> FnEmitter<'a> {
         self.extra_functions.push(hash_lines.join("\n"));
 
         let mut clone_lines = Vec::new();
-        clone_lines.push(format!(
-            "define void @{}(i8* %dst, i8* %src) {{",
-            clone_fn
-        ));
+        clone_lines.push(format!("define void @{}(i8* %dst, i8* %src) {{", clone_fn));
         clone_lines.push("entry:".to_string());
-        clone_lines.push(format!(
-            "  %dst_ptr = bitcast i8* %dst to {}*",
-            storage_ty
-        ));
-        clone_lines.push(format!(
-            "  %src_ptr = bitcast i8* %src to {}*",
-            storage_ty
-        ));
+        clone_lines.push(format!("  %dst_ptr = bitcast i8* %dst to {}*", storage_ty));
+        clone_lines.push(format!("  %src_ptr = bitcast i8* %src to {}*", storage_ty));
         let mut clone_counter = 0usize;
         self.emit_map_key_clone_from_ptr(
             key_ty,
@@ -7163,7 +7555,10 @@ impl<'a> FnEmitter<'a> {
             "{} = extractvalue %{} {}, 0",
             tag_ir, enum_name, key_val.ir
         ));
-        Ok(Some(Value { ty: tag_ty, ir: tag_ir }))
+        Ok(Some(Value {
+            ty: tag_ty,
+            ir: tag_ir,
+        }))
     }
 
     fn emit_map_key_ptr(&mut self, key_ty: &Type, key_val: Value) -> Result<String, String> {
@@ -7174,7 +7569,8 @@ impl<'a> FnEmitter<'a> {
         let runtime_key_ty = key_spec.runtime_ty;
         let normalized = if key_val.ty == runtime_key_ty {
             key_val
-        } else if key_val.ty == Type::Builtin(BuiltinType::Bool) && self.is_int_type(&runtime_key_ty)
+        } else if key_val.ty == Type::Builtin(BuiltinType::Bool)
+            && self.is_int_type(&runtime_key_ty)
         {
             let as_u64 = self.new_temp();
             self.emit(format!("{} = zext i1 {} to i64", as_u64, key_val.ir));
@@ -7214,7 +7610,11 @@ impl<'a> FnEmitter<'a> {
         Ok(key_ptr)
     }
 
-    fn emit_map_key_from_runtime(&mut self, key_ty: &Type, runtime_val: Value) -> Result<Value, String> {
+    fn emit_map_key_from_runtime(
+        &mut self,
+        key_ty: &Type,
+        runtime_val: Value,
+    ) -> Result<Value, String> {
         if &runtime_val.ty == key_ty {
             return Ok(runtime_val);
         }
@@ -7231,29 +7631,28 @@ impl<'a> FnEmitter<'a> {
                 ir: cmp,
             });
         }
-        if let Type::Named(enum_name) = key_ty {
-            if let Some(TypeDefKind::Enum(def)) = self.types.get(enum_name) {
-                if def.variants.iter().all(|(_, fields)| fields.is_empty()) {
-                    let tag_ty = self.map_key_enum_tag_ty(enum_name)?;
-                    let tag_val = if runtime_val.ty == tag_ty {
-                        runtime_val
-                    } else {
-                        self.cast_int_value(runtime_val, &tag_ty)?
-                    };
-                    let enum_ir = self.new_temp();
-                    self.emit(format!(
-                        "{} = insertvalue %{} undef, {} {}, 0",
-                        enum_ir,
-                        enum_name,
-                        llvm_type(&tag_ty)?,
-                        tag_val.ir
-                    ));
-                    return Ok(Value {
-                        ty: key_ty.clone(),
-                        ir: enum_ir,
-                    });
-                }
-            }
+        if let Type::Named(enum_name) = key_ty
+            && let Some(TypeDefKind::Enum(def)) = self.types.get(enum_name)
+            && def.variants.iter().all(|(_, fields)| fields.is_empty())
+        {
+            let tag_ty = self.map_key_enum_tag_ty(enum_name)?;
+            let tag_val = if runtime_val.ty == tag_ty {
+                runtime_val
+            } else {
+                self.cast_int_value(runtime_val, &tag_ty)?
+            };
+            let enum_ir = self.new_temp();
+            self.emit(format!(
+                "{} = insertvalue %{} undef, {} {}, 0",
+                enum_ir,
+                enum_name,
+                llvm_type(&tag_ty)?,
+                tag_val.ir
+            ));
+            return Ok(Value {
+                ty: key_ty.clone(),
+                ir: enum_ir,
+            });
         }
         self.cast_value(runtime_val, key_ty)
     }
@@ -7279,7 +7678,10 @@ impl<'a> FnEmitter<'a> {
         let dst_llvm = llvm_type(target)?;
         if src_bits < dst_bits {
             let op = if src_signed { "sext" } else { "zext" };
-            self.emit(format!("{} = {} {} {} to {}", tmp, op, src_llvm, val.ir, dst_llvm));
+            self.emit(format!(
+                "{} = {} {} {} to {}",
+                tmp, op, src_llvm, val.ir, dst_llvm
+            ));
         } else {
             self.emit(format!(
                 "{} = trunc {} {} to {}",
@@ -7583,25 +7985,23 @@ impl<'a> FnEmitter<'a> {
                 dispatch.push((symbol.clone(), sig.clone()));
             }
         }
-        self.require_not_invariant_fmt(dispatch.is_empty(), format!(
-                "unknown method `{}`",
-                method
-            ))?;
+        self.require_not_invariant_fmt(
+            dispatch.is_empty(),
+            format!("unknown method `{}`", method),
+        )?;
         dispatch.sort_by(|a, b| {
             let a_iface = a.1.params.first() == Some(&Type::Interface);
             let b_iface = b.1.params.first() == Some(&Type::Interface);
-            a_iface
-                .cmp(&b_iface)
-                .then_with(|| a.0.cmp(&b.0))
+            a_iface.cmp(&b_iface).then_with(|| a.0.cmp(&b.0))
         });
         let iface_fallback_count = dispatch
             .iter()
             .filter(|(_, sig)| sig.params.first() == Some(&Type::Interface))
             .count();
-        self.require_not_invariant_fmt(iface_fallback_count > 1, format!(
-                "ambiguous interface fallback for method `{}`",
-                method
-            ))?;
+        self.require_not_invariant_fmt(
+            iface_fallback_count > 1,
+            format!("ambiguous interface fallback for method `{}`", method),
+        )?;
         let canonical = dispatch[0].1.clone();
         for (_, sig) in dispatch.iter().skip(1) {
             self.require_not_invariant_fmt(
@@ -7631,16 +8031,12 @@ impl<'a> FnEmitter<'a> {
         let join_idx = self.add_block(join_name.clone());
         let mut incoming = Vec::<(String, String)>::new();
         for (idx, (symbol, sig)) in dispatch.iter().enumerate() {
-            let recv_ty = sig
-                .params
-                .first()
-                .cloned()
-                .ok_or_else(|| {
-                    Self::invariant_violation(&format!(
-                        "method `{}` requires a receiver parameter",
-                        symbol
-                    ))
-                })?;
+            let recv_ty = sig.params.first().cloned().ok_or_else(|| {
+                Self::invariant_violation(&format!(
+                    "method `{}` requires a receiver parameter",
+                    symbol
+                ))
+            })?;
             let call_name = self.new_block("iface_method_call");
             let call_idx = self.add_block(call_name.clone());
             let next_name = if idx + 1 == dispatch.len() {
@@ -7704,7 +8100,10 @@ impl<'a> FnEmitter<'a> {
             llvm_type(&ret_ty)?,
             incoming_ir.join(", ")
         ));
-        Ok(Value { ty: ret_ty, ir: phi })
+        Ok(Value {
+            ty: ret_ty,
+            ir: phi,
+        })
     }
 
     fn emit_interface_box_value(&mut self, val: Value) -> Result<Value, String> {
@@ -7720,10 +8119,7 @@ impl<'a> FnEmitter<'a> {
             ));
             let storage_ty = llvm_storage_type(&val.ty)?;
             let cast = self.new_temp();
-            self.emit(format!(
-                "{} = bitcast i8* {} to {}*",
-                cast, raw, storage_ty
-            ));
+            self.emit(format!("{} = bitcast i8* {} to {}*", cast, raw, storage_ty));
             if matches!(val.ty, Type::Alias(_) | Type::Shared(_) | Type::Chan(_)) {
                 self.emit_shared_inc_value(&val)?;
             }
@@ -7764,10 +8160,7 @@ impl<'a> FnEmitter<'a> {
         ));
         let expected_tag = self.interface_type_tag(target);
         let ok = self.new_temp();
-        self.emit(format!(
-            "{} = icmp eq i64 {}, {}",
-            ok, tag_ir, expected_tag
-        ));
+        self.emit(format!("{} = icmp eq i64 {}, {}", ok, tag_ir, expected_tag));
         let ok_name = self.new_block("iface_cast_ok");
         let fail_name = self.new_block("iface_cast_fail");
         let ok_idx = self.add_block(ok_name.clone());
@@ -7973,11 +8366,7 @@ impl<'a> FnEmitter<'a> {
             h ^= b as u64;
             h = h.wrapping_mul(1099511628211);
         }
-        if h == 0 {
-            1
-        } else {
-            h
-        }
+        if h == 0 { 1 } else { h }
     }
 
     fn coerce_int_pair(&mut self, lhs: Value, rhs: Value) -> Result<(Value, Value), String> {
@@ -8052,10 +8441,7 @@ impl<'a> FnEmitter<'a> {
         let idx_ir = self.emit_index_i64(idx_val)?;
         if bounds_check {
             let in_bounds = self.new_temp();
-            self.emit(format!(
-                "{} = icmp ult i64 {}, {}",
-                in_bounds, idx_ir, len
-            ));
+            self.emit(format!("{} = icmp ult i64 {}, {}", in_bounds, idx_ir, len));
             let ok_name = self.new_block("arr_idx_ok");
             let fail_name = self.new_block("arr_idx_fail");
             let ok_idx = self.add_block(ok_name.clone());
@@ -8090,10 +8476,7 @@ impl<'a> FnEmitter<'a> {
             ptr, llvm_ty, llvm_ty
         ));
         let size = self.new_temp();
-        self.emit(format!(
-            "{} = ptrtoint {}* {} to i64",
-            size, llvm_ty, ptr
-        ));
+        self.emit(format!("{} = ptrtoint {}* {} to i64", size, llvm_ty, ptr));
         Ok(Value {
             ty: Type::Builtin(BuiltinType::I64),
             ir: size,
@@ -8115,7 +8498,9 @@ impl<'a> FnEmitter<'a> {
             | Type::Alias(_)
             | Type::Shared(_)
             | Type::Interface => true,
-            Type::Tuple(items) => items.iter().any(|item| self.needs_drop_inner(item, visiting)),
+            Type::Tuple(items) => items
+                .iter()
+                .any(|item| self.needs_drop_inner(item, visiting)),
             Type::Result(ok, err) => {
                 self.needs_drop_inner(ok, visiting) || self.needs_drop_inner(err, visiting)
             }
@@ -8198,17 +8583,11 @@ impl<'a> FnEmitter<'a> {
         match ty {
             Type::Builtin(BuiltinType::Bytes) | Type::Slice(_) => {
                 let cast = next_tmp();
-                lines.push(format!(
-                    "  {} = bitcast i8* {} to %slice*",
-                    cast, ptr
-                ));
+                lines.push(format!("  {} = bitcast i8* {} to %slice*", cast, ptr));
                 let val = next_tmp();
                 lines.push(format!("  {} = load %slice, %slice* {}", val, cast));
                 let obj = next_tmp();
-                lines.push(format!(
-                    "  {} = extractvalue %slice {}, 0",
-                    obj, val
-                ));
+                lines.push(format!("  {} = extractvalue %slice {}, 0", obj, val));
                 lines.push(format!(
                     "  call void @__gost_slice_drop(%slice_obj* {})",
                     obj
@@ -8221,37 +8600,22 @@ impl<'a> FnEmitter<'a> {
                 lines.push(format!("  {} = load %map, %map* {}", val, cast));
                 let obj = next_tmp();
                 lines.push(format!("  {} = extractvalue %map {}, 0", obj, val));
-                lines.push(format!(
-                    "  call void @__gost_map_drop(%map_obj* {})",
-                    obj
-                ));
+                lines.push(format!("  call void @__gost_map_drop(%map_obj* {})", obj));
             }
             Type::Chan(_) => {
                 let cast = next_tmp();
-                lines.push(format!(
-                    "  {} = bitcast i8* {} to %chan**",
-                    cast, ptr
-                ));
+                lines.push(format!("  {} = bitcast i8* {} to %chan**", cast, ptr));
                 let val = next_tmp();
                 lines.push(format!("  {} = load %chan*, %chan** {}", val, cast));
                 lines.push(format!("  call void @__gost_chan_drop(%chan* {})", val));
             }
             Type::Own(_) | Type::Alias(_) | Type::Shared(_) => {
                 let cast = next_tmp();
-                lines.push(format!(
-                    "  {} = bitcast i8* {} to %shared*",
-                    cast, ptr
-                ));
+                lines.push(format!("  {} = bitcast i8* {} to %shared*", cast, ptr));
                 let val = next_tmp();
-                lines.push(format!(
-                    "  {} = load %shared, %shared* {}",
-                    val, cast
-                ));
+                lines.push(format!("  {} = load %shared, %shared* {}", val, cast));
                 let obj = next_tmp();
-                lines.push(format!(
-                    "  {} = extractvalue %shared {}, 0",
-                    obj, val
-                ));
+                lines.push(format!("  {} = extractvalue %shared {}, 0", obj, val));
                 lines.push(format!(
                     "  call void @__gost_shared_dec(%shared_obj* {})",
                     obj
@@ -8259,25 +8623,13 @@ impl<'a> FnEmitter<'a> {
             }
             Type::Interface => {
                 let cast = next_tmp();
-                lines.push(format!(
-                    "  {} = bitcast i8* {} to %interface*",
-                    cast, ptr
-                ));
+                lines.push(format!("  {} = bitcast i8* {} to %interface*", cast, ptr));
                 let val = next_tmp();
-                lines.push(format!(
-                    "  {} = load %interface, %interface* {}",
-                    val, cast
-                ));
+                lines.push(format!("  {} = load %interface, %interface* {}", val, cast));
                 let data = next_tmp();
-                lines.push(format!(
-                    "  {} = extractvalue %interface {}, 1",
-                    data, val
-                ));
+                lines.push(format!("  {} = extractvalue %interface {}, 1", data, val));
                 let is_null = next_tmp();
-                lines.push(format!(
-                    "  {} = icmp eq i8* {}, null",
-                    is_null, data
-                ));
+                lines.push(format!("  {} = icmp eq i8* {}, null", is_null, data));
                 let id = is_null.trim_start_matches('%');
                 let free_label = format!("drop_iface_free_{}", id);
                 let end_label = format!("drop_iface_end_{}", id);
@@ -8335,10 +8687,7 @@ impl<'a> FnEmitter<'a> {
                             llvm_type_for_tuple_elem(ok_ty)?,
                             field_ptr
                         ));
-                        lines.push(format!(
-                            "  call void {}(i8* {})",
-                            drop_fn, cast_ptr
-                        ));
+                        lines.push(format!("  call void {}(i8* {})", drop_fn, cast_ptr));
                     }
                 }
                 lines.push(format!("  br label %{}", end_label));
@@ -8358,10 +8707,7 @@ impl<'a> FnEmitter<'a> {
                             llvm_type_for_tuple_elem(err_ty)?,
                             field_ptr
                         ));
-                        lines.push(format!(
-                            "  call void {}(i8* {})",
-                            drop_fn, cast_ptr
-                        ));
+                        lines.push(format!("  call void {}(i8* {})", drop_fn, cast_ptr));
                     }
                 }
                 lines.push(format!("  br label %{}", end_label));
@@ -8392,20 +8738,14 @@ impl<'a> FnEmitter<'a> {
                             llvm_type_for_tuple_elem(item_ty)?,
                             field_ptr
                         ));
-                        lines.push(format!(
-                            "  call void {}(i8* {})",
-                            drop_fn, cast_ptr
-                        ));
+                        lines.push(format!("  call void {}(i8* {})", drop_fn, cast_ptr));
                     }
                 }
             }
             Type::Named(name) => match self.types.get(name) {
                 Some(TypeDefKind::Struct(def)) => {
                     let cast = next_tmp();
-                    lines.push(format!(
-                        "  {} = bitcast i8* {} to %{}*",
-                        cast, ptr, name
-                    ));
+                    lines.push(format!("  {} = bitcast i8* {} to %{}*", cast, ptr, name));
                     for (idx, field) in def.fields.iter().enumerate() {
                         if !self.needs_drop(&field.ty) {
                             continue;
@@ -8424,10 +8764,7 @@ impl<'a> FnEmitter<'a> {
                                 llvm_storage_type(&field.ty)?,
                                 field_ptr
                             ));
-                            lines.push(format!(
-                                "  call void {}(i8* {})",
-                                drop_fn, cast_ptr
-                            ));
+                            lines.push(format!("  call void {}(i8* {})", drop_fn, cast_ptr));
                         }
                     }
                 }
@@ -8438,22 +8775,13 @@ impl<'a> FnEmitter<'a> {
                         return Ok(());
                     }
                     let cast = next_tmp();
-                    lines.push(format!(
-                        "  {} = bitcast i8* {} to %{}*",
-                        cast, ptr, name
-                    ));
+                    lines.push(format!("  {} = bitcast i8* {} to %{}*", cast, ptr, name));
                     let val = next_tmp();
                     lines.push(format!("  {} = load %{}, %{}* {}", val, name, name, cast));
                     let tag = next_tmp();
-                    lines.push(format!(
-                        "  {} = extractvalue %{} {}, 0",
-                        tag, name, val
-                    ));
+                    lines.push(format!("  {} = extractvalue %{} {}, 0", tag, name, val));
                     let payload = next_tmp();
-                    lines.push(format!(
-                        "  {} = extractvalue %{} {}, 1",
-                        payload, name, val
-                    ));
+                    lines.push(format!("  {} = extractvalue %{} {}, 1", payload, name, val));
                     let end_label = format!("drop_end_{}", name);
                     let tag_ty = self.enum_tag_llvm_type(name)?;
                     let mut cases = Vec::new();
@@ -8498,10 +8826,8 @@ impl<'a> FnEmitter<'a> {
                                         llvm_storage_type(field_ty)?,
                                         field_ptr
                                     ));
-                                    lines.push(format!(
-                                        "  call void {}(i8* {})",
-                                        drop_fn, cast_ptr
-                                    ));
+                                    lines
+                                        .push(format!("  call void {}(i8* {})", drop_fn, cast_ptr));
                                 }
                             }
                             let size_ptr = next_tmp();
@@ -8575,8 +8901,7 @@ impl<'a> FnEmitter<'a> {
                     },
                     _ => return self.invariant_err("field access expects struct"),
                 };
-                let (field_idx, field_ty) =
-                    self.resolve_struct_field(&struct_name, name)?;
+                let (field_idx, field_ty) = self.resolve_struct_field(&struct_name, name)?;
                 let gep = self.new_temp();
                 self.emit(format!(
                     "{} = getelementptr %{}, %{}* {}, i32 0, i32 {}",
@@ -8586,13 +8911,13 @@ impl<'a> FnEmitter<'a> {
             }
             ExprKind::Index { base, index } => {
                 let idx_val = self.emit_expr(index)?;
-                if let Ok((base_ty, base_ptr)) = self.emit_place_ptr(base) {
-                    if let Type::Array(inner, len) = base_ty {
-                        let elem_ty = *inner;
-                        let elem_ptr =
-                            self.emit_array_elem_ptr(&base_ptr, &elem_ty, len, &idx_val, true)?;
-                        return Ok((elem_ty, elem_ptr));
-                    }
+                if let Ok((base_ty, base_ptr)) = self.emit_place_ptr(base)
+                    && let Type::Array(inner, len) = base_ty
+                {
+                    let elem_ty = *inner;
+                    let elem_ptr =
+                        self.emit_array_elem_ptr(&base_ptr, &elem_ty, len, &idx_val, true)?;
+                    return Ok((elem_ty, elem_ptr));
                 }
                 let base_val = self.emit_expr(base)?;
                 match &base_val.ty {
@@ -8621,29 +8946,26 @@ impl<'a> FnEmitter<'a> {
                         Type::Slice(elem) => {
                             let elem_ty = *elem.clone();
                             let slice_obj = self.emit_slice_obj_from_value(&base_val)?;
-                            let elem_ptr = self.emit_slice_elem_ptr(
-                                &slice_obj,
-                                &elem_ty,
-                                &idx_val,
-                                true,
-                            )?;
+                            let elem_ptr =
+                                self.emit_slice_elem_ptr(&slice_obj, &elem_ty, &idx_val, true)?;
                             Ok((elem_ty, elem_ptr))
                         }
                         Type::Builtin(BuiltinType::Bytes) => {
                             let elem_ty = Type::Builtin(BuiltinType::U32);
                             let slice_obj = self.emit_slice_obj_from_value(&base_val)?;
-                            let elem_ptr = self.emit_slice_elem_ptr(
-                                &slice_obj,
-                                &elem_ty,
-                                &idx_val,
-                                true,
-                            )?;
+                            let elem_ptr =
+                                self.emit_slice_elem_ptr(&slice_obj, &elem_ty, &idx_val, true)?;
                             Ok((elem_ty, elem_ptr))
                         }
                         Type::Array(elem, len) => {
                             let elem_ty = *elem.clone();
-                            let elem_ptr =
-                                self.emit_array_elem_ptr(&base_val.ir, &elem_ty, *len, &idx_val, true)?;
+                            let elem_ptr = self.emit_array_elem_ptr(
+                                &base_val.ir,
+                                &elem_ty,
+                                *len,
+                                &idx_val,
+                                true,
+                            )?;
                             Ok((elem_ty, elem_ptr))
                         }
                         _ => self.invariant_err("indexing expects a slice"),
@@ -8690,9 +9012,8 @@ impl<'a> FnEmitter<'a> {
         let enum_ty = Type::Named(enum_name.to_string());
         if self.enum_is_tag_only(enum_name)? {
             if payload_ptr.is_some() {
-                return self.invariant_err(
-                    "tag-only enum representation cannot carry payload pointer",
-                );
+                return self
+                    .invariant_err("tag-only enum representation cannot carry payload pointer");
             }
             let agg = self.new_temp();
             self.emit(format!(
@@ -8749,7 +9070,10 @@ impl<'a> FnEmitter<'a> {
         args: &[Expr],
     ) -> Result<Value, String> {
         let (variant_idx, field_tys) = self.resolve_enum_variant(enum_name, variant)?;
-        self.require_not_invariant(field_tys.len() != args.len(), "enum constructor arity mismatch")?;
+        self.require_not_invariant(
+            field_tys.len() != args.len(),
+            "enum constructor arity mismatch",
+        )?;
         let mut arg_vals = Vec::new();
         for arg in args {
             arg_vals.push(self.emit_expr(arg)?);
@@ -8816,14 +9140,8 @@ impl<'a> FnEmitter<'a> {
                     (ok.as_ref().clone(), err.as_ref().clone())
                 } else {
                     match variant {
-                        "Ok" | "ok" => (
-                            arg_val.ty.clone(),
-                            Type::Builtin(BuiltinType::Error),
-                        ),
-                        "Err" | "err" => (
-                            Type::Builtin(BuiltinType::Unit),
-                            arg_val.ty.clone(),
-                        ),
+                        "Ok" | "ok" => (arg_val.ty.clone(), Type::Builtin(BuiltinType::Error)),
+                        "Err" | "err" => (Type::Builtin(BuiltinType::Unit), arg_val.ty.clone()),
                         _ => return self.invariant_err("unknown Result variant"),
                     }
                 }
@@ -8890,11 +9208,7 @@ impl<'a> FnEmitter<'a> {
         })
     }
 
-    fn resolve_struct_field(
-        &self,
-        type_name: &str,
-        field: &str,
-    ) -> Result<(usize, Type), String> {
+    fn resolve_struct_field(&self, type_name: &str, field: &str) -> Result<(usize, Type), String> {
         match self.types.get(type_name) {
             Some(TypeDefKind::Struct(def)) => def
                 .fields
@@ -9096,7 +9410,10 @@ impl<'a> FnEmitter<'a> {
             ptr, array_len, array_len, name
         ));
         let tmp = self.new_temp();
-        self.emit(format!("{} = insertvalue %string undef, i8* {}, 0", tmp, ptr));
+        self.emit(format!(
+            "{} = insertvalue %string undef, i8* {}, 0",
+            tmp, ptr
+        ));
         let str_val = self.new_temp();
         self.emit(format!(
             "{} = insertvalue %string {}, i64 {}, 1",
@@ -9159,7 +9476,10 @@ impl<'a> FnEmitter<'a> {
                     llvm_type(ty)?,
                     ptr
                 ));
-                args.push(Value { ty: ty.clone(), ir: tmp });
+                args.push(Value {
+                    ty: ty.clone(),
+                    ir: tmp,
+                });
             }
             let _ = self.emit_call_by_name(&deferred.name, &deferred.type_args, args)?;
         }
@@ -9173,10 +9493,10 @@ impl<'a> FnEmitter<'a> {
 
     fn exit_scope(&mut self) -> Result<(), String> {
         let emit_runtime = !self.mir_mode;
-        if let Some(defers) = self.deferred.pop() {
-            if emit_runtime {
-                self.emit_deferred_list(&defers)?;
-            }
+        if let Some(defers) = self.deferred.pop()
+            && emit_runtime
+        {
+            self.emit_deferred_list(&defers)?;
         }
         if let Some(names) = self.scopes.pop() {
             if emit_runtime {
@@ -9200,7 +9520,4 @@ impl<'a> FnEmitter<'a> {
         }
         Ok(())
     }
-
 }
-
-

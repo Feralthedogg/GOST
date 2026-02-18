@@ -159,14 +159,14 @@ pub fn intrinsic_signature(name: &str) -> Option<IntrinsicSignature> {
             Some("__gost_process_exit expects 1 argument"),
             None,
         )),
-        "__gost_sync_mutex_new" | "__gost_sync_waitgroup_new" | "__gost_sync_once_new" => Some(
-            no_type_args(
+        "__gost_sync_mutex_new" | "__gost_sync_waitgroup_new" | "__gost_sync_once_new" => {
+            Some(no_type_args(
                 Arity::Exactly(0),
                 "__gost_sync_* does not take type arguments",
                 Some("__gost_sync_* expects 0 arguments"),
                 sync_internal,
-            ),
-        ),
+            ))
+        }
         "__gost_sync_mutex_lock"
         | "__gost_sync_mutex_try_lock"
         | "__gost_sync_mutex_unlock"

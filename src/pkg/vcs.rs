@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,13 +34,7 @@ pub fn ensure_mirror(
     if mirror.exists() {
         if allow_fetch {
             let _ = run_git(
-                &[
-                    "-C",
-                    mirror.to_str().unwrap(),
-                    "fetch",
-                    "--prune",
-                    "--tags",
-                ],
+                &["-C", mirror.to_str().unwrap(), "fetch", "--prune", "--tags"],
                 None,
             )?;
         }
@@ -49,7 +43,10 @@ pub fn ensure_mirror(
     if !allow_fetch {
         bail!("missing mirror for {} (readonly/offline)", source_url);
     }
-    let _ = run_git(&["clone", "--mirror", source_url, mirror.to_str().unwrap()], None)?;
+    let _ = run_git(
+        &["clone", "--mirror", source_url, mirror.to_str().unwrap()],
+        None,
+    )?;
     Ok(mirror)
 }
 
@@ -71,8 +68,8 @@ pub fn resolve_rev(mirror: &Path, requested: &str) -> anyhow::Result<String> {
         )?;
         return Ok(full);
     }
-    if requested.starts_with('v') {
-        if let Ok(full) = run_git(
+    if requested.starts_with('v')
+        && let Ok(full) = run_git(
             &[
                 "-C",
                 mirror.to_str().unwrap(),
@@ -80,9 +77,9 @@ pub fn resolve_rev(mirror: &Path, requested: &str) -> anyhow::Result<String> {
                 &format!("refs/tags/{}^{{commit}}", requested),
             ],
             None,
-        ) {
-            return Ok(full);
-        }
+        )
+    {
+        return Ok(full);
     }
     let full = run_git(
         &[
@@ -111,18 +108,18 @@ pub fn checkout_module(
     ));
 
     if dst.exists() {
-        let cur = run_git(
-            &["-C", dst.to_str().unwrap(), "rev-parse", "HEAD"],
-            None,
-        )
-        .unwrap_or_default();
+        let cur =
+            run_git(&["-C", dst.to_str().unwrap(), "rev-parse", "HEAD"], None).unwrap_or_default();
         if cur == rev {
             return Ok(dst);
         }
         fs::remove_dir_all(&dst).ok();
     }
 
-    let _ = run_git(&["clone", mirror.to_str().unwrap(), dst.to_str().unwrap()], None)?;
+    let _ = run_git(
+        &["clone", mirror.to_str().unwrap(), dst.to_str().unwrap()],
+        None,
+    )?;
     let _ = run_git(
         &["-C", dst.to_str().unwrap(), "checkout", "--force", rev],
         None,
