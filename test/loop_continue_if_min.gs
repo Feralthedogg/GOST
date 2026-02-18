@@ -3,9 +3,9 @@ module main
 fn main() -> i32 {
     loop {
         if true {
-            continue;
+            continue
         }
-        break;
+        break
     }
-    return 0;
+    return 0
 }

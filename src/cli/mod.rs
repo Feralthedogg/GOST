@@ -663,10 +663,23 @@ fn link_and_run(input_path: &Path, ll_path: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&exe_path);
     }
     compile_ll_to_obj(&cc, ll_path, &obj_path)?;
+    let release = std::env::var("GOST_RELEASE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let native = std::env::var("GOST_NATIVE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let mut link_args = vec![
         obj_path.display().to_string(),
         rt_lib.display().to_string(),
     ];
+    if release {
+        link_args.push("-O3".into());
+        if native {
+            link_args.push("-march=native".into());
+            link_args.push("-mtune=native".into());
+        }
+    }
     if is_gcc(&cc) {
         link_args.push("-pthread".into());
     } else {
@@ -715,6 +728,13 @@ fn build_runtime(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
 }
 
 fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
+    // Default to optimized runtime for execution throughput.
+    let release = std::env::var("GOST_RELEASE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let native = std::env::var("GOST_NATIVE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let target = if let Ok(t) = std::env::var("GOST_RUST_TARGET") {
         Some(t)
     } else if let Some(triple) = compiler_triple(cc) {
@@ -732,6 +752,9 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
     cmd.arg("build")
         .arg("--manifest-path")
         .arg(runtime_dir.join("Cargo.toml"));
+    if release {
+        cmd.arg("--release");
+    }
     // Isolate runtime build artifacts from the main crate to avoid locking gs.exe on Windows.
     cmd.env("CARGO_TARGET_DIR", runtime_dir.join("target"));
     if let Some(target) = &target {
@@ -739,6 +762,16 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
     }
     if std::env::var("GOST_STATS").ok().as_deref() == Some("1") {
         cmd.arg("--features").arg("stats");
+    }
+    if native {
+        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if !rustflags.contains("target-cpu") {
+            if !rustflags.is_empty() {
+                rustflags.push(' ');
+            }
+            rustflags.push_str("-C target-cpu=native");
+        }
+        cmd.env("RUSTFLAGS", rustflags);
     }
     cmd.env("CC", cc);
     let status = cmd.status().map_err(|e| format!("failed to run cargo: {}", e))?;
@@ -750,10 +783,11 @@ fn build_runtime_rust(runtime_dir: &Path, cc: &str) -> Result<PathBuf, String> {
     } else {
         "libgostrt.a"
     };
+    let profile = if release { "release" } else { "debug" };
     let lib_path = if let Some(target) = target {
-        runtime_dir.join("target").join(target).join("debug").join(lib_name)
+        runtime_dir.join("target").join(target).join(profile).join(lib_name)
     } else {
-        runtime_dir.join("target").join("debug").join(lib_name)
+        runtime_dir.join("target").join(profile).join(lib_name)
     };
     if !lib_path.exists() {
         return Err(format!("Rust runtime output not found: {}", lib_path.display()));
@@ -797,15 +831,28 @@ fn compiler_target(cc: &str) -> Option<String> {
 }
 
 fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), String> {
+    let release = std::env::var("GOST_RELEASE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let native = std::env::var("GOST_NATIVE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     if is_clang(cc) {
+        let mut args = vec![
+            "-c".into(),
+            ll_path.display().to_string(),
+            "-o".into(),
+            obj_path.display().to_string(),
+        ];
+        if release {
+            args.push("-O3".into());
+            if native {
+                args.push("-march=native".into());
+            }
+        }
         return run_cmd(
             cc,
-            &[
-                "-c".into(),
-                ll_path.display().to_string(),
-                "-o".into(),
-                obj_path.display().to_string(),
-            ],
+            &args,
         );
     }
     let llc = resolve_llc();
@@ -817,6 +864,12 @@ fn compile_ll_to_obj(cc: &str, ll_path: &Path, obj_path: &Path) -> Result<(), St
         "-o".into(),
         obj_path.display().to_string(),
     ];
+    if release {
+        args.push("-O=3".into());
+        if native {
+            args.push("-mcpu=native".into());
+        }
+    }
     if let Some(triple) = compiler_triple(cc) {
         args.push("-mtriple".into());
         args.push(triple);

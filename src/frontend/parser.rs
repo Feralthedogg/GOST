@@ -1,6 +1,24 @@
 use super::ast::*;
 use super::diagnostic::Diagnostics;
-use super::lexer::{Keyword, Symbol, Token, TokenKind};
+use super::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
+use super::symbols::{mangle_impl_method, module_symbol_key};
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ParsedRepr {
+    C,
+    Transparent,
+    Int(ReprInt),
+    Other(String),
+}
+
+#[derive(Clone, Debug)]
+struct ImplTraitRecord {
+    trait_name: String,
+    recv_name: String,
+    methods: Vec<TraitMethod>,
+    span: Span,
+}
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -8,6 +26,9 @@ pub struct Parser {
     pub diags: Diagnostics,
     next_expr_id: ExprId,
     allow_struct_lit: bool,
+    current_package: String,
+    module_disambiguator: String,
+    impl_trait_records: Vec<ImplTraitRecord>,
 }
 
 impl Parser {
@@ -22,11 +43,18 @@ impl Parser {
             diags: Diagnostics::default(),
             next_expr_id,
             allow_struct_lit: true,
+            current_package: String::new(),
+            module_disambiguator: String::new(),
+            impl_trait_records: Vec::new(),
         }
     }
 
     pub fn next_expr_id(&self) -> ExprId {
         self.next_expr_id
+    }
+
+    pub fn set_module_disambiguator(&mut self, value: impl Into<String>) {
+        self.module_disambiguator = value.into();
     }
 
     fn new_expr(&mut self, kind: ExprKind, span: Span) -> Expr {
@@ -48,13 +76,13 @@ impl Parser {
             Some(name) => name,
             None => return None,
         };
+        self.current_package = package.clone();
+        self.impl_trait_records.clear();
         self.consume_semis();
         let mut imports = Vec::new();
         while self.at_keyword(Keyword::Import) {
-            self.bump();
-            match self.parse_string_lit() {
-                Some(s) => imports.push(s),
-                None => self.diags.push("expected string literal after import", self.peek_span()),
+            if let Some(spec) = self.parse_import_spec() {
+                imports.push(spec);
             }
             self.consume_semis();
         }
@@ -64,8 +92,10 @@ impl Parser {
                 self.bump();
                 continue;
             }
+            let vis = self.parse_item_visibility();
             let layout = self.parse_layout_modifiers();
-            let has_layout = layout.repr_c || layout.pack.is_some() || layout.bitfield;
+            self.consume_semis();
+            let has_layout = layout.has_any();
             if has_layout
                 && !self.at_keyword(Keyword::Copy)
                 && !self.at_keyword(Keyword::Struct)
@@ -82,9 +112,12 @@ impl Parser {
                 let start = self.bump().span;
                 is_unsafe = true;
                 start_override = Some(start.clone());
-                if !self.at_keyword(Keyword::Extern) && !self.at_keyword(Keyword::Fn) {
+                if !self.at_keyword(Keyword::Extern)
+                    && !self.at_keyword(Keyword::Fn)
+                    && !self.at_keyword(Keyword::Impl)
+                {
                     self.diags
-                        .push("expected fn or extern after unsafe", Some(start));
+                        .push("expected fn, extern, or impl after unsafe", Some(start));
                     continue;
                 }
             }
@@ -112,7 +145,7 @@ impl Parser {
                 }
                 if self.at_keyword(Keyword::Fn) {
                     if let Some(func) =
-                        self.parse_function(true, is_unsafe, Some(abi), Some(start))
+                        self.parse_function(vis, true, is_unsafe, Some(abi), Some(start))
                     {
                         items.push(Item::Function(func));
                     }
@@ -120,7 +153,7 @@ impl Parser {
                     if is_unsafe {
                         self.error_here("extern global cannot be unsafe");
                     }
-                    if let Some(global) = self.parse_extern_global(Some(abi), Some(start)) {
+                    if let Some(global) = self.parse_extern_global(vis, Some(abi), Some(start)) {
                         items.push(Item::ExternGlobal(global));
                     }
                 } else {
@@ -130,18 +163,48 @@ impl Parser {
                 continue;
             }
             if self.at_keyword(Keyword::Fn) {
-                if let Some(func) = self.parse_function(false, is_unsafe, None, start_override) {
+                if let Some(func) = self.parse_function(vis, false, is_unsafe, None, start_override) {
                     items.push(Item::Function(func));
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Const) {
+                if let Some(c) = self.parse_const_item(vis, start_override) {
+                    items.push(Item::Const(c));
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Type) {
+                if let Some(alias) = self.parse_type_alias(vis, start_override) {
+                    items.push(Item::TypeAlias(alias));
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Trait) {
+                if let Some(alias) = self.parse_trait_alias_item(vis, start_override) {
+                    items.push(Item::TypeAlias(alias));
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Impl) {
+                if let Some(methods) = self.parse_impl_block(vis, start_override) {
+                    items.extend(methods);
+                }
+                continue;
+            }
+            if self.at_keyword(Keyword::Let) {
+                if let Some(global) = self.parse_global_var(vis, start_override) {
+                    items.push(Item::Global(global));
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Copy) {
                 if self.peek_is_keyword(Keyword::Struct) {
-                    if let Some(def) = self.parse_struct_def(layout.clone()) {
+                    if let Some(def) = self.parse_struct_def(vis, layout.clone()) {
                         items.push(Item::Struct(def));
                     }
                 } else if self.peek_is_keyword(Keyword::Enum) {
-                    if let Some(def) = self.parse_enum_def(layout.clone()) {
+                    if let Some(def) = self.parse_enum_def(vis, layout.clone()) {
                         items.push(Item::Enum(def));
                     }
                 } else {
@@ -151,13 +214,13 @@ impl Parser {
                 continue;
             }
             if self.at_keyword(Keyword::Struct) {
-                if let Some(def) = self.parse_struct_def(layout.clone()) {
+                if let Some(def) = self.parse_struct_def(vis, layout.clone()) {
                     items.push(Item::Struct(def));
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Enum) {
-                if let Some(def) = self.parse_enum_def(layout.clone()) {
+                if let Some(def) = self.parse_enum_def(vis, layout.clone()) {
                     items.push(Item::Enum(def));
                 }
                 continue;
@@ -165,6 +228,9 @@ impl Parser {
             self.error_here("expected item");
             self.bump();
         }
+        self.synthesize_trait_default_impl_methods(&mut items);
+        self.validate_trait_impl_records(&items);
+        self.validate_type_param_bounds(&items);
         Some(FileAst {
             package,
             imports,
@@ -187,8 +253,73 @@ impl Parser {
         }
     }
 
+    fn parse_item_visibility(&mut self) -> Visibility {
+        if self.at_keyword(Keyword::Pub) {
+            self.bump();
+            Visibility::Public
+        } else if self.at_keyword(Keyword::Private) {
+            self.bump();
+            Visibility::Private
+        } else {
+            Visibility::Public
+        }
+    }
+
+    fn parse_import_spec(&mut self) -> Option<ImportSpec> {
+        self.expect_keyword(Keyword::Import);
+        let path = match self.parse_string_lit() {
+            Some(s) => s,
+            None => {
+                self.diags
+                    .push("expected string literal after import", self.peek_span());
+                return None;
+            }
+        };
+        let alias = if self.at_keyword(Keyword::As) {
+            self.bump();
+            match self.bump().kind {
+                TokenKind::Ident(name) => Some(name),
+                _ => {
+                    self.error_here("expected alias identifier after `as`");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let only = if self.at_symbol(Symbol::LBrace) {
+            self.bump();
+            let mut names = Vec::new();
+            if !self.at_symbol(Symbol::RBrace) {
+                loop {
+                    match self.bump().kind {
+                        TokenKind::Ident(name) => names.push(name),
+                        _ => {
+                            self.error_here("expected imported item name");
+                            break;
+                        }
+                    }
+                    if self.at_symbol(Symbol::Comma) {
+                        self.bump();
+                        if self.at_symbol(Symbol::RBrace) {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect_symbol(Symbol::RBrace);
+            Some(names)
+        } else {
+            None
+        };
+        Some(ImportSpec { path, alias, only })
+    }
+
     fn parse_function(
         &mut self,
+        vis: Visibility,
         is_extern: bool,
         is_unsafe: bool,
         extern_abi: Option<String>,
@@ -208,6 +339,7 @@ impl Parser {
                 return None;
             }
         };
+        let type_params = self.parse_type_param_names()?;
         self.expect_symbol(Symbol::LParen);
         let mut params = Vec::new();
         let mut is_variadic = false;
@@ -271,7 +403,9 @@ impl Parser {
         };
         let end = body.span.clone();
         Some(Function {
+            vis,
             name,
+            type_params,
             params,
             is_variadic,
             ret_type,
@@ -290,6 +424,7 @@ impl Parser {
 
     fn parse_extern_global(
         &mut self,
+        vis: Visibility,
         extern_abi: Option<String>,
         start_override: Option<Span>,
     ) -> Option<ExternGlobal> {
@@ -315,6 +450,7 @@ impl Parser {
         }
         let semi = self.bump().span;
         Some(ExternGlobal {
+            vis,
             name,
             ty,
             extern_abi,
@@ -327,7 +463,698 @@ impl Parser {
         })
     }
 
-    fn parse_struct_def(&mut self, mut layout: LayoutAttr) -> Option<StructDef> {
+    fn parse_type_alias(&mut self, vis: Visibility, start_override: Option<Span>) -> Option<TypeAlias> {
+        let start = start_override.unwrap_or_else(|| self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        }));
+        self.expect_keyword(Keyword::Type);
+        let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected alias name");
+                return None;
+            }
+        };
+        self.expect_symbol(Symbol::Eq);
+        let ty = self.parse_type()?;
+        if !self.at_symbol(Symbol::Semi) {
+            self.error_here("expected `;` after type alias");
+            return None;
+        }
+        let semi = self.bump().span;
+        Some(TypeAlias {
+            vis,
+            name,
+            ty,
+            is_trait: false,
+            trait_methods: Vec::new(),
+            span: Span {
+                start: start.start,
+                end: semi.end,
+                line: start.line,
+                column: start.column,
+            },
+        })
+    }
+
+    fn parse_trait_alias_item(
+        &mut self,
+        vis: Visibility,
+        start_override: Option<Span>,
+    ) -> Option<TypeAlias> {
+        let start = start_override.unwrap_or_else(|| {
+            self.peek_span().unwrap_or(Span {
+                start: 0,
+                end: 0,
+                line: 1,
+                column: 1,
+            })
+        });
+        self.expect_keyword(Keyword::Trait);
+        let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected trait name");
+                return None;
+            }
+        };
+        let methods = self.parse_trait_method_list();
+        if self.at_symbol(Symbol::Semi) {
+            self.bump();
+        }
+        Some(TypeAlias {
+            vis,
+            name,
+            ty: TypeAst {
+                kind: TypeAstKind::Interface,
+                span: start.clone(),
+            },
+            is_trait: true,
+            trait_methods: methods,
+            span: start,
+        })
+    }
+
+    fn parse_impl_block(
+        &mut self,
+        default_vis: Visibility,
+        start_override: Option<Span>,
+    ) -> Option<Vec<Item>> {
+        let start = start_override.unwrap_or_else(|| {
+            self.peek_span().unwrap_or(Span {
+                start: 0,
+                end: 0,
+                line: 1,
+                column: 1,
+            })
+        });
+        self.expect_keyword(Keyword::Impl);
+        let head_name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected impl target type name");
+                return None;
+            }
+        };
+        let mut trait_name: Option<String> = None;
+        let recv_name = if self.at_keyword(Keyword::For) {
+            self.bump();
+            trait_name = Some(head_name);
+            match self.bump().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected type name after `for`");
+                    return None;
+                }
+            }
+        } else {
+            head_name
+        };
+        let recv_ty = TypeAst {
+            kind: TypeAstKind::Named(recv_name.clone()),
+            span: start.clone(),
+        };
+        self.expect_symbol(Symbol::LBrace);
+        let mut out = Vec::new();
+        let mut impl_methods = Vec::new();
+        while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
+            self.consume_semis();
+            if self.at_symbol(Symbol::RBrace) {
+                break;
+            }
+            let vis = if self.at_keyword(Keyword::Pub) || self.at_keyword(Keyword::Private) {
+                self.parse_item_visibility()
+            } else {
+                default_vis
+            };
+            let mut is_unsafe = false;
+            if self.at_keyword(Keyword::Unsafe) {
+                self.bump();
+                is_unsafe = true;
+            }
+            if !self.at_keyword(Keyword::Fn) {
+                self.error_here("expected `fn` inside impl block");
+                self.bump();
+                continue;
+            }
+            let mut func = match self.parse_function(vis, false, is_unsafe, None, None) {
+                Some(v) => v,
+                None => return None,
+            };
+            if func.params.first().map(|p| p.name.as_str()) != Some("self") {
+                func.params.insert(
+                    0,
+                    Param {
+                        name: "self".to_string(),
+                        ty: recv_ty.clone(),
+                        span: func.span.clone(),
+                    },
+                );
+            }
+            if trait_name.is_some() {
+                impl_methods.push(self.canonical_method_sig(&func));
+            }
+            let module_key = module_symbol_key(&self.current_package, &self.module_disambiguator);
+            func.name = mangle_impl_method(&module_key, &recv_name, &func.name);
+            out.push(Item::Function(func));
+            self.consume_semis();
+        }
+        self.expect_symbol(Symbol::RBrace);
+        if let Some(trait_name) = trait_name {
+            self.impl_trait_records.push(ImplTraitRecord {
+                trait_name,
+                recv_name,
+                methods: impl_methods,
+                span: start,
+            });
+        }
+        Some(out)
+    }
+
+    fn parse_trait_method_list(&mut self) -> Vec<TraitMethod> {
+        let mut methods = Vec::new();
+        if !self.at_symbol(Symbol::LBrace) {
+            return methods;
+        }
+        let trait_span = self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        });
+        self.bump();
+        while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
+            self.consume_semis();
+            if self.at_symbol(Symbol::RBrace) {
+                break;
+            }
+            if self.at_keyword(Keyword::Pub) || self.at_keyword(Keyword::Private) {
+                self.parse_item_visibility();
+            }
+            if !self.at_keyword(Keyword::Fn) {
+                self.error_here("expected `fn` inside trait body");
+                self.bump();
+                continue;
+            }
+            let method_start = self.peek_span().unwrap_or(trait_span.clone());
+            self.bump();
+            let method_name = match self.bump().kind {
+                TokenKind::Ident(name) => name,
+                _ => {
+                    self.error_here("expected trait method name");
+                    break;
+                }
+            };
+            let type_params = match self.parse_type_param_names() {
+                Some(v) => v,
+                None => break,
+            };
+            self.expect_symbol(Symbol::LParen);
+            let mut params = Vec::new();
+            let mut is_variadic = false;
+            if !self.at_symbol(Symbol::RParen) {
+                loop {
+                    if self.at_variadic_marker() {
+                        self.consume_variadic_marker();
+                        is_variadic = true;
+                        break;
+                    }
+                    let param_start = self.peek_span().unwrap_or(method_start.clone());
+                    let param_name = match self.bump().kind {
+                        TokenKind::Ident(name) => name,
+                        _ => {
+                            self.error_here("expected parameter name");
+                            break;
+                        }
+                    };
+                    self.expect_symbol(Symbol::Colon);
+                    let Some(ty) = self.parse_type() else {
+                        break;
+                    };
+                    params.push(Param {
+                        name: param_name,
+                        ty,
+                        span: param_start,
+                    });
+                    if self.at_symbol(Symbol::Comma) {
+                        self.bump();
+                        if self.at_symbol(Symbol::RParen) {
+                            break;
+                        }
+                        if self.at_variadic_marker() {
+                            self.consume_variadic_marker();
+                            is_variadic = true;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect_symbol(Symbol::RParen);
+            let ret_type = if self.at_symbol(Symbol::Arrow) {
+                self.bump();
+                match self.parse_type() {
+                    Some(v) => v,
+                    None => Self::unit_type_ast(&method_start),
+                }
+            } else {
+                Self::unit_type_ast(&method_start)
+            };
+            let default_body = if self.at_symbol(Symbol::LBrace) {
+                let Some(block) = self.parse_block() else {
+                    break;
+                };
+                Some(block)
+            } else {
+                None
+            };
+            if self.at_symbol(Symbol::Semi) {
+                self.bump();
+            }
+            methods.push(TraitMethod {
+                name: method_name,
+                type_params,
+                params: Self::canonical_method_params(params),
+                is_variadic,
+                ret_type,
+                default_body,
+                span: method_start,
+            });
+            self.consume_semis();
+        }
+        self.expect_symbol(Symbol::RBrace);
+        methods
+    }
+
+    fn canonical_method_sig(&self, func: &Function) -> TraitMethod {
+        TraitMethod {
+            name: func.name.clone(),
+            type_params: func.type_params.clone(),
+            params: Self::canonical_method_params(func.params.clone()),
+            is_variadic: func.is_variadic,
+            ret_type: func
+                .ret_type
+                .clone()
+                .unwrap_or_else(|| Self::unit_type_ast(&func.span)),
+            default_body: None,
+            span: func.span.clone(),
+        }
+    }
+
+    fn canonical_method_params(mut params: Vec<Param>) -> Vec<Param> {
+        if params.first().map(|p| p.name.as_str()) == Some("self") {
+            params.remove(0);
+        }
+        params
+    }
+
+    fn unit_type_ast(span: &Span) -> TypeAst {
+        TypeAst {
+            kind: TypeAstKind::Named("unit".to_string()),
+            span: span.clone(),
+        }
+    }
+
+    fn validate_trait_impl_records(&mut self, items: &[Item]) {
+        if self.impl_trait_records.is_empty() {
+            return;
+        }
+        let mut trait_map: HashMap<String, Vec<TraitMethod>> = HashMap::new();
+        for item in items {
+            if let Item::TypeAlias(alias) = item {
+                if alias.is_trait {
+                    trait_map.insert(alias.name.clone(), alias.trait_methods.clone());
+                }
+            }
+        }
+        for record in &self.impl_trait_records {
+            let Some(required_methods) = trait_map.get(&record.trait_name) else {
+                self.diags.push(
+                    format!(
+                        "unknown trait `{}` in `impl {} for {}`",
+                        record.trait_name, record.trait_name, record.recv_name
+                    ),
+                    Some(record.span.clone()),
+                );
+                continue;
+            };
+            let mut provided_map: HashMap<&str, &TraitMethod> = HashMap::new();
+            for method in &record.methods {
+                if provided_map.insert(method.name.as_str(), method).is_some() {
+                    self.diags.push(
+                        format!(
+                            "duplicate method `{}` in `impl {} for {}`",
+                            method.name, record.trait_name, record.recv_name
+                        ),
+                        Some(method.span.clone()),
+                    );
+                }
+            }
+            for required in required_methods {
+                let Some(provided) = provided_map.get(required.name.as_str()) else {
+                    if required.default_body.is_none() {
+                        self.diags.push(
+                            format!(
+                                "missing method `{}` in `impl {} for {}`",
+                                required.name, record.trait_name, record.recv_name
+                            ),
+                            Some(record.span.clone()),
+                        );
+                    }
+                    continue;
+                };
+                if !self.trait_method_signature_eq(required, provided) {
+                    self.diags.push(
+                        format!(
+                            "method `{}` signature mismatch in `impl {} for {}`",
+                            required.name, record.trait_name, record.recv_name
+                        ),
+                        Some(provided.span.clone()),
+                    );
+                }
+            }
+            for provided in &record.methods {
+                if !required_methods.iter().any(|m| m.name == provided.name) {
+                    self.diags.push(
+                        format!(
+                            "method `{}` is not declared in trait `{}`",
+                            provided.name, record.trait_name
+                        ),
+                        Some(provided.span.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn validate_type_param_bounds(&mut self, items: &[Item]) {
+        let mut trait_names: HashSet<String> = HashSet::new();
+        for item in items {
+            if let Item::TypeAlias(alias) = item {
+                if alias.is_trait {
+                    trait_names.insert(alias.name.clone());
+                }
+            }
+        }
+        let mut validate_bounds = |type_params: &[TypeParam]| {
+            for type_param in type_params {
+                for bound in &type_param.bounds {
+                    match &bound.kind {
+                        TypeAstKind::Named(name)
+                            if name == "interface" || trait_names.contains(name) => {}
+                        TypeAstKind::Named(name) => {
+                            self.diags.push(
+                                format!(
+                                    "unknown generic bound `{}` on type parameter `{}`",
+                                    name, type_param.name
+                                ),
+                                Some(bound.span.clone()),
+                            );
+                        }
+                        _ => {
+                            self.diags.push(
+                                format!(
+                                    "generic bound on `{}` must be a trait name",
+                                    type_param.name
+                                ),
+                                Some(bound.span.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        for item in items {
+            match item {
+                Item::Function(func) => validate_bounds(&func.type_params),
+                Item::TypeAlias(alias) if alias.is_trait => {
+                    for method in &alias.trait_methods {
+                        validate_bounds(&method.type_params);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn synthesize_trait_default_impl_methods(&mut self, items: &mut Vec<Item>) {
+        if self.impl_trait_records.is_empty() {
+            return;
+        }
+        let mut trait_map: HashMap<String, Vec<TraitMethod>> = HashMap::new();
+        for item in items.iter() {
+            if let Item::TypeAlias(alias) = item {
+                if alias.is_trait {
+                    trait_map.insert(alias.name.clone(), alias.trait_methods.clone());
+                }
+            }
+        }
+        if trait_map.is_empty() {
+            return;
+        }
+
+        let module_key = module_symbol_key(&self.current_package, &self.module_disambiguator);
+        let mut synthesized = Vec::new();
+        for record in &mut self.impl_trait_records {
+            let Some(required_methods) = trait_map.get(&record.trait_name) else {
+                continue;
+            };
+            let mut provided: HashSet<String> =
+                record.methods.iter().map(|m| m.name.clone()).collect();
+            for required in required_methods {
+                if provided.contains(&required.name) {
+                    continue;
+                }
+                let Some(default_body) = &required.default_body else {
+                    continue;
+                };
+                let recv_ty = TypeAst {
+                    kind: TypeAstKind::Named(record.recv_name.clone()),
+                    span: required.span.clone(),
+                };
+                let mut params = Vec::with_capacity(required.params.len() + 1);
+                params.push(Param {
+                    name: "self".to_string(),
+                    ty: recv_ty,
+                    span: required.span.clone(),
+                });
+                params.extend(required.params.clone());
+                synthesized.push(Item::Function(Function {
+                    vis: Visibility::Private,
+                    name: mangle_impl_method(&module_key, &record.recv_name, &required.name),
+                    type_params: required.type_params.clone(),
+                    params,
+                    is_variadic: required.is_variadic,
+                    ret_type: Some(required.ret_type.clone()),
+                    is_extern: false,
+                    is_unsafe: false,
+                    extern_abi: None,
+                    body: default_body.clone(),
+                    span: required.span.clone(),
+                }));
+                record.methods.push(TraitMethod {
+                    name: required.name.clone(),
+                    type_params: required.type_params.clone(),
+                    params: required.params.clone(),
+                    is_variadic: required.is_variadic,
+                    ret_type: required.ret_type.clone(),
+                    default_body: None,
+                    span: required.span.clone(),
+                });
+                provided.insert(required.name.clone());
+            }
+        }
+        items.extend(synthesized);
+    }
+
+    fn trait_method_signature_eq(&self, expected: &TraitMethod, actual: &TraitMethod) -> bool {
+        if expected.is_variadic != actual.is_variadic
+            || expected.type_params.len() != actual.type_params.len()
+            || expected.params.len() != actual.params.len()
+        {
+            return false;
+        }
+
+        // Compare trait/impl generic methods modulo parameter renaming
+        // (e.g. trait fn f[T](x: T) and impl fn f[U](x: U)).
+        let mut generic_map: HashMap<String, String> = HashMap::new();
+        for (lhs, rhs) in expected.type_params.iter().zip(actual.type_params.iter()) {
+            if lhs.bounds.len() != rhs.bounds.len() {
+                return false;
+            }
+            generic_map.insert(rhs.name.clone(), lhs.name.clone());
+        }
+        for (lhs, rhs) in expected.type_params.iter().zip(actual.type_params.iter()) {
+            for (lhs_bound, rhs_bound) in lhs.bounds.iter().zip(rhs.bounds.iter()) {
+                if !Self::type_ast_eq_with_generic_map(lhs_bound, rhs_bound, &generic_map) {
+                    return false;
+                }
+            }
+        }
+
+        expected
+            .params
+            .iter()
+            .zip(actual.params.iter())
+            .all(|(lhs, rhs)| Self::type_ast_eq_with_generic_map(&lhs.ty, &rhs.ty, &generic_map))
+            && Self::type_ast_eq_with_generic_map(&expected.ret_type, &actual.ret_type, &generic_map)
+    }
+
+    fn type_ast_eq_with_generic_map(
+        lhs: &TypeAst,
+        rhs: &TypeAst,
+        rhs_generic_to_lhs: &HashMap<String, String>,
+    ) -> bool {
+        match (&lhs.kind, &rhs.kind) {
+            (TypeAstKind::Named(a), TypeAstKind::Named(b)) => {
+                a == b || rhs_generic_to_lhs.get(b).map(|mapped| mapped == a).unwrap_or(false)
+            }
+            (TypeAstKind::Ref(a), TypeAstKind::Ref(b))
+            | (TypeAstKind::MutRef(a), TypeAstKind::MutRef(b))
+            | (TypeAstKind::Own(a), TypeAstKind::Own(b))
+            | (TypeAstKind::Alias(a), TypeAstKind::Alias(b))
+            | (TypeAstKind::Slice(a), TypeAstKind::Slice(b))
+            | (TypeAstKind::Chan(a), TypeAstKind::Chan(b))
+            | (TypeAstKind::Shared(a), TypeAstKind::Shared(b)) => {
+                Self::type_ast_eq_with_generic_map(a, b, rhs_generic_to_lhs)
+            }
+            (TypeAstKind::Array(a_ty, a_len), TypeAstKind::Array(b_ty, b_len)) => {
+                a_len == b_len && Self::type_ast_eq_with_generic_map(a_ty, b_ty, rhs_generic_to_lhs)
+            }
+            (TypeAstKind::Map(a_key, a_val), TypeAstKind::Map(b_key, b_val))
+            | (TypeAstKind::Result(a_key, a_val), TypeAstKind::Result(b_key, b_val)) => {
+                Self::type_ast_eq_with_generic_map(a_key, b_key, rhs_generic_to_lhs)
+                    && Self::type_ast_eq_with_generic_map(a_val, b_val, rhs_generic_to_lhs)
+            }
+            (TypeAstKind::Tuple(a_items), TypeAstKind::Tuple(b_items)) => {
+                a_items.len() == b_items.len()
+                    && a_items
+                        .iter()
+                        .zip(b_items.iter())
+                        .all(|(a, b)| Self::type_ast_eq_with_generic_map(a, b, rhs_generic_to_lhs))
+            }
+            (
+                TypeAstKind::FnPtr {
+                    params: a_params,
+                    ret: a_ret,
+                    is_variadic: a_var,
+                },
+                TypeAstKind::FnPtr {
+                    params: b_params,
+                    ret: b_ret,
+                    is_variadic: b_var,
+                },
+            ) => {
+                a_var == b_var
+                    && a_params.len() == b_params.len()
+                    && a_params
+                        .iter()
+                        .zip(b_params.iter())
+                        .all(|(a, b)| Self::type_ast_eq_with_generic_map(a, b, rhs_generic_to_lhs))
+                    && Self::type_ast_eq_with_generic_map(a_ret, b_ret, rhs_generic_to_lhs)
+            }
+            (TypeAstKind::Interface, TypeAstKind::Interface) => true,
+            _ => false,
+        }
+    }
+
+    fn parse_const_item(
+        &mut self,
+        vis: Visibility,
+        start_override: Option<Span>,
+    ) -> Option<ConstItem> {
+        let start = start_override.unwrap_or_else(|| self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        }));
+        self.expect_keyword(Keyword::Const);
+        let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected const name");
+                return None;
+            }
+        };
+        let ty = if self.at_symbol(Symbol::Colon) {
+            self.bump();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect_symbol(Symbol::Eq);
+        let init = self.parse_expr()?;
+        if !self.at_symbol(Symbol::Semi) {
+            self.error_here("expected `;` after const item");
+            return None;
+        }
+        let semi = self.bump().span;
+        Some(ConstItem {
+            vis,
+            name,
+            ty,
+            init,
+            span: Span {
+                start: start.start,
+                end: semi.end,
+                line: start.line,
+                column: start.column,
+            },
+        })
+    }
+
+    fn parse_global_var(
+        &mut self,
+        vis: Visibility,
+        start_override: Option<Span>,
+    ) -> Option<GlobalVar> {
+        let start = start_override.unwrap_or_else(|| self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        }));
+        self.expect_keyword(Keyword::Let);
+        let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected global name");
+                return None;
+            }
+        };
+        let ty = if self.at_symbol(Symbol::Colon) {
+            self.bump();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect_symbol(Symbol::Eq);
+        let init = self.parse_expr()?;
+        if !self.at_symbol(Symbol::Semi) {
+            self.error_here("expected `;` after global let");
+            return None;
+        }
+        let semi = self.bump().span;
+        Some(GlobalVar {
+            vis,
+            name,
+            ty,
+            init,
+            span: Span {
+                start: start.start,
+                end: semi.end,
+                line: start.line,
+                column: start.column,
+            },
+        })
+    }
+
+    fn parse_struct_def(&mut self, vis: Visibility, mut layout: LayoutAttr) -> Option<StructDef> {
         let start = self.peek_span().unwrap_or(Span {
             start: 0,
             end: 0,
@@ -340,11 +1167,7 @@ impl Parser {
             self.bump();
         }
         let extra_layout = self.parse_layout_modifiers();
-        layout.repr_c |= extra_layout.repr_c;
-        layout.bitfield |= extra_layout.bitfield;
-        if extra_layout.pack.is_some() {
-            layout.pack = extra_layout.pack;
-        }
+        self.merge_layout_attrs(&mut layout, extra_layout, Some(start.clone()));
         self.expect_keyword(Keyword::Struct);
         let name = match self.bump().kind {
             TokenKind::Ident(name) => name,
@@ -356,6 +1179,11 @@ impl Parser {
         self.expect_symbol(Symbol::LBrace);
         let mut fields = Vec::new();
         while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
+            let field_vis = if self.at_keyword(Keyword::Pub) || self.at_keyword(Keyword::Private) {
+                self.parse_item_visibility()
+            } else {
+                Visibility::Public
+            };
             let field_start = self.peek_span().unwrap_or(start.clone());
             let field_name = match self.bump().kind {
                 TokenKind::Ident(name) => name,
@@ -368,6 +1196,7 @@ impl Parser {
             let ty = self.parse_type()?;
             self.expect_symbol(Symbol::Semi);
             fields.push(Field {
+                vis: field_vis,
                 name: field_name,
                 ty,
                 span: field_start,
@@ -375,6 +1204,7 @@ impl Parser {
         }
         self.expect_symbol(Symbol::RBrace);
         Some(StructDef {
+            vis,
             name,
             fields,
             is_copy,
@@ -383,7 +1213,7 @@ impl Parser {
         })
     }
 
-    fn parse_enum_def(&mut self, mut layout: LayoutAttr) -> Option<EnumDef> {
+    fn parse_enum_def(&mut self, vis: Visibility, mut layout: LayoutAttr) -> Option<EnumDef> {
         let start = self.peek_span().unwrap_or(Span {
             start: 0,
             end: 0,
@@ -396,11 +1226,7 @@ impl Parser {
             self.bump();
         }
         let extra_layout = self.parse_layout_modifiers();
-        layout.repr_c |= extra_layout.repr_c;
-        layout.bitfield |= extra_layout.bitfield;
-        if extra_layout.pack.is_some() {
-            layout.pack = extra_layout.pack;
-        }
+        self.merge_layout_attrs(&mut layout, extra_layout, Some(start.clone()));
         self.expect_keyword(Keyword::Enum);
         let name = match self.bump().kind {
             TokenKind::Ident(name) => name,
@@ -447,6 +1273,7 @@ impl Parser {
         }
         self.expect_symbol(Symbol::RBrace);
         Some(EnumDef {
+            vis,
             name,
             variants,
             is_copy,
@@ -470,14 +1297,8 @@ impl Parser {
                     }
                 };
                 self.expect_symbol(Symbol::RParen);
-                if repr_name.eq_ignore_ascii_case("c") {
-                    layout.repr_c = true;
-                } else {
-                    self.diags.push(
-                        format!("unsupported repr `{}` (only repr(C) is supported)", repr_name),
-                        Some(repr_span),
-                    );
-                }
+                let repr = Self::parse_repr_name(&repr_name);
+                self.apply_layout_repr(&mut layout, repr, Some(repr_span));
                 continue;
             }
             if self.at_ident("pack") {
@@ -504,6 +1325,83 @@ impl Parser {
             break;
         }
         layout
+    }
+
+    fn parse_repr_name(name: &str) -> ParsedRepr {
+        match name.to_ascii_lowercase().as_str() {
+            "c" => ParsedRepr::C,
+            "transparent" => ParsedRepr::Transparent,
+            "i8" => ParsedRepr::Int(ReprInt::I8),
+            "i16" => ParsedRepr::Int(ReprInt::I16),
+            "i32" => ParsedRepr::Int(ReprInt::I32),
+            "i64" => ParsedRepr::Int(ReprInt::I64),
+            "isize" => ParsedRepr::Int(ReprInt::Isize),
+            "u8" => ParsedRepr::Int(ReprInt::U8),
+            "u16" => ParsedRepr::Int(ReprInt::U16),
+            "u32" => ParsedRepr::Int(ReprInt::U32),
+            "u64" => ParsedRepr::Int(ReprInt::U64),
+            "usize" => ParsedRepr::Int(ReprInt::Usize),
+            _ => ParsedRepr::Other(name.to_string()),
+        }
+    }
+
+    fn current_repr(layout: &LayoutAttr) -> Option<ParsedRepr> {
+        if layout.repr_c {
+            Some(ParsedRepr::C)
+        } else if layout.repr_transparent {
+            Some(ParsedRepr::Transparent)
+        } else if let Some(other) = &layout.repr_other {
+            Some(ParsedRepr::Other(other.clone()))
+        } else {
+            layout.repr_int.map(ParsedRepr::Int)
+        }
+    }
+
+    fn apply_layout_repr(
+        &mut self,
+        layout: &mut LayoutAttr,
+        repr: ParsedRepr,
+        span: Option<Span>,
+    ) {
+        let existing = Self::current_repr(layout);
+        if existing == Some(repr.clone()) {
+            return;
+        }
+        if existing.is_some() {
+            self.diags
+                .push("conflicting repr modifiers are not allowed", span);
+            return;
+        }
+        match repr {
+            ParsedRepr::C => layout.repr_c = true,
+            ParsedRepr::Transparent => layout.repr_transparent = true,
+            ParsedRepr::Int(kind) => layout.repr_int = Some(kind),
+            ParsedRepr::Other(other) => layout.repr_other = Some(other),
+        }
+    }
+
+    fn merge_layout_attrs(
+        &mut self,
+        layout: &mut LayoutAttr,
+        extra: LayoutAttr,
+        span: Option<Span>,
+    ) {
+        if extra.repr_c {
+            self.apply_layout_repr(layout, ParsedRepr::C, span.clone());
+        }
+        if extra.repr_transparent {
+            self.apply_layout_repr(layout, ParsedRepr::Transparent, span.clone());
+        }
+        if let Some(kind) = extra.repr_int {
+            self.apply_layout_repr(layout, ParsedRepr::Int(kind), span.clone());
+        }
+        if let Some(other) = extra.repr_other {
+            self.apply_layout_repr(layout, ParsedRepr::Other(other), span.clone());
+        }
+        if extra.pack.is_some() {
+            layout.pack = extra.pack;
+        }
+        layout.bitfield |= extra.bitfield;
     }
 
     fn parse_block(&mut self) -> Option<Block> {
@@ -542,22 +1440,41 @@ impl Parser {
             }
             if self.at_keyword(Keyword::Break) {
                 let span = self.bump().span;
+                let label = match self.peek().kind.clone() {
+                    TokenKind::Ident(name) => {
+                        self.bump();
+                        Some(name)
+                    }
+                    _ => None,
+                };
                 if self.at_symbol(Symbol::Semi) {
                     self.bump();
                 }
-                stmts.push(Stmt::Break { span });
+                stmts.push(Stmt::Break { label, span });
                 continue;
             }
             if self.at_keyword(Keyword::Continue) {
                 let span = self.bump().span;
+                let label = match self.peek().kind.clone() {
+                    TokenKind::Ident(name) => {
+                        self.bump();
+                        Some(name)
+                    }
+                    _ => None,
+                };
                 if self.at_symbol(Symbol::Semi) {
                     self.bump();
                 }
-                stmts.push(Stmt::Continue { span });
+                stmts.push(Stmt::Continue { label, span });
                 continue;
             }
             if self.at_keyword(Keyword::Let) {
                 let stmt = self.parse_let_stmt()?;
+                stmts.push(stmt);
+                continue;
+            }
+            if self.at_keyword(Keyword::Const) {
+                let stmt = self.parse_const_stmt()?;
                 stmts.push(stmt);
                 continue;
             }
@@ -600,13 +1517,14 @@ impl Parser {
                 continue;
             }
             let expr = self.parse_expr()?;
-            if self.at_symbol(Symbol::Eq) {
+            if let Some(op) = self.peek_assign_op() {
                 let span = self.bump().span;
                 let value = self.parse_expr()?;
                 if self.at_symbol(Symbol::Semi) {
                     self.bump();
                 }
                 stmts.push(Stmt::Assign {
+                    op,
                     target: expr,
                     value,
                     span,
@@ -671,6 +1589,23 @@ impl Parser {
             }
         };
         self.expect_symbol(Symbol::Colon);
+        if self.at_keyword(Keyword::For) {
+            return self.parse_for_stmt_with_label(Some(label_name));
+        }
+        if self.at_keyword(Keyword::While) {
+            let mut stmt = self.parse_while_stmt()?;
+            if let Stmt::While { label, .. } = &mut stmt {
+                *label = Some(label_name);
+            }
+            return Some(stmt);
+        }
+        if self.at_keyword(Keyword::Loop) {
+            let mut stmt = self.parse_loop_stmt()?;
+            if let Stmt::Loop { label, .. } = &mut stmt {
+                *label = Some(label_name);
+            }
+            return Some(stmt);
+        }
         let callee = self.new_expr(ExprKind::Ident("asm_label".to_string()), start.clone());
         let label_arg = self.new_expr(ExprKind::String(label_name), start.clone());
         let expr = self.new_expr(
@@ -712,20 +1647,100 @@ impl Parser {
         })
     }
 
-    fn parse_for_stmt(&mut self) -> Option<Stmt> {
+    fn parse_const_stmt(&mut self) -> Option<Stmt> {
         let span = self.bump().span;
         let name = match self.bump().kind {
+            TokenKind::Ident(name) => name,
+            _ => {
+                self.error_here("expected identifier after const");
+                return None;
+            }
+        };
+        let ty = if self.at_symbol(Symbol::Colon) {
+            self.bump();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect_symbol(Symbol::Eq);
+        let init = self.parse_expr()?;
+        if self.at_symbol(Symbol::Semi) {
+            self.bump();
+        }
+        Some(Stmt::Const {
+            name,
+            ty,
+            init,
+            span,
+        })
+    }
+
+    fn parse_for_stmt(&mut self) -> Option<Stmt> {
+        self.parse_for_stmt_with_label(None)
+    }
+
+    fn parse_for_stmt_with_label(&mut self, label: Option<String>) -> Option<Stmt> {
+        let span = self.bump().span;
+        let first_name = match self.bump().kind {
             TokenKind::Ident(name) => name,
             _ => {
                 self.error_here("expected iterator variable");
                 return None;
             }
         };
+        let second_name = if self.at_symbol(Symbol::Comma) {
+            self.bump();
+            match self.bump().kind {
+                TokenKind::Ident(name) => Some(name),
+                _ => {
+                    self.error_here("expected value variable after `,`");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         self.expect_keyword(Keyword::In);
-        let iter = self.parse_expr_no_struct_lit()?;
+        let start_or_iter = self.parse_expr_no_struct_lit()?;
+        let range_inclusive = if self.at_symbol(Symbol::DotDot) {
+            self.bump();
+            Some(false)
+        } else if self.at_symbol(Symbol::DotDotEq) {
+            self.bump();
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(inclusive) = range_inclusive {
+            let end_expr = self.parse_expr_no_struct_lit()?;
+            let body = self.parse_block()?;
+            let (name, index) = if let Some(value_name) = second_name {
+                (value_name, Some(first_name))
+            } else {
+                (first_name, None)
+            };
+            return Some(Stmt::ForRange {
+                label,
+                name,
+                index,
+                start: start_or_iter,
+                end: end_expr,
+                inclusive,
+                body,
+                span,
+            });
+        }
+        let iter = start_or_iter;
         let body = self.parse_block()?;
+        let (name, index) = if let Some(value_name) = second_name {
+            (value_name, Some(first_name))
+        } else {
+            (first_name, None)
+        };
         Some(Stmt::ForIn {
+            label,
             name,
+            index,
             iter,
             body,
             span,
@@ -736,13 +1751,22 @@ impl Parser {
         let span = self.bump().span;
         let cond = self.parse_expr_no_struct_lit()?;
         let body = self.parse_block()?;
-        Some(Stmt::While { cond, body, span })
+        Some(Stmt::While {
+            label: None,
+            cond,
+            body,
+            span,
+        })
     }
 
     fn parse_loop_stmt(&mut self) -> Option<Stmt> {
         let span = self.bump().span;
         let body = self.parse_block()?;
-        Some(Stmt::Loop { body, span })
+        Some(Stmt::Loop {
+            label: None,
+            body,
+            span,
+        })
     }
 
     fn parse_select_stmt(&mut self) -> Option<Stmt> {
@@ -930,6 +1954,17 @@ impl Parser {
                 span,
             ));
         }
+        if self.at_symbol(Symbol::Tilde) {
+            let span = self.bump().span;
+            let expr = self.parse_unary_expr()?;
+            return Some(self.new_expr(
+                ExprKind::Unary {
+                    op: UnaryOp::BitNot,
+                    expr: Box::new(expr),
+                },
+                span,
+            ));
+        }
         if self.at_symbol(Symbol::Amp) {
             let span = self.bump().span;
             let is_mut = if self.at_keyword(Keyword::Mut) {
@@ -956,6 +1991,17 @@ impl Parser {
             ));
         }
         let mut expr = self.parse_postfix_expr()?;
+        while self.at_keyword(Keyword::As) {
+            let span = self.bump().span;
+            let ty = self.parse_type()?;
+            expr = self.new_expr(
+                ExprKind::Cast {
+                    expr: Box::new(expr),
+                    ty,
+                },
+                span,
+            );
+        }
         if self.at_symbol(Symbol::Question) {
             let span = self.bump().span;
             expr = self.new_expr(
@@ -971,9 +2017,8 @@ impl Parser {
     fn parse_postfix_expr(&mut self) -> Option<Expr> {
         let mut expr = self.parse_primary_expr()?;
         loop {
-            if self.at_symbol(Symbol::LBracket) && self.is_builtin_generic_callee(&expr) {
+            if let Some(type_args) = self.try_parse_call_type_args() {
                 let span = self.peek_span().unwrap_or(expr.span.clone());
-                let type_args = self.parse_type_args()?;
                 self.expect_symbol(Symbol::LParen);
                 let mut args = Vec::new();
                 if !self.at_symbol(Symbol::RParen) {
@@ -1087,6 +2132,12 @@ impl Parser {
                 block.span,
             ));
         }
+        if self.at_symbol(Symbol::Pipe) {
+            return self.parse_closure_expr();
+        }
+        if self.at_symbol(Symbol::LBracket) {
+            return self.parse_bracket_literal_expr();
+        }
         if self.at_symbol(Symbol::LBrace) {
             let block = self.parse_block()?;
             return Some(self.new_expr(
@@ -1100,7 +2151,17 @@ impl Parser {
             let then_block = Box::new(self.parse_block()?);
             let else_block = if self.at_keyword(Keyword::Else) {
                 self.bump();
-                Some(Box::new(self.parse_block()?))
+                if self.at_keyword(Keyword::If) {
+                    // Desugar `else if ...` into `else { if ... }` so the AST shape stays stable.
+                    let else_if = self.parse_primary_expr()?;
+                    Some(Box::new(Block {
+                        stmts: Vec::new(),
+                        tail: Some(else_if.clone()),
+                        span: else_if.span,
+                    }))
+                } else {
+                    Some(Box::new(self.parse_block()?))
+                }
             } else {
                 None
             };
@@ -1121,14 +2182,26 @@ impl Parser {
             while !self.at_symbol(Symbol::RBrace) && !self.at_eof() {
                 let arm_span = self.peek_span().unwrap_or(span.clone());
                 let pattern = self.parse_pattern()?;
+                let guard = if self.at_keyword(Keyword::If) {
+                    self.bump();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 self.expect_symbol(Symbol::FatArrow);
                 let body = self.parse_block_or_expr()?;
-                self.expect_symbol(Symbol::Comma);
                 arms.push(MatchArm {
                     pattern,
+                    guard,
                     body,
                     span: arm_span,
                 });
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                } else if !self.at_symbol(Symbol::RBrace) {
+                    self.error_here("expected `,` or `}` after match arm");
+                    return None;
+                }
             }
             self.expect_symbol(Symbol::RBrace);
             return Some(self.new_expr(
@@ -1142,7 +2215,7 @@ impl Parser {
         match self.bump().kind {
             TokenKind::IntLit(value) => Some(self.new_expr(ExprKind::Int(value), span)),
             TokenKind::FloatLit(value) => Some(self.new_expr(ExprKind::Float(value), span)),
-            TokenKind::StringLit(value) => Some(self.new_expr(ExprKind::String(value), span)),
+            TokenKind::StringLit(value) => self.parse_interpolated_string_expr(value, span),
             TokenKind::CharLit(value) => Some(self.new_expr(ExprKind::Char(value), span)),
             TokenKind::Keyword(Keyword::True) => Some(self.new_expr(ExprKind::Bool(true), span)),
             TokenKind::Keyword(Keyword::False) => Some(self.new_expr(ExprKind::Bool(false), span)),
@@ -1236,6 +2309,106 @@ impl Parser {
                 None
             }
         }
+    }
+
+    fn parse_interpolation_expr_fragment(&mut self, raw: &str, span: &Span) -> Option<Expr> {
+        let tokens = Lexer::new(raw).lex_all();
+        let mut sub = Parser::new_with_expr_id(tokens, self.next_expr_id);
+        sub.current_package = self.current_package.clone();
+        sub.module_disambiguator = self.module_disambiguator.clone();
+        let expr = sub.parse_expr();
+        if !sub.at_eof() {
+            sub.error_here("unexpected token inside string interpolation");
+        }
+        self.next_expr_id = sub.next_expr_id();
+        if !sub.diags.is_empty() {
+            for mut d in sub.diags.items {
+                if d.span.is_none() {
+                    d.span = Some(span.clone());
+                }
+                self.diags.push_diag(d);
+            }
+        }
+        expr
+    }
+
+    fn parse_interpolated_string_expr(&mut self, value: String, span: Span) -> Option<Expr> {
+        if !value.contains("${") {
+            return Some(self.new_expr(ExprKind::String(value), span));
+        }
+
+        let chars: Vec<char> = value.chars().collect();
+        let mut i = 0usize;
+        let mut literal = String::new();
+        let mut parts: Vec<Expr> = Vec::new();
+
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                if !literal.is_empty() {
+                    parts.push(self.new_expr(ExprKind::String(literal.clone()), span.clone()));
+                    literal.clear();
+                }
+                i += 2;
+                let mut depth = 1i32;
+                let mut frag = String::new();
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if ch == '{' {
+                        depth += 1;
+                        frag.push(ch);
+                    } else if ch == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                        frag.push(ch);
+                    } else {
+                        frag.push(ch);
+                    }
+                    i += 1;
+                }
+                if depth != 0 {
+                    self.diags.push(
+                        "unterminated `${...}` in string interpolation",
+                        Some(span.clone()),
+                    );
+                    return None;
+                }
+                let frag = frag.trim();
+                if frag.is_empty() {
+                    self.diags
+                        .push("empty `${...}` in string interpolation", Some(span.clone()));
+                    return None;
+                }
+                let expr = self.parse_interpolation_expr_fragment(frag, &span)?;
+                parts.push(expr);
+                continue;
+            }
+            literal.push(chars[i]);
+            i += 1;
+        }
+        if !literal.is_empty() {
+            parts.push(self.new_expr(ExprKind::String(literal), span.clone()));
+        }
+        if parts.is_empty() {
+            return Some(self.new_expr(ExprKind::String(String::new()), span));
+        }
+
+        let mut iter = parts.into_iter();
+        let mut out = iter.next()?;
+        for part in iter {
+            let callee = self.new_expr(ExprKind::Ident("string_concat".to_string()), span.clone());
+            out = self.new_expr(
+                ExprKind::Call {
+                    callee: Box::new(callee),
+                    type_args: Vec::new(),
+                    args: vec![out, part],
+                },
+                span.clone(),
+            );
+        }
+        Some(out)
     }
 
     fn parse_colon_inline_asm_expr(&mut self) -> Option<Expr> {
@@ -1419,6 +2592,7 @@ impl Parser {
         }
         if outputs.len() == 1 {
             let assign = Stmt::Assign {
+                op: AssignOp::Assign,
                 target: outputs[0].2.clone(),
                 value: call_expr,
                 span: span.clone(),
@@ -1448,6 +2622,7 @@ impl Parser {
                 span.clone(),
             );
             stmts.push(Stmt::Assign {
+                op: AssignOp::Assign,
                 target: target.clone(),
                 value,
                 span: span.clone(),
@@ -1591,6 +2766,157 @@ impl Parser {
         ))
     }
 
+    fn parse_braced_expr_list(&mut self) -> Option<(Vec<Expr>, Span)> {
+        let lbrace = self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        });
+        self.expect_symbol(Symbol::LBrace);
+        let mut items = Vec::new();
+        if !self.at_symbol(Symbol::RBrace) {
+            loop {
+                items.push(self.parse_expr()?);
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                    if self.at_symbol(Symbol::RBrace) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        let rbrace = self.peek_span().unwrap_or(lbrace.clone());
+        self.expect_symbol(Symbol::RBrace);
+        let span = Span {
+            start: lbrace.start,
+            end: rbrace.end,
+            line: lbrace.line,
+            column: lbrace.column,
+        };
+        Some((items, span))
+    }
+
+    fn lower_slice_literal_expr(
+        &mut self,
+        elem_ty: TypeAst,
+        elems: Vec<Expr>,
+        span: Span,
+    ) -> Expr {
+        let tmp_name = format!("__slice_lit_{}", self.next_expr_id);
+        let slice_ty = TypeAst {
+            kind: TypeAstKind::Slice(Box::new(elem_ty.clone())),
+            span: span.clone(),
+        };
+        let len_lit = self.new_expr(ExprKind::Int("0".to_string()), span.clone());
+        let cap_lit = self.new_expr(ExprKind::Int(elems.len().to_string()), span.clone());
+        let make_callee = self.new_expr(ExprKind::Ident("make_slice".to_string()), span.clone());
+        let make_call = self.new_expr(
+            ExprKind::Call {
+                callee: Box::new(make_callee),
+                type_args: vec![elem_ty.clone()],
+                args: vec![len_lit, cap_lit],
+            },
+            span.clone(),
+        );
+        let mut stmts = Vec::new();
+        stmts.push(Stmt::Let {
+            name: tmp_name.clone(),
+            ty: Some(slice_ty),
+            init: make_call,
+            span: span.clone(),
+        });
+        for elem in elems {
+            let push_callee = self.new_expr(ExprKind::Ident("slice_push".to_string()), span.clone());
+            let tmp_ident = self.new_expr(ExprKind::Ident(tmp_name.clone()), span.clone());
+            let borrow = self.new_expr(
+                ExprKind::Borrow {
+                    is_mut: true,
+                    expr: Box::new(tmp_ident),
+                },
+                span.clone(),
+            );
+            let push_call = self.new_expr(
+                ExprKind::Call {
+                    callee: Box::new(push_callee),
+                    type_args: vec![elem_ty.clone()],
+                    args: vec![borrow, elem],
+                },
+                span.clone(),
+            );
+            stmts.push(Stmt::Expr {
+                expr: push_call,
+                span: span.clone(),
+            });
+        }
+        let tail = self.new_expr(ExprKind::Ident(tmp_name), span.clone());
+        self.new_expr(
+            ExprKind::Block(Box::new(Block {
+                stmts,
+                tail: Some(tail),
+                span: span.clone(),
+            })),
+            span,
+        )
+    }
+
+    fn parse_bracket_literal_expr(&mut self) -> Option<Expr> {
+        let start = self.peek_span().unwrap_or(Span {
+            start: 0,
+            end: 0,
+            line: 1,
+            column: 1,
+        });
+
+        let save_idx = self.idx;
+        let save_diags = self.diags.items.len();
+        self.bump(); // `[`
+        if self.at_symbol(Symbol::RBracket) {
+            self.bump(); // `]`
+            if let Some(elem_ty) = self.parse_type() {
+                if self.at_symbol(Symbol::LBrace) {
+                    let (elems, body_span) = self.parse_braced_expr_list()?;
+                    let span = Span {
+                        start: start.start,
+                        end: body_span.end,
+                        line: start.line,
+                        column: start.column,
+                    };
+                    return Some(self.lower_slice_literal_expr(elem_ty, elems, span));
+                }
+            }
+        }
+        self.idx = save_idx;
+        self.diags.items.truncate(save_diags);
+
+        self.expect_symbol(Symbol::LBracket);
+        let mut items = Vec::new();
+        if !self.at_symbol(Symbol::RBracket) {
+            loop {
+                items.push(self.parse_expr()?);
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                    if self.at_symbol(Symbol::RBracket) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        let rbracket = self.peek_span().unwrap_or(start.clone());
+        self.expect_symbol(Symbol::RBracket);
+        let span = Span {
+            start: start.start,
+            end: rbracket.end,
+            line: start.line,
+            column: start.column,
+        };
+        Some(self.new_expr(ExprKind::ArrayLit(items), span))
+    }
+
     fn parse_type_args(&mut self) -> Option<Vec<TypeAst>> {
         self.expect_symbol(Symbol::LBracket);
         let mut args = Vec::new();
@@ -1611,7 +2937,147 @@ impl Parser {
         Some(args)
     }
 
+    fn parse_type_param_names(&mut self) -> Option<Vec<TypeParam>> {
+        if !self.at_symbol(Symbol::LBracket) {
+            return Some(Vec::new());
+        }
+        self.bump();
+        let mut params = Vec::new();
+        if !self.at_symbol(Symbol::RBracket) {
+            loop {
+                let param_span = self.peek_span().unwrap_or(Span {
+                    start: 0,
+                    end: 0,
+                    line: 1,
+                    column: 1,
+                });
+                let name = match self.bump().kind {
+                    TokenKind::Ident(name) => name,
+                    _ => {
+                        self.error_here("expected type parameter name");
+                        return None;
+                    }
+                };
+                let mut bounds = Vec::new();
+                if self.at_symbol(Symbol::Colon) {
+                    self.bump();
+                    loop {
+                        bounds.push(self.parse_type()?);
+                        if self.at_symbol(Symbol::Plus) {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                params.push(TypeParam {
+                    name,
+                    bounds,
+                    span: param_span,
+                });
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                    if self.at_symbol(Symbol::RBracket) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(Symbol::RBracket);
+        Some(params)
+    }
+
+    fn try_parse_call_type_args(&mut self) -> Option<Vec<TypeAst>> {
+        if !self.at_symbol(Symbol::LBracket) {
+            return None;
+        }
+        let save_idx = self.idx;
+        let save_diags = self.diags.items.len();
+        let parsed = self.parse_type_args();
+        match parsed {
+            Some(type_args) if self.at_symbol(Symbol::LParen) => Some(type_args),
+            _ => {
+                self.idx = save_idx;
+                self.diags.items.truncate(save_diags);
+                None
+            }
+        }
+    }
+
+    fn parse_closure_expr(&mut self) -> Option<Expr> {
+        let start = self.bump().span;
+        let mut params = Vec::new();
+        if !self.at_symbol(Symbol::Pipe) {
+            loop {
+                let pspan = self.peek_span().unwrap_or(start.clone());
+                let name = match self.bump().kind {
+                    TokenKind::Ident(name) => name,
+                    _ => {
+                        self.error_here("expected closure parameter name");
+                        return None;
+                    }
+                };
+                let ty = if self.at_symbol(Symbol::Colon) {
+                    self.bump();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push(ClosureParam {
+                    name,
+                    ty,
+                    span: pspan,
+                });
+                if self.at_symbol(Symbol::Comma) {
+                    self.bump();
+                    if self.at_symbol(Symbol::Pipe) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(Symbol::Pipe);
+        let body = if self.at_symbol(Symbol::LBrace) {
+            BlockOrExpr::Block(Box::new(self.parse_block()?))
+        } else {
+            BlockOrExpr::Expr(self.parse_expr()?)
+        };
+        let end = match &body {
+            BlockOrExpr::Block(block) => block.span.clone(),
+            BlockOrExpr::Expr(expr) => expr.span.clone(),
+        };
+        Some(self.new_expr(
+            ExprKind::Closure {
+                params,
+                body: Box::new(body),
+            },
+            Span {
+                start: start.start,
+                end: end.end,
+                line: start.line,
+                column: start.column,
+            },
+        ))
+    }
+
     fn parse_pattern(&mut self) -> Option<Pattern> {
+        let mut patterns = Vec::new();
+        patterns.push(self.parse_pattern_atom()?);
+        while self.at_symbol(Symbol::Pipe) {
+            self.bump();
+            patterns.push(self.parse_pattern_atom()?);
+        }
+        if patterns.len() == 1 {
+            return patterns.pop();
+        }
+        Some(Pattern::Or(patterns))
+    }
+
+    fn parse_pattern_atom(&mut self) -> Option<Pattern> {
         let token = self.bump();
         match token.kind {
             TokenKind::Ident(name) if name == "_" => Some(Pattern::Wildcard),
@@ -1677,10 +3143,32 @@ impl Parser {
         });
         if self.at_symbol(Symbol::LBracket) {
             self.bump();
+            if self.at_symbol(Symbol::RBracket) {
+                self.bump();
+                let inner = self.parse_type()?;
+                return Some(TypeAst {
+                    kind: TypeAstKind::Slice(Box::new(inner)),
+                    span,
+                });
+            }
+            let len_raw = match self.bump().kind {
+                TokenKind::IntLit(raw) => raw,
+                _ => {
+                    self.error_here("expected array length");
+                    return None;
+                }
+            };
+            let len = match len_raw.parse::<usize>() {
+                Ok(v) => v,
+                Err(_) => {
+                    self.error_here("array length out of range");
+                    return None;
+                }
+            };
             self.expect_symbol(Symbol::RBracket);
             let inner = self.parse_type()?;
             return Some(TypeAst {
-                kind: TypeAstKind::Slice(Box::new(inner)),
+                kind: TypeAstKind::Array(Box::new(inner), len),
                 span,
             });
         }
@@ -1706,7 +3194,7 @@ impl Parser {
                 span,
             });
         }
-        if self.at_keyword(Keyword::Interface) {
+        if self.at_keyword(Keyword::Interface) || self.at_keyword(Keyword::Trait) {
             self.bump();
             return Some(TypeAst {
                 kind: TypeAstKind::Interface,
@@ -1790,6 +3278,26 @@ impl Parser {
                 span,
             });
         }
+        if self.at_ident("own") {
+            self.bump();
+            self.expect_symbol(Symbol::LBracket);
+            let inner = self.parse_type()?;
+            self.expect_symbol(Symbol::RBracket);
+            return Some(TypeAst {
+                kind: TypeAstKind::Own(Box::new(inner)),
+                span,
+            });
+        }
+        if self.at_ident("alias") {
+            self.bump();
+            self.expect_symbol(Symbol::LBracket);
+            let inner = self.parse_type()?;
+            self.expect_symbol(Symbol::RBracket);
+            return Some(TypeAst {
+                kind: TypeAstKind::Alias(Box::new(inner)),
+                span,
+            });
+        }
         if self.at_ident("chan") {
             self.bump();
             self.expect_symbol(Symbol::LBracket);
@@ -1852,6 +3360,12 @@ impl Parser {
 
     fn bump(&mut self) -> Token {
         let token = self.peek().clone();
+        if self.is_explicit_semi(&token) {
+            self.diags.push(
+                "explicit `;` is not allowed; end statements with newline",
+                Some(token.span.clone()),
+            );
+        }
         if !matches!(token.kind, TokenKind::Eof) {
             self.idx += 1;
         }
@@ -1864,6 +3378,12 @@ impl Parser {
 
     fn at_symbol(&self, symbol: Symbol) -> bool {
         matches!(&self.peek().kind, TokenKind::Symbol(sym) if *sym == symbol)
+    }
+
+    fn is_explicit_semi(&self, token: &Token) -> bool {
+        matches!(token.kind, TokenKind::Symbol(Symbol::Semi))
+            // inserted semicolon has zero-length span, explicit source `;` has width
+            && token.span.end > token.span.start
     }
 
     fn at_keyword(&self, keyword: Keyword) -> bool {
@@ -1889,62 +3409,39 @@ impl Parser {
     }
 
     fn at_variadic_marker(&self) -> bool {
+        let t0 = self.tokens.get(self.idx).map(|t| &t.kind);
+        let t1 = self.tokens.get(self.idx + 1).map(|t| &t.kind);
+        let t2 = self.tokens.get(self.idx + 2).map(|t| &t.kind);
         matches!(
-            self.tokens.get(self.idx).map(|t| &t.kind),
-            Some(TokenKind::Symbol(Symbol::Dot))
-        ) && matches!(
-            self.tokens.get(self.idx + 1).map(|t| &t.kind),
-            Some(TokenKind::Symbol(Symbol::Dot))
-        ) && matches!(
-            self.tokens.get(self.idx + 2).map(|t| &t.kind),
-            Some(TokenKind::Symbol(Symbol::Dot))
+            (t0, t1, t2),
+            (
+                Some(TokenKind::Symbol(Symbol::Dot)),
+                Some(TokenKind::Symbol(Symbol::Dot)),
+                Some(TokenKind::Symbol(Symbol::Dot))
+            ) | (
+                Some(TokenKind::Symbol(Symbol::DotDot)),
+                Some(TokenKind::Symbol(Symbol::Dot)),
+                _
+            )
         )
     }
 
     fn consume_variadic_marker(&mut self) {
-        if self.at_variadic_marker() {
+        if matches!(
+            self.tokens.get(self.idx).map(|t| &t.kind),
+            Some(TokenKind::Symbol(Symbol::DotDot))
+        ) && matches!(
+            self.tokens.get(self.idx + 1).map(|t| &t.kind),
+            Some(TokenKind::Symbol(Symbol::Dot))
+        ) {
+            self.bump();
+            self.bump();
+        } else if self.at_variadic_marker() {
             self.bump();
             self.bump();
             self.bump();
         } else {
             self.error_here("expected `...`");
-        }
-    }
-
-    fn is_builtin_generic_callee(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Ident(name) => matches!(
-                name.as_str(),
-                "make_chan"
-                    | "make_slice"
-                    | "slice_len"
-                    | "slice_get_copy"
-                    | "slice_set"
-                    | "slice_ref"
-                    | "slice_mutref"
-                    | "slice_push"
-                    | "slice_pop"
-                    | "shared_new"
-                    | "shared_get"
-                    | "shared_get_mut"
-                    | "make_map"
-                    | "map_get"
-                    | "map_set"
-                    | "map_del"
-                    | "map_len"
-                    | "asm"
-                    | "asm_pure"
-                    | "asm_volatile"
-            ),
-            ExprKind::Field { base, name } => {
-                if let ExprKind::Ident(base_name) = &base.kind {
-                    (base_name == "Result" || base_name == "result")
-                        && (name == "Ok" || name == "Err" || name == "ok" || name == "err")
-                } else {
-                    false
-                }
-            }
-            _ => false,
         }
     }
 
@@ -1982,20 +3479,42 @@ impl Parser {
         let op = match self.peek().kind {
             TokenKind::Symbol(Symbol::OrOr) => (1, BinaryOp::Or),
             TokenKind::Symbol(Symbol::AndAnd) => (2, BinaryOp::And),
-            TokenKind::Symbol(Symbol::EqEq) => (3, BinaryOp::Eq),
-            TokenKind::Symbol(Symbol::NotEq) => (3, BinaryOp::NotEq),
-            TokenKind::Symbol(Symbol::Lt) => (4, BinaryOp::Lt),
-            TokenKind::Symbol(Symbol::Lte) => (4, BinaryOp::Lte),
-            TokenKind::Symbol(Symbol::Gt) => (4, BinaryOp::Gt),
-            TokenKind::Symbol(Symbol::Gte) => (4, BinaryOp::Gte),
-            TokenKind::Symbol(Symbol::Plus) => (6, BinaryOp::Add),
-            TokenKind::Symbol(Symbol::Minus) => (6, BinaryOp::Sub),
-            TokenKind::Symbol(Symbol::Star) => (7, BinaryOp::Mul),
-            TokenKind::Symbol(Symbol::Slash) => (7, BinaryOp::Div),
-            TokenKind::Symbol(Symbol::Percent) => (7, BinaryOp::Rem),
+            TokenKind::Symbol(Symbol::Pipe) => (3, BinaryOp::BitOr),
+            TokenKind::Symbol(Symbol::Caret) => (4, BinaryOp::BitXor),
+            TokenKind::Symbol(Symbol::Amp) => (5, BinaryOp::BitAnd),
+            TokenKind::Symbol(Symbol::EqEq) => (6, BinaryOp::Eq),
+            TokenKind::Symbol(Symbol::NotEq) => (6, BinaryOp::NotEq),
+            TokenKind::Symbol(Symbol::Lt) => (7, BinaryOp::Lt),
+            TokenKind::Symbol(Symbol::Lte) => (7, BinaryOp::Lte),
+            TokenKind::Symbol(Symbol::Gt) => (7, BinaryOp::Gt),
+            TokenKind::Symbol(Symbol::Gte) => (7, BinaryOp::Gte),
+            TokenKind::Symbol(Symbol::Shl) => (8, BinaryOp::Shl),
+            TokenKind::Symbol(Symbol::Shr) => (8, BinaryOp::Shr),
+            TokenKind::Symbol(Symbol::Plus) => (9, BinaryOp::Add),
+            TokenKind::Symbol(Symbol::Minus) => (9, BinaryOp::Sub),
+            TokenKind::Symbol(Symbol::Star) => (10, BinaryOp::Mul),
+            TokenKind::Symbol(Symbol::Slash) => (10, BinaryOp::Div),
+            TokenKind::Symbol(Symbol::Percent) => (10, BinaryOp::Rem),
             _ => return None,
         };
         Some(op)
+    }
+
+    fn peek_assign_op(&self) -> Option<AssignOp> {
+        match self.peek().kind {
+            TokenKind::Symbol(Symbol::Eq) => Some(AssignOp::Assign),
+            TokenKind::Symbol(Symbol::PlusEq) => Some(AssignOp::AddAssign),
+            TokenKind::Symbol(Symbol::MinusEq) => Some(AssignOp::SubAssign),
+            TokenKind::Symbol(Symbol::StarEq) => Some(AssignOp::MulAssign),
+            TokenKind::Symbol(Symbol::SlashEq) => Some(AssignOp::DivAssign),
+            TokenKind::Symbol(Symbol::PercentEq) => Some(AssignOp::RemAssign),
+            TokenKind::Symbol(Symbol::AmpEq) => Some(AssignOp::BitAndAssign),
+            TokenKind::Symbol(Symbol::PipeEq) => Some(AssignOp::BitOrAssign),
+            TokenKind::Symbol(Symbol::CaretEq) => Some(AssignOp::BitXorAssign),
+            TokenKind::Symbol(Symbol::ShlEq) => Some(AssignOp::ShlAssign),
+            TokenKind::Symbol(Symbol::ShrEq) => Some(AssignOp::ShrAssign),
+            _ => None,
+        }
     }
 }
 

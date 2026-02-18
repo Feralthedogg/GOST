@@ -1,4 +1,4 @@
-use crate::frontend::ast::{Block, Expr, ExprId, Pattern, SelectArm};
+use crate::frontend::ast::{AssignOp, Block, Expr, ExprId, Pattern, SelectArm};
 use crate::sema::types::{Type, TypeClass};
 use std::collections::HashMap;
 
@@ -60,6 +60,10 @@ pub struct BasicBlock {
 pub enum MirStmt {
     EnterScope { scope: ScopeId },
     ExitScope { scope: ScopeId },
+    MatchBind {
+        pattern: Pattern,
+        scrutinee: Expr,
+    },
     ForIn {
         name: String,
         iter: Expr,
@@ -76,6 +80,7 @@ pub enum MirStmt {
         init: Expr,
     },
     Assign {
+        op: AssignOp,
         target: Expr,
         value: Expr,
     },

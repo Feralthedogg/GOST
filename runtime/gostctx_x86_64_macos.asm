@@ -1,3 +1,5 @@
+# runtime/gostctx_x86_64_macos.asm
+
 .text
 .globl _gost_ctx_swap
 _gost_ctx_swap:

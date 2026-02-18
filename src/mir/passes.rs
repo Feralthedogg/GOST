@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::frontend::ast::{Block, Expr, ExprKind, Stmt};
+use crate::frontend::ast::{Block, BlockOrExpr, Expr, ExprKind, Pattern, Stmt};
 use crate::sema::types::{Type, TypeClass, TypeDefKind, TypeDefs};
 
 use super::{BasicBlock, CleanupItem, MirFunction, MirStmt, ScopeId, Terminator};
@@ -497,6 +497,278 @@ pub fn verify_mir_strict(func: &MirFunction) -> Result<(), String> {
     Ok(())
 }
 
+fn type_contains_iter(ty: &Type) -> bool {
+    match ty {
+        Type::Iter(_) => true,
+        Type::Ref(inner)
+        | Type::MutRef(inner)
+        | Type::Own(inner)
+        | Type::Alias(inner)
+        | Type::Slice(inner)
+        | Type::Chan(inner)
+        | Type::Shared(inner) => type_contains_iter(inner),
+        Type::Array(inner, _) => type_contains_iter(inner),
+        Type::Map(key, value) => type_contains_iter(key) || type_contains_iter(value),
+        Type::Result(ok, err) => type_contains_iter(ok) || type_contains_iter(err),
+        Type::Tuple(items) => items.iter().any(type_contains_iter),
+        Type::Builtin(_) | Type::FnPtr { .. } | Type::Interface | Type::Named(_) => false,
+    }
+}
+
+fn pattern_backend_supported(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Wildcard | Pattern::Bool(_) | Pattern::Int(_) | Pattern::Ident(_) => true,
+        Pattern::Or(items) => !items.is_empty() && items.iter().all(pattern_backend_supported),
+        Pattern::Variant { .. } => true,
+    }
+}
+
+fn check_backend_ready_block(
+    block: &Block,
+    func_name: &str,
+    bb_idx: usize,
+    context: &str,
+) -> Result<(), String> {
+    for stmt in &block.stmts {
+        check_backend_ready_stmt(stmt, func_name, bb_idx, context)?;
+    }
+    if let Some(tail) = &block.tail {
+        check_backend_ready_expr(tail, func_name, bb_idx, context)?;
+    }
+    Ok(())
+}
+
+fn check_backend_ready_stmt(
+    stmt: &Stmt,
+    func_name: &str,
+    bb_idx: usize,
+    context: &str,
+) -> Result<(), String> {
+    match stmt {
+        Stmt::Let { init, .. } | Stmt::Const { init, .. } => {
+            check_backend_ready_expr(init, func_name, bb_idx, context)?
+        }
+        Stmt::Assign { target, value, .. } => {
+            check_backend_ready_expr(target, func_name, bb_idx, context)?;
+            check_backend_ready_expr(value, func_name, bb_idx, context)?;
+        }
+        Stmt::Expr { expr, .. } | Stmt::Go { expr, .. } => {
+            check_backend_ready_expr(expr, func_name, bb_idx, context)?
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                check_backend_ready_expr(expr, func_name, bb_idx, context)?;
+            }
+        }
+        _ => {
+            return Err(format!(
+                "backend-ready MIR violation: function {} bb {} contains high-level statement in {}",
+                func_name, bb_idx, context
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn check_backend_ready_expr(
+    expr: &Expr,
+    func_name: &str,
+    bb_idx: usize,
+    context: &str,
+) -> Result<(), String> {
+    match &expr.kind {
+        ExprKind::Try { .. } => {
+            return Err(format!(
+                "backend-ready MIR violation: function {} bb {} contains ExprKind::Try in {}",
+                func_name, bb_idx, context
+            ))
+        }
+        ExprKind::Closure { .. } => {
+            return Err(format!(
+                "backend-ready MIR violation: function {} bb {} contains closure expression in {}",
+                func_name, bb_idx, context
+            ))
+        }
+        ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            check_backend_ready_block(block, func_name, bb_idx, context)?;
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            check_backend_ready_expr(cond, func_name, bb_idx, context)?;
+            check_backend_ready_block(then_block, func_name, bb_idx, context)?;
+            if let Some(else_block) = else_block {
+                check_backend_ready_block(else_block, func_name, bb_idx, context)?;
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            check_backend_ready_expr(scrutinee, func_name, bb_idx, context)?;
+            for arm in arms {
+                if !pattern_backend_supported(&arm.pattern) {
+                    return Err(format!(
+                        "backend-ready MIR violation: function {} bb {} contains unsupported match pattern in {}",
+                        func_name, bb_idx, context
+                    ));
+                }
+                if let Some(guard) = &arm.guard {
+                    check_backend_ready_expr(guard, func_name, bb_idx, context)?;
+                }
+                match &arm.body {
+                    BlockOrExpr::Block(block) => {
+                        check_backend_ready_block(block, func_name, bb_idx, context)?
+                    }
+                    BlockOrExpr::Expr(expr) => {
+                        check_backend_ready_expr(expr, func_name, bb_idx, context)?
+                    }
+                }
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            check_backend_ready_expr(callee, func_name, bb_idx, context)?;
+            for arg in args {
+                check_backend_ready_expr(arg, func_name, bb_idx, context)?;
+            }
+        }
+        ExprKind::Field { base, .. } => check_backend_ready_expr(base, func_name, bb_idx, context)?,
+        ExprKind::Index { base, index } => {
+            check_backend_ready_expr(base, func_name, bb_idx, context)?;
+            check_backend_ready_expr(index, func_name, bb_idx, context)?;
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Borrow { expr, .. }
+        | ExprKind::Deref { expr, .. }
+        | ExprKind::Recv { chan: expr }
+        | ExprKind::Close { chan: expr }
+        | ExprKind::After { ms: expr } => check_backend_ready_expr(expr, func_name, bb_idx, context)?,
+        ExprKind::Binary { left, right, .. } => {
+            check_backend_ready_expr(left, func_name, bb_idx, context)?;
+            check_backend_ready_expr(right, func_name, bb_idx, context)?;
+        }
+        ExprKind::Send { chan, value } => {
+            check_backend_ready_expr(chan, func_name, bb_idx, context)?;
+            check_backend_ready_expr(value, func_name, bb_idx, context)?;
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, value) in fields {
+                check_backend_ready_expr(value, func_name, bb_idx, context)?;
+            }
+        }
+        ExprKind::ArrayLit(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                check_backend_ready_expr(item, func_name, bb_idx, context)?;
+            }
+        }
+        ExprKind::Bool(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => {}
+    }
+    Ok(())
+}
+
+pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
+    if type_contains_iter(&func.ret_ty) {
+        return Err(format!(
+            "backend-ready MIR violation: function {} return type still contains iter",
+            func.name
+        ));
+    }
+    for (idx, local) in func.locals.iter().enumerate() {
+        if type_contains_iter(&local.ty) {
+            return Err(format!(
+                "backend-ready MIR violation: function {} local {} still contains iter type",
+                func.name, idx
+            ));
+        }
+    }
+    for (expr_id, ty) in &func.expr_types {
+        if type_contains_iter(ty) {
+            return Err(format!(
+                "backend-ready MIR violation: function {} expr {} still contains iter type",
+                func.name, expr_id
+            ));
+        }
+    }
+
+    for (bb_idx, block) in func.blocks.iter().enumerate() {
+        for stmt in &block.stmts {
+            match stmt {
+                MirStmt::ForIn { .. } | MirStmt::Select { .. } => {
+                    return Err(format!(
+                        "backend-ready MIR violation: function {} bb {} contains high-level MIR statement",
+                        func.name, bb_idx
+                    ))
+                }
+                MirStmt::Let { .. } => {
+                    return Err(format!(
+                        "backend-ready MIR violation: function {} bb {} still contains MirStmt::Let",
+                        func.name, bb_idx
+                    ))
+                }
+                MirStmt::MatchBind { pattern, scrutinee } => {
+                    if !pattern_backend_supported(pattern) {
+                        return Err(format!(
+                            "backend-ready MIR violation: function {} bb {} has unsupported match-bind pattern",
+                            func.name, bb_idx
+                        ));
+                    }
+                    check_backend_ready_expr(scrutinee, &func.name, bb_idx, "MirStmt::MatchBind")?;
+                }
+                MirStmt::Go { expr } => {
+                    check_backend_ready_expr(expr, &func.name, bb_idx, "MirStmt::Go")?;
+                }
+                MirStmt::Assign { target, value, .. } => {
+                    check_backend_ready_expr(target, &func.name, bb_idx, "MirStmt::Assign(target)")?;
+                    check_backend_ready_expr(value, &func.name, bb_idx, "MirStmt::Assign(value)")?;
+                }
+                MirStmt::Expr { expr }
+                | MirStmt::DeferCall { call: expr }
+                | MirStmt::Eval { expr, .. } => {
+                    check_backend_ready_expr(expr, &func.name, bb_idx, "MirStmt expression")?;
+                }
+                MirStmt::EnterScope { .. }
+                | MirStmt::ExitScope { .. }
+                | MirStmt::Drop { .. }
+                | MirStmt::DropName { .. } => {}
+            }
+        }
+        match &block.term {
+            Terminator::If { cond, .. } => {
+                check_backend_ready_expr(cond, &func.name, bb_idx, "Terminator::If")?
+            }
+            Terminator::Match {
+                scrutinee, arms, ..
+            } => {
+                check_backend_ready_expr(scrutinee, &func.name, bb_idx, "Terminator::Match(scrutinee)")?;
+                for (pattern, _) in arms {
+                    if !pattern_backend_supported(pattern) {
+                        return Err(format!(
+                            "backend-ready MIR violation: function {} bb {} has unsupported match terminator pattern",
+                            func.name, bb_idx
+                        ));
+                    }
+                }
+            }
+            Terminator::Return { value } => {
+                if let Some(value) = value {
+                    check_backend_ready_expr(value, &func.name, bb_idx, "Terminator::Return")?;
+                }
+            }
+            Terminator::ReturnError { err } => {
+                check_backend_ready_expr(err, &func.name, bb_idx, "Terminator::ReturnError")?;
+            }
+            Terminator::Goto(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn successors(term: &Terminator) -> Vec<usize> {
     match term {
         Terminator::Goto(target) => vec![*target],
@@ -609,7 +881,7 @@ fn apply_stmt_effects(
             }
             Ok(())
         }
-        MirStmt::Assign { target, value } => {
+        MirStmt::Assign { target, value, .. } => {
             apply_expr_moves(
                 value,
                 ExprCtx::Value,
@@ -724,6 +996,14 @@ fn apply_stmt_effects(
             linear_mask,
             local_names,
         ),
+        MirStmt::MatchBind { scrutinee, .. } => apply_expr_moves(
+            scrutinee,
+            ExprCtx::Place,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         MirStmt::EnterScope { .. }
         | MirStmt::ExitScope { .. }
         | MirStmt::Drop { .. }
@@ -796,6 +1076,14 @@ fn apply_ast_stmt_moves(
             linear_mask,
             local_names,
         ),
+        Stmt::Const { init, .. } => apply_expr_moves(
+            init,
+            ExprCtx::Value,
+            state,
+            name_to_local,
+            linear_mask,
+            local_names,
+        ),
         Stmt::Assign { target, value, .. } => {
             apply_expr_moves(
                 value,
@@ -838,6 +1126,27 @@ fn apply_ast_stmt_moves(
         Stmt::ForIn { iter, body, .. } => {
             apply_expr_moves(
                 iter,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
+            apply_block_moves(body, state, name_to_local, linear_mask, local_names)
+        }
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
+            apply_expr_moves(
+                start,
+                ExprCtx::Value,
+                state,
+                name_to_local,
+                linear_mask,
+                local_names,
+            )?;
+            apply_expr_moves(
+                end,
                 ExprCtx::Value,
                 state,
                 name_to_local,
@@ -987,6 +1296,9 @@ fn apply_expr_moves(
         ExprKind::Unary { expr: inner, .. } => {
             apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
+        ExprKind::Cast { expr: inner, .. } => {
+            apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
+        }
         ExprKind::Binary { left, right, .. } => {
             apply_expr_moves(left, ExprCtx::Value, state, name_to_local, linear_mask, local_names)?;
             apply_expr_moves(
@@ -999,6 +1311,19 @@ fn apply_expr_moves(
             )
         }
         ExprKind::Tuple(items) => {
+            for item in items {
+                apply_expr_moves(
+                    item,
+                    ExprCtx::Value,
+                    state,
+                    name_to_local,
+                    linear_mask,
+                    local_names,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::ArrayLit(items) => {
             for item in items {
                 apply_expr_moves(
                     item,
@@ -1063,6 +1388,16 @@ fn apply_expr_moves(
             let mut arm_states = Vec::new();
             for arm in arms {
                 let mut arm_state = state.to_vec();
+                if let Some(guard) = &arm.guard {
+                    apply_expr_moves(
+                        guard,
+                        ExprCtx::Value,
+                        &mut arm_state,
+                        name_to_local,
+                        linear_mask,
+                        local_names,
+                    )?;
+                }
                 match &arm.body {
                     crate::frontend::ast::BlockOrExpr::Block(block) => {
                         apply_block_moves(block, &mut arm_state, name_to_local, linear_mask, local_names)?;
@@ -1088,6 +1423,21 @@ fn apply_expr_moves(
             state.copy_from_slice(&joined);
             Ok(())
         }
+        ExprKind::Closure { body, .. } => match body.as_ref() {
+            crate::frontend::ast::BlockOrExpr::Block(block) => {
+                apply_block_moves(block, state, name_to_local, linear_mask, local_names)
+            }
+            crate::frontend::ast::BlockOrExpr::Expr(expr) => {
+                apply_expr_moves(
+                    expr,
+                    ExprCtx::Value,
+                    state,
+                    name_to_local,
+                    linear_mask,
+                    local_names,
+                )
+            }
+        },
         ExprKind::Try { expr: inner } => {
             apply_expr_moves(inner, ExprCtx::Value, state, name_to_local, linear_mask, local_names)
         }
@@ -1111,23 +1461,44 @@ fn apply_expr_moves(
 }
 
 fn needs_drop(defs: &TypeDefs, ty: &Type) -> bool {
+    let mut visiting = HashSet::new();
+    needs_drop_inner(defs, ty, &mut visiting)
+}
+
+fn needs_drop_inner(defs: &TypeDefs, ty: &Type, visiting: &mut HashSet<String>) -> bool {
     match ty {
         Type::Builtin(crate::sema::types::BuiltinType::Bytes) => true,
         Type::Builtin(_) => false,
-        Type::Slice(_) | Type::Map(_, _) | Type::Chan(_) | Type::Shared(_) => true,
-        Type::Tuple(items) => items.iter().any(|item| needs_drop(defs, item)),
-        Type::Result(ok, err) => needs_drop(defs, ok) || needs_drop(defs, err),
-        Type::Named(name) => match defs.get(name) {
-            Some(TypeDefKind::Struct(def)) => def
-                .fields
-                .iter()
-                .any(|(_, field_ty)| needs_drop(defs, field_ty)),
-            Some(TypeDefKind::Enum(def)) => def
-                .variants
-                .iter()
-                .any(|(_, fields)| fields.iter().any(|field_ty| needs_drop(defs, field_ty))),
-            None => false,
-        },
+        Type::Slice(_)
+        | Type::Map(_, _)
+        | Type::Chan(_)
+        | Type::Own(_)
+        | Type::Alias(_)
+        | Type::Shared(_) => true,
+        Type::Tuple(items) => items.iter().any(|item| needs_drop_inner(defs, item, visiting)),
+        Type::Result(ok, err) => {
+            needs_drop_inner(defs, ok, visiting) || needs_drop_inner(defs, err, visiting)
+        }
+        Type::Named(name) => {
+            if visiting.contains(name) {
+                return false;
+            }
+            visiting.insert(name.clone());
+            let needs = match defs.get(name) {
+                Some(TypeDefKind::Struct(def)) => def
+                    .fields
+                    .iter()
+                    .any(|field| needs_drop_inner(defs, &field.ty, visiting)),
+                Some(TypeDefKind::Enum(def)) => def.variants.iter().any(|(_, fields)| {
+                    fields
+                        .iter()
+                        .any(|field_ty| needs_drop_inner(defs, field_ty, visiting))
+                }),
+                None => false,
+            };
+            visiting.remove(name);
+            needs
+        }
         _ => false,
     }
 }

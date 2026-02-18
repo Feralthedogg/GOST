@@ -2,7 +2,7 @@ module main
 
 fn main() -> i32 {
     loop {
-        break;
+        break
     }
-    return 0;
+    return 0
 }

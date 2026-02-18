@@ -1,3 +1,5 @@
 tools/
 target/
 runtime/target/
+test/
+sample/

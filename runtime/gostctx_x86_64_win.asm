@@ -1,3 +1,5 @@
+# runtime/gostctx_x86_64_win.asm
+
 .text
 .globl gost_ctx_swap
 # Win64: from=rcx, to=rdx

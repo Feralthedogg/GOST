@@ -1,0 +1,24 @@
+name: Codegen Guardrails
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run compile/codegen regression tests
+        run: cargo test --lib
+
+      - name: Guard new codegen reject strings
+        shell: pwsh
+        run: ./scripts/check_codegen_reject_strings.ps1

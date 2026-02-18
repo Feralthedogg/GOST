@@ -17,6 +17,10 @@ pub enum TokenKind {
 pub enum Keyword {
     Module,
     Import,
+    Pub,
+    Private,
+    Const,
+    Type,
     Extern,
     Unsafe,
     Fn,
@@ -48,6 +52,9 @@ pub enum Keyword {
     False,
     Nil,
     Interface,
+    Trait,
+    Impl,
+    As,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,6 +69,8 @@ pub enum Symbol {
     Semi,
     Colon,
     Dot,
+    DotDot,
+    DotDotEq,
     Arrow,
     FatArrow,
     Pipe,
@@ -72,8 +81,22 @@ pub enum Symbol {
     Minus,
     Slash,
     Percent,
+    Caret,
+    Tilde,
     Bang,
     Eq,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    Shl,
+    Shr,
+    ShlEq,
+    ShrEq,
     EqEq,
     NotEq,
     Lt,
@@ -170,6 +193,11 @@ impl<'a> Lexer<'a> {
             let kind = match ident.as_str() {
                 "module" => TokenKind::Keyword(Keyword::Module),
                 "import" => TokenKind::Keyword(Keyword::Import),
+                "pub" => TokenKind::Keyword(Keyword::Pub),
+                "private" => TokenKind::Keyword(Keyword::Private),
+                "priv" => TokenKind::Keyword(Keyword::Private),
+                "const" => TokenKind::Keyword(Keyword::Const),
+                "type" => TokenKind::Keyword(Keyword::Type),
                 "extern" => TokenKind::Keyword(Keyword::Extern),
                 "unsafe" => TokenKind::Keyword(Keyword::Unsafe),
                 "fn" => TokenKind::Keyword(Keyword::Fn),
@@ -201,6 +229,9 @@ impl<'a> Lexer<'a> {
                 "false" => TokenKind::Keyword(Keyword::False),
                 "nil" => TokenKind::Keyword(Keyword::Nil),
                 "interface" => TokenKind::Keyword(Keyword::Interface),
+                "trait" => TokenKind::Keyword(Keyword::Trait),
+                "impl" => TokenKind::Keyword(Keyword::Impl),
+                "as" => TokenKind::Keyword(Keyword::As),
                 _ => TokenKind::Ident(ident),
             };
             let end = self.idx;
@@ -217,7 +248,7 @@ impl<'a> Lexer<'a> {
         }
         if ch.is_ascii_digit() {
             let number = self.read_number();
-            let kind = if number.contains('.') {
+            let kind = if number.contains('.') || number.contains('e') || number.contains('E') {
                 TokenKind::FloatLit(number)
             } else {
                 TokenKind::IntLit(number)
@@ -281,7 +312,17 @@ impl<'a> Lexer<'a> {
             }
             '.' => {
                 self.advance();
-                TokenKind::Symbol(Symbol::Dot)
+                if self.peek_char() == '.' {
+                    self.advance();
+                    if self.peek_char() == '=' {
+                        self.advance();
+                        TokenKind::Symbol(Symbol::DotDotEq)
+                    } else {
+                        TokenKind::Symbol(Symbol::DotDot)
+                    }
+                } else {
+                    TokenKind::Symbol(Symbol::Dot)
+                }
             }
             '|' => {
                 self.advance();
@@ -291,6 +332,9 @@ impl<'a> Lexer<'a> {
                 } else if self.peek_char() == '|' {
                     self.advance();
                     TokenKind::Symbol(Symbol::OrOr)
+                } else if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::PipeEq)
                 } else {
                     TokenKind::Symbol(Symbol::Pipe)
                 }
@@ -300,34 +344,73 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == '&' {
                     self.advance();
                     TokenKind::Symbol(Symbol::AndAnd)
+                } else if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::AmpEq)
                 } else {
                     TokenKind::Symbol(Symbol::Amp)
                 }
             }
             '*' => {
                 self.advance();
-                TokenKind::Symbol(Symbol::Star)
+                if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::StarEq)
+                } else {
+                    TokenKind::Symbol(Symbol::Star)
+                }
             }
             '+' => {
                 self.advance();
-                TokenKind::Symbol(Symbol::Plus)
+                if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::PlusEq)
+                } else {
+                    TokenKind::Symbol(Symbol::Plus)
+                }
             }
             '-' => {
                 self.advance();
                 if self.peek_char() == '>' {
                     self.advance();
                     TokenKind::Symbol(Symbol::Arrow)
+                } else if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::MinusEq)
                 } else {
                     TokenKind::Symbol(Symbol::Minus)
                 }
             }
             '/' => {
                 self.advance();
-                TokenKind::Symbol(Symbol::Slash)
+                if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::SlashEq)
+                } else {
+                    TokenKind::Symbol(Symbol::Slash)
+                }
             }
             '%' => {
                 self.advance();
-                TokenKind::Symbol(Symbol::Percent)
+                if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::PercentEq)
+                } else {
+                    TokenKind::Symbol(Symbol::Percent)
+                }
+            }
+            '^' => {
+                self.advance();
+                if self.peek_char() == '=' {
+                    self.advance();
+                    TokenKind::Symbol(Symbol::CaretEq)
+                } else {
+                    TokenKind::Symbol(Symbol::Caret)
+                }
+            }
+            '~' => {
+                self.advance();
+                TokenKind::Symbol(Symbol::Tilde)
             }
             '!' => {
                 self.advance();
@@ -352,7 +435,15 @@ impl<'a> Lexer<'a> {
             }
             '<' => {
                 self.advance();
-                if self.peek_char() == '=' {
+                if self.peek_char() == '<' {
+                    self.advance();
+                    if self.peek_char() == '=' {
+                        self.advance();
+                        TokenKind::Symbol(Symbol::ShlEq)
+                    } else {
+                        TokenKind::Symbol(Symbol::Shl)
+                    }
+                } else if self.peek_char() == '=' {
                     self.advance();
                     TokenKind::Symbol(Symbol::Lte)
                 } else {
@@ -361,7 +452,15 @@ impl<'a> Lexer<'a> {
             }
             '>' => {
                 self.advance();
-                if self.peek_char() == '=' {
+                if self.peek_char() == '>' {
+                    self.advance();
+                    if self.peek_char() == '=' {
+                        self.advance();
+                        TokenKind::Symbol(Symbol::ShrEq)
+                    } else {
+                        TokenKind::Symbol(Symbol::Shr)
+                    }
+                } else if self.peek_char() == '=' {
                     self.advance();
                     TokenKind::Symbol(Symbol::Gte)
                 } else {
@@ -415,9 +514,46 @@ impl<'a> Lexer<'a> {
                         self.advance();
                     }
                 }
+                '/' if self.peek_next_char() == '*' => {
+                    let saw_newline = self.consume_block_comment();
+                    if saw_newline && self.prev_can_insert_semi {
+                        self.prev_can_insert_semi = false;
+                        self.pending_semi = true;
+                        return;
+                    }
+                }
                 _ => return,
             }
         }
+    }
+
+    fn consume_block_comment(&mut self) -> bool {
+        self.advance(); // '/'
+        self.advance(); // '*'
+        let mut depth = 1usize;
+        let mut saw_newline = false;
+        while self.idx < self.bytes.len() && depth > 0 {
+            let ch = self.peek_char();
+            if ch == '\n' {
+                saw_newline = true;
+                self.advance();
+                continue;
+            }
+            if ch == '/' && self.peek_next_char() == '*' {
+                self.advance();
+                self.advance();
+                depth += 1;
+                continue;
+            }
+            if ch == '*' && self.peek_next_char() == '/' {
+                self.advance();
+                self.advance();
+                depth -= 1;
+                continue;
+            }
+            self.advance();
+        }
+        saw_newline
     }
 
     fn read_string(&mut self) -> String {
@@ -481,20 +617,107 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_number(&mut self) -> String {
-        let mut s = String::new();
-        while self.idx < self.bytes.len() {
-            let ch = self.peek_char();
-            if ch.is_ascii_digit() {
-                s.push(ch);
-                self.advance();
-            } else if ch == '.' {
-                s.push(ch);
-                self.advance();
-            } else {
-                break;
+        if self.peek_char() == '0' {
+            let next = self.peek_next_char();
+            if next == 'x' || next == 'X' {
+                return self.read_prefixed_int(16);
+            }
+            if next == 'o' || next == 'O' {
+                return self.read_prefixed_int(8);
+            }
+            if next == 'b' || next == 'B' {
+                return self.read_prefixed_int(2);
             }
         }
+
+        let mut s = String::new();
+        self.read_decimal_digits(&mut s);
+
+        if self.peek_char() == '.' {
+            // Keep range operators (`..`, `..=`) out of numeric literals.
+            let next = self.peek_next_char();
+            if next != '.' && next.is_ascii_digit() {
+                s.push('.');
+                self.advance();
+                self.read_decimal_digits(&mut s);
+            }
+        }
+
+        let exp = self.peek_char();
+        if (exp == 'e' || exp == 'E') && self.has_valid_exponent_tail() {
+            s.push('e');
+            self.advance();
+            if self.peek_char() == '+' || self.peek_char() == '-' {
+                s.push(self.peek_char());
+                self.advance();
+            }
+            self.read_decimal_digits(&mut s);
+        }
+
         s
+    }
+
+    fn read_prefixed_int(&mut self, radix: u32) -> String {
+        self.advance(); // 0
+        self.advance(); // x/o/b
+        let mut digits = String::new();
+        while self.idx < self.bytes.len() {
+            let ch = self.peek_char();
+            if ch == '_' {
+                self.advance();
+                continue;
+            }
+            if ch.is_digit(radix) {
+                digits.push(ch);
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if digits.is_empty() {
+            return "0".to_string();
+        }
+        u128::from_str_radix(&digits, radix)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    }
+
+    fn read_decimal_digits(&mut self, out: &mut String) -> usize {
+        let mut count = 0usize;
+        while self.idx < self.bytes.len() {
+            let ch = self.peek_char();
+            if ch == '_' {
+                self.advance();
+                continue;
+            }
+            if ch.is_ascii_digit() {
+                out.push(ch);
+                self.advance();
+                count += 1;
+                continue;
+            }
+            break;
+        }
+        count
+    }
+
+    fn has_valid_exponent_tail(&self) -> bool {
+        let mut i = self.idx + 1;
+        if i >= self.bytes.len() {
+            return false;
+        }
+        let mut ch = self.bytes[i] as char;
+        if ch == '+' || ch == '-' {
+            i += 1;
+            if i >= self.bytes.len() {
+                return false;
+            }
+            ch = self.bytes[i] as char;
+        }
+        if !ch.is_ascii_digit() {
+            return false;
+        }
+        true
     }
 
     fn read_while<F>(&mut self, f: F) -> String

@@ -1,7 +1,9 @@
+pub mod abi;
 pub mod cli;
 pub mod codegen;
 pub mod compile;
 pub mod frontend;
+pub mod intrinsics;
 pub mod mir;
 pub mod pkg;
 pub mod sema;

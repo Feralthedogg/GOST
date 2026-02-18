@@ -1,3 +1,5 @@
+# runtime/gostctx_x86_64_sysv.asm
+
 .text
 .globl gost_ctx_swap
 .type gost_ctx_swap,@function

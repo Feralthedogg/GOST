@@ -1,422 +1,455 @@
 module main
 
-import "std/fmt"
-import "std/error"
+import "std/fmt" as fmt { println }
 
-struct Point {
-    x: i32;
-    y: i32;
+pub const PUBLIC_CONST: i32 = 7
+private const PRIVATE_CONST: i32 = 9
+let GLOBAL_I64: i64 = 123
+
+extern "C" fn printf(fmt: string, ...) -> i32
+extern "C" let errno: i32
+extern "system" fn c_system(x: i64) -> i64
+extern "win64" fn c_win64(x: i64) -> i64
+extern "sysv64" fn c_sysv64(x: i64) -> i64
+
+type ID = i64
+type Mapper = fn(i32) -> i32
+trait AnyBox {}
+
+repr(C) pack(1) struct PackedPair {
+    a: u8
+    b: u16
+}
+
+repr(C) bitfield struct FlagsBits {
+    a: u32
+    b: u32
+}
+
+repr(C) enum CTag {
+    A
+    B
+}
+
+struct User {
+    name: string
+    age: i32
 }
 
 copy struct Pair {
-    a: i32;
-    b: i32;
+    a: i32
+    b: i32
 }
 
-enum Color {
-    Red;
-    Rgb(i32, i32, i32);
+enum Paint {
+    Red
+    Rgb(i32, i32, i32)
 }
 
-copy enum Flag {
-    On;
-    Off;
+copy enum Tiny {
+    One
+    Two
 }
 
-fn point_sum(p: Point) -> i32 {
-    let rx = &p.x;
-    let ry = &p.y;
-    let x = *rx;
-    let y = *ry;
-    return x + y;
-}
-
-fn match_demo(v: i32) -> string {
-    return match v {
-        0 => "zero",
-        1 => "one",
-        _ => "other",
-    };
-}
-
-fn enum_demo(c: Color) -> string {
-    return match c {
-        Color.Red => "red",
-        Color.Rgb(r, g, b) => "rgb",
-        _ => "other",
-    };
-}
-
-fn try_ok() -> (i32, error) {
-    return (7, nil);
-}
-
-fn try_demo() -> error {
-    let v = try_ok()?;
-    let t = v + 1;
-    let unused = t;
-    return nil;
-}
-
-fn ok_res() -> Result[i32, error] {
-    return Result.Ok[i32, error](7);
-}
-
-fn fail_res() -> Result[i32, error] {
-    return Result.Err[i32, error](error_new("x"));
-}
-
-fn ok2() -> (i32, error) {
-    return (3, nil);
-}
-
-fn t1() -> error {
-    let v = ok_res()?;
-    let v2 = v;
-    return nil;
-}
-
-fn t2() -> error {
-    defer println("D");
-    let unused = fail_res()?;
-    println("X");
-    return nil;
-}
-
-fn t3() -> error {
-    let v = ok2()?;
-    let v2 = v;
-    return nil;
-}
-
-fn t4(r: Result[i32, error]) -> i32 {
-    return match r {
-        Result.Ok(x) => x,
-        Result.Err(_) => 0,
-        _ => 0,
-    };
-}
-
-fn mk_res() -> Result[[]i32, error] {
-    let xs = make_slice[i32](1, 1);
-    return Result.Ok[[]i32, error](xs);
-}
-
-fn t5() -> error {
-    let r = mk_res();
-    let r2 = r;
-    return nil;
-}
-
-fn ping() {
-    println("ping");
-}
-
-fn work_shared(x: shared[i32]) {
-    let r = shared_get[i32](&x);
-    let v = *r;
-    let v2 = v;
-}
-
-fn defer_capture_demo() {
-    let x = "one";
-    defer println(x);
-    x = "two";
-    println("defer capture set");
-}
-
-fn defer_loop_demo() {
-    let xs = make_slice[i32](3, 3);
-    slice_set[i32](&mut xs, 0, 1);
-    slice_set[i32](&mut xs, 1, 2);
-    slice_set[i32](&mut xs, 2, 3);
-    for v in &xs {
-        defer println("inner");
-        if *v == 1 {
-            continue;
-        }
-        if *v == 2 {
-            break;
-        }
+impl User {
+    pub fn greet() -> string {
+        return "hello ${self.name}"
     }
-    println("after loop");
-}
 
-fn defer_return_demo() {
-    defer println("outer");
-    {
-        defer println("inner");
-        return;
+    private fn age_plus(delta: i32) -> i32 {
+        return self.age + delta
     }
 }
 
-fn try_ok_demo() -> error {
-    defer println("try defer");
-    let v = try_ok()?;
-    if v == 7 {
-        return nil;
+pub fn exported_helper(v: i32) -> i32 {
+    return v + 1
+}
+
+fn add(x: i32, d: i32) -> i32 {
+    return x + d
+}
+
+fn plus1(x: i32) -> i32 {
+    return x + 1
+}
+
+fn inc_i64(x: i64) -> i64 {
+    return x + 1 as i64
+}
+
+fn dbl_i64(x: i64) -> i64 {
+    return x * 2 as i64
+}
+
+fn id[T](v: T) -> T {
+    return v
+}
+
+fn pick_left[T, U](a: T, _b: U) -> T {
+    return a
+}
+
+fn apply_map(m: Mapper, x: i32) -> i32 {
+    return m(x)
+}
+
+fn pair_ok() -> (i32, error) {
+    return (3, nil)
+}
+
+fn res_ok() -> Result[i32, error] {
+    return Result.Ok(4)
+}
+
+fn try_combo() -> error {
+    let a = pair_ok()?
+    let b = res_ok()?
+    let s = a + b
+    if s > 0 {
+        return nil
     }
-    return nil;
+    return nil
 }
 
-fn inc(x: i32) -> i32 { x + 1 }
-fn double(x: i32) -> i32 { x * 2 }
-fn iter_pred(r: ref[i32]) -> bool { *r != 0 }
-fn iter_map(r: ref[i32]) -> i32 { println("map"); let v = *r; v }
-
-fn after_waiter() {
-    let t = after(1);
-    let _ = recv(t);
+fn async_send(ch: chan[i32]) {
+    send(ch, 77)
 }
 
-fn stress_after(n: i32) {
-    let xs = make_slice[i32](n, n);
-    for _ in &xs {
-        go after_waiter();
-    }
-    select { case after(1000) => { } }
+fn defer_mark() {
+    fmt.println("defer: end")
 }
 
-fn timer_worker() {
-    let t = after(1);
-    let _ = recv(t);
+unsafe fn asm_probe(x: i64) -> i64 {
+    asm volatile("test %0, %0" : : "r"(x) : "cc")
+    let y: i64 = asm("nop")
+    let z: i64 = asm[i64]("mov $1, $0", "=r,r", x)
+    let _u: unit = asm[unit]("nop", "")
+    return y + z - z
 }
 
-fn timer_stress(n: i32) {
-    let xs = make_slice[i32](n, n);
-    for _ in &xs {
-        go timer_worker();
-    }
-    let wait = if n > 50000 { 2000 } else { 500 };
-    select { case after(wait) => { } }
-    println("timer_stress done");
-}
-
-fn select_worker() {
-    select {
-        case after(1) => { },
-        case after(2) => { },
-        case after(3) => { },
+fn check_enum_match(p: Paint) -> i32 {
+    return match p {
+        Paint.Red => 1,
+        Paint.Rgb(r, g, b) if r > 0 => r + g + b,
+        Paint.Rgb(_, _, _) => 0,
+        _ => -1,
     }
 }
 
-fn mixed_after_worker() {
-    select {
-        case after(1) => { },
-        case after(1000) => { },
+fn check_guard_or(n: i64) -> i64 {
+    return match n {
+        1 | 2 if n == 0 as i64 => 99 as i64,
+        1 | 2 => 10 as i64,
+        3 if n > 2 as i64 => 20 as i64,
+        3 | 4 => 30 as i64,
+        _ => 0 as i64,
     }
-}
-
-fn select_stress(n: i32) {
-    let xs = make_slice[i32](n, n);
-    for _ in &xs {
-        go select_worker();
-    }
-    let wait = if n > 50000 { 2000 } else { 500 };
-    select { case after(wait) => { } }
-    println("select_stress done");
-}
-
-fn close_drop_stress(n: i32) {
-    let xs = make_slice[i32](n, n);
-    for _ in &xs {
-        let ch = make_chan[i32](0);
-        close(ch);
-    }
-    println("close_drop_stress done");
-}
-
-fn mixed_after_stress(n: i32) {
-    let xs = make_slice[i32](n, n);
-    for _ in &xs {
-        go mixed_after_worker();
-    }
-    select { case after(1500) => { } }
-    println("mixed_after_stress done");
 }
 
 fn main() -> i32 {
-    println("start");
-    defer println("defer");
+    fmt.println("syntax smoke start")
+    defer defer_mark()
 
-    let n = 1;
-    let m = n + 2;
-    let cmp = (m > n) && (n == 1);
-    let cmp2 = (n != 0) || (m >= n);
-    let c = 'a';
-    let c2 = c;
-    let f = 1.5;
-    let f2 = -f;
-    let notv = !false;
-    println("after basics");
-
-    let block_val = { let a = 1; a + 2 };
-    println("after block");
-
-    let tup = (1, 2);
-    let tup2 = tup;
-    println("after tuple");
-
-    let xs = make_slice[i32](3, 3);
-    slice_set[i32](&mut xs, 0, 1);
-    slice_set[i32](&mut xs, 1, 2);
-    slice_set[i32](&mut xs, 2, 3);
-
-    let first = xs[0];
-    let first2 = first;
-
-    let len = slice_len[i32](&xs);
-    let len2 = len;
-
-    {
-        let r = slice_ref[i32](&xs, 1);
-        let rv = *r;
+    if PUBLIC_CONST != 7 || PRIVATE_CONST != 9 {
+        return 1
+    }
+    if GLOBAL_I64 != 123 as i64 {
+        return 2
     }
 
-    {
-        let mr = slice_mutref[i32](&mut xs, 2);
-        let mrv = *mr;
+    let logic_ok = (true && !false) || false
+    if !logic_ok {
+        return 3
+    }
+    let chv: char = 'x'
+    if chv != 'x' {
+        return 4
+    }
+    let f32v: f32 = 1.25
+    let f64v: f64 = 1.25
+    if f32v <= 1.0 as f32 || f64v <= 1.0 {
+        return 5
     }
 
-    xs[1] = 5;
+    let i8v: i8 = 1
+    let i16v: i16 = 2
+    let u8v: u8 = 3
+    let u16v: u16 = 4
+    let isz: isize = 5
+    let usz: usize = 6
+    let _int_sum: i64 =
+        (i8v as i64) + (i16v as i64) + (u8v as i64) + (u16v as i64) + (isz as i64) + (usz as i64)
 
-    slice_push[i32](&mut xs, 4);
-    let pop = slice_pop[i32](&mut xs);
-    let pop2 = pop;
-    println("after slice");
+    let bits: u32 = 1
+    bits <<= 1 as u32
+    bits |= 3 as u32
+    bits &= 7 as u32
+    bits ^= 1 as u32
+    bits += 2 as u32
+    bits -= 1 as u32
+    bits *= 3 as u32
+    bits /= 2 as u32
+    bits %= 3 as u32
+    let inv = ~bits
+    let _shifted = (inv as i64) >> (1 as i64)
 
-    let ys = make_slice[i32](2, 2);
-    slice_set[i32](&mut ys, 0, 9);
-    slice_set[i32](&mut ys, 1, 8);
-
-    for v in ys {
-        if v == 9 {
-            continue;
-        }
-        if v == 8 {
-            break;
-        }
+    let block_v = { let k = 1
+ k + 2 }
+    if block_v != 3 {
+        return 6
+    }
+    let tag = if block_v == 3 { "ok" } else { "bad" }
+    if string_len(tag) != 2 as i64 {
+        return 7
     }
 
-    let zs = make_slice[i32](1, 1);
-    slice_set[i32](&mut zs, 0, 4);
-    for v in &mut zs {
-        let vv = *v;
+    let _tp = (1, 2)
+
+    let p = Pair { a = 1, b = 2 }
+    let ra = &p.a
+    let rb = &p.b
+    if *ra + *rb != 3 {
+        return 8
     }
-    println("after loops");
 
-    let its = make_slice[i32](3, 3);
-    slice_set[i32](&mut its, 0, 1);
-    slice_set[i32](&mut its, 1, 0);
-    slice_set[i32](&mut its, 2, 2);
-    for x in iter(&its) |> filter(iter_pred) |> map(iter_map) {
-        let x2 = x;
+    let _packed = PackedPair { a = 1 as u8, b = 2 as u16 }
+    let _flags = FlagsBits { a = 1 as u32, b = 2 as u32 }
+    let _ctag = CTag.A
+    let _tiny = Tiny.One
+
+    let u = User { name = "gost", age = 10 }
+    let greeting = u.greet()
+    if string_len(greeting) == 0 as i64 {
+        return 9
     }
-    println("after iter");
+    if u.age_plus(2) != 12 {
+        return 10
+    }
 
-    let map = make_map[string, i32](4);
-    map_set[string, i32](&mut map, "a", 10);
-    let got = map_get[string, i32](&map, "a");
-    let got2 = got;
-    let mlen = map_len[string, i32](&map);
-    let mlen2 = mlen;
-    let md = map_del[string, i32](&mut map, "a");
-    let md2 = md;
-    println("after map");
+    let idv = id(42 as i64)
+    if idv != 42 as i64 {
+        return 11
+    }
+    let left = pick_left(42 as i64, 7 as u32)
+    if left != 42 as i64 {
+        return 111
+    }
+    let mapped = apply_map(plus1, 9)
+    if mapped != 10 {
+        return 12
+    }
+    let alias_id: ID = 5 as ID
+    if alias_id != 5 as i64 {
+        return 13
+    }
 
-    let sh = shared_new[i32](5);
-    let rsh = shared_get[i32](&sh);
-    let shv = *rsh;
-    println("after shared");
+    let base: i64 = 40
+    let addc = |x: i64| x + base
+    let out1 = addc(2 as i64)
+    let nested = |v: i64| (|w: i64| w + base)(v)
+    let out2 = nested(3 as i64)
+    if out1 != 42 as i64 || out2 != 43 as i64 {
+        return 14
+    }
 
-    let ch = make_chan[i32](1);
-    send(ch, 99);
-    let recv_val = recv(ch);
-    let recv_val2 = recv_val;
-    println("after chan");
+    let piped = 3 as i64 |> inc_i64 |> dbl_i64
+    if piped != 8 as i64 {
+        return 15
+    }
 
+    let sum: i64 = 0
+    for i in 1 as i64..=3 as i64 {
+        sum += i
+    }
+    for j in 0 as i64..3 as i64 {
+        sum += j
+    }
+    if sum != 9 as i64 {
+        return 16
+    }
+
+    let xs_index = make_slice[i32](0 as i64, 0 as i64)
+    slice_push[i32](&mut xs_index, 10)
+    slice_push[i32](&mut xs_index, 20)
+    slice_push[i32](&mut xs_index, 30)
+
+    let acc = 0
+    for idx, v in xs_index {
+        acc += idx + v
+    }
+    if acc != 63 {
+        return 17
+    }
+
+    let xs_refs = make_slice[i32](0 as i64, 0 as i64)
+    slice_push[i32](&mut xs_refs, 10)
+    slice_push[i32](&mut xs_refs, 20)
+    slice_push[i32](&mut xs_refs, 30)
+    for rv in &xs_refs {
+        let _x = *rv
+    }
+
+    let xs_mut = make_slice[i32](0 as i64, 0 as i64)
+    slice_push[i32](&mut xs_mut, 10)
+    slice_push[i32](&mut xs_mut, 20)
+    slice_push[i32](&mut xs_mut, 30)
+    for mv in &mut xs_mut {
+        *mv += 1
+    }
+    let _popv = slice_pop[i32](&mut xs_mut)
+
+    let mp = make_map[string, i32](4 as i64)
+    map_set[string, i32](&mut mp, "a", 10)
+    let _got = map_get[string, i32](&mp, "a")
+    if map_len[string, i32](&mp) != 1 as i64 {
+        return 18
+    }
+    if !map_del[string, i32](&mut mp, "a") {
+        return 19
+    }
+
+    let sh = own_new[i32](1)
+    let shr = own_borrow_mut[i32](&mut sh)
+    *shr = *shr + 2
+    if *shr != 3 {
+        return 20
+    }
+
+    let ch = make_chan[i32](1)
+    send(ch, 99)
+    let _first_recv = recv(ch)
+
+    select {
+        case send(ch, 123) => { },
+        default => { return 21
+ },
+    }
     select {
         case recv(ch) => |v, ok| {
-            let v2 = v;
-            let ok2 = ok;
-            println("select recv");
+            if !ok || v != 123 {
+                return 22
+            }
         },
-        case after(1) => {
-            println("select after");
-        },
-        default => {
-            println("select default");
-        },
+        case after(20) => { return 23
+ },
     }
-    println("after select");
-
-    close(ch);
-
-    let color = Color.Rgb(1, 2, 3);
-    let msg = enum_demo(color);
-    println(msg);
-
-    let msg2 = match_demo(1);
-    println(msg2);
-    println("after match");
-
-    let err = try_demo();
-    let err2 = err;
-    println("after try");
-
-    let r1 = t1();
-    let r1b = r1;
-    let r2 = t2();
-    let r2b = r2;
-    let r3 = t3();
-    let r3b = r3;
-    let mv = t4(ok_res());
-    let mv2 = mv;
-    let r5 = t5();
-    let r5b = r5;
-    println("after result");
-
-    go ping();
-    println("after go");
-
-    let sh_stress = shared_new[i32](1);
-    let stress = make_slice[i32](50, 50);
-    for v in &stress {
-        go work_shared(sh_stress);
-    }
+    close(ch)
     select {
-        case after(5) => { },
-    }
-    println("after go stress");
-
-    stress_after(10000);
-    println("after timer stress");
-
-    let run_100k = false;
-
-    timer_stress(10000);
-    select_stress(10000);
-    close_drop_stress(10000);
-    mixed_after_stress(10000);
-
-    if run_100k {
-        timer_stress(100000);
-        select_stress(100000);
-        mixed_after_stress(100000);
+        case recv(ch) => |_v, ok| {
+            if ok {
+                return 24
+            }
+        },
+        default => { return 25
+ },
     }
 
-    if cmp {
-        println("cmp true");
+    let ch2 = make_chan[i32](0)
+    go async_send(ch2)
+    select {
+        case recv(ch2) => |v, ok| {
+            if !ok || v != 77 {
+                return 26
+            }
+        },
+        case after(200) => { return 27
+ },
     }
-    let piped = 3 |> inc |> double;
-    let piped2 = piped;
-    defer_capture_demo();
-    defer_loop_demo();
-    let ok = try_ok_demo();
-    let ok2 = ok;
-    defer_return_demo();
-    println("before done");
 
-    println("done");
-    return 0;
+    let outer_seen: i64 = 0
+    let inner_seen: i64 = 0
+    let i: i64 = 0
+    outer: while i < 5 as i64 {
+        i = i + 1 as i64
+        outer_seen = outer_seen + 1 as i64
+
+        let j: i64 = 0
+        inner: while j < 3 as i64 {
+            j = j + 1 as i64
+            if j == 2 as i64 {
+                continue outer
+            }
+            inner_seen = inner_seen + 1 as i64
+            if j > 10 as i64 {
+                break inner
+            }
+        }
+    }
+
+    let k: i64 = 0
+    done: loop {
+        k = k + 1 as i64
+        let t: i64 = 0
+        while t < 5 as i64 {
+            t = t + 1 as i64
+            if t == 3 as i64 {
+                break done
+            }
+        }
+    }
+    if !(outer_seen == 5 as i64 && inner_seen == 5 as i64 && k == 1 as i64) {
+        return 28
+    }
+
+    if check_enum_match(Paint.Rgb(1, 2, 3)) != 6 {
+        return 29
+    }
+    if check_guard_or(3 as i64) != 20 as i64 {
+        return 30
+    }
+    let mr = Result.Ok(7)
+    let bound = match mr {
+        Result.Ok(x) if x > 5 => x,
+        Result.Ok(_) => 0,
+        Result.Err(_) => -1,
+        _ => -2,
+    }
+    if bound != 7 {
+        return 31
+    }
+
+    let any = 41 as interface
+    let dyn_got = any.add(1)
+    if dyn_got != 42 {
+        return 32
+    }
+    let back = any as i32
+    if back != 41 {
+        return 33
+    }
+
+    let ta = 12 as AnyBox
+    let tb = ta as i32
+    if tb != 12 {
+        return 34
+    }
+
+    const LOCAL_CONST: i32 = 5
+    if LOCAL_CONST != 5 {
+        return 35
+    }
+
+    let e0 = recover()
+    if e0 != nil {
+        return 36
+    }
+    panic("boom")
+    let e1 = recover()
+    if e1 == nil {
+        return 37
+    }
+    let e2 = recover()
+    if e2 != nil {
+        return 38
+    }
+
+    let terr = try_combo()
+    if terr != nil {
+        return 39
+    }
+
+    let _asmv: i64 = unsafe { asm_probe(1 as i64) }
+
+    fmt.println("all syntax smoke test: ok")
+    return 0
 }

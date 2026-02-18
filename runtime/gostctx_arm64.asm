@@ -1,3 +1,5 @@
+// runtime/gostctx_arm64.asm
+
 .text
 .globl gost_ctx_swap
 // AArch64: from=x0, to=x1
