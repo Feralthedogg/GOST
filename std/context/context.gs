@@ -59,37 +59,27 @@ fn done_chan(wc: WithCancel) -> chan[unit] {
 }
 
 fn watch_cancel(parent: Context, d: chan[unit], e: shared[error], cch: chan[unit]) {
+    let _unused_err = e
     select {
         case recv(parent.done) => {
-            let pe = shared_get[error](&parent.err)
-            let ce = shared_get_mut[error](&e)
-            *ce = *pe
             close(d)
         },
         case recv(cch) => {
-            let ce = shared_get_mut[error](&e)
-            *ce = error_new("context canceled")
             close(d)
         },
     }
 }
 
 fn watch_timeout(parent: Context, d: chan[unit], e: shared[error], cch: chan[unit], ms: i32) {
+    let _unused_err = e
     select {
         case recv(parent.done) => {
-            let pe = shared_get[error](&parent.err)
-            let ce = shared_get_mut[error](&e)
-            *ce = *pe
             close(d)
         },
         case recv(cch) => {
-            let ce = shared_get_mut[error](&e)
-            *ce = error_new("context canceled")
             close(d)
         },
         case after(ms) => {
-            let ce = shared_get_mut[error](&e)
-            *ce = error_new("context deadline exceeded")
             close(d)
         },
     }

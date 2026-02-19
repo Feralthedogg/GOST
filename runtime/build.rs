@@ -20,5 +20,6 @@ fn main() {
         build.file("gostctx_x86_64_sysv.asm");
     }
     build.flag("-x").flag("assembler");
+    build.flag_if_supported("-Qunused-arguments");
     build.compile("gostctx");
 }

@@ -219,6 +219,8 @@ impl Parser {
                         self.parse_function(vis, true, is_unsafe, Some(abi), Some(start))
                     {
                         items.push(Item::Function(func));
+                    } else {
+                        self.sync_to_next_item_boundary();
                     }
                 } else if self.at_keyword(Keyword::Let) {
                     // SAFETY: This block depends on invariants established by the surrounding code path.
@@ -227,6 +229,8 @@ impl Parser {
                     }
                     if let Some(global) = self.parse_extern_global(vis, Some(abi), Some(start)) {
                         items.push(Item::ExternGlobal(global));
+                    } else {
+                        self.sync_to_next_item_boundary();
                     }
                 } else {
                     self.error_here("expected fn or let after extern");
@@ -238,36 +242,48 @@ impl Parser {
                 if let Some(func) = self.parse_function(vis, false, is_unsafe, None, start_override)
                 {
                     items.push(Item::Function(func));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Const) {
                 if let Some(c) = self.parse_const_item(vis, start_override) {
                     items.push(Item::Const(c));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Type) {
                 if let Some(alias) = self.parse_type_alias(vis, start_override) {
                     items.push(Item::TypeAlias(alias));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Trait) {
                 if let Some(alias) = self.parse_trait_alias_item(vis, start_override) {
                     items.push(Item::TypeAlias(alias));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Impl) {
                 if let Some(methods) = self.parse_impl_block(vis, start_override) {
                     items.extend(methods);
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Let) {
                 if let Some(global) = self.parse_global_var(vis, start_override) {
                     items.push(Item::Global(global));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
@@ -275,10 +291,14 @@ impl Parser {
                 if self.peek_is_keyword(Keyword::Struct) {
                     if let Some(def) = self.parse_struct_def(vis, layout.clone()) {
                         items.push(Item::Struct(def));
+                    } else {
+                        self.sync_to_next_item_boundary();
                     }
                 } else if self.peek_is_keyword(Keyword::Enum) {
                     if let Some(def) = self.parse_enum_def(vis, layout.clone()) {
                         items.push(Item::Enum(def));
+                    } else {
+                        self.sync_to_next_item_boundary();
                     }
                 } else {
                     self.error_here("expected struct or enum after copy");
@@ -289,17 +309,21 @@ impl Parser {
             if self.at_keyword(Keyword::Struct) {
                 if let Some(def) = self.parse_struct_def(vis, layout.clone()) {
                     items.push(Item::Struct(def));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
             if self.at_keyword(Keyword::Enum) {
                 if let Some(def) = self.parse_enum_def(vis, layout.clone()) {
                     items.push(Item::Enum(def));
+                } else {
+                    self.sync_to_next_item_boundary();
                 }
                 continue;
             }
-            self.error_here("expected item");
-            self.bump();
+            self.error_expected_here("an item declaration");
+            self.sync_to_next_item_boundary();
         }
         self.synthesize_trait_default_impl_methods(&mut items);
         self.validate_trait_impl_records(&items);
@@ -313,14 +337,14 @@ impl Parser {
 
     fn parse_package(&mut self) -> Option<String> {
         if !self.at_keyword(Keyword::Module) {
-            self.error_here("file must start with `module`");
+            self.error_expected_here("`module`");
             return None;
         }
         self.bump();
         match self.bump().kind {
             TokenKind::Ident(name) => Some(name),
             _ => {
-                self.error_here("expected module name");
+                self.error_expected_here("module name");
                 None
             }
         }
@@ -2421,13 +2445,14 @@ impl Parser {
                 self.expect_symbol(Symbol::RParen);
                 Some(self.new_expr(ExprKind::After { ms: Box::new(ms) }, span))
             }
+            TokenKind::LexError(_) => None,
             TokenKind::Unknown(ch) => {
                 self.diags
                     .push(format!("unexpected character `{}`", ch), Some(span));
                 None
             }
             _ => {
-                self.error_here("unexpected token");
+                self.error_expected_here("expression");
                 None
             }
         }
@@ -3431,6 +3456,10 @@ impl Parser {
                 Some(token.span.clone()),
             );
         }
+        if let TokenKind::LexError(kind) = &token.kind {
+            // Why: Lexer errors are the most precise failure site; consume once to avoid cascades.
+            self.diags.push(kind.message(), Some(token.span.clone()));
+        }
         if !matches!(token.kind, TokenKind::Eof) {
             self.idx += 1;
         }
@@ -3516,9 +3545,49 @@ impl Parser {
         }
     }
 
+    fn at_item_boundary_start(&self) -> bool {
+        self.at_keyword(Keyword::Pub)
+            || self.at_keyword(Keyword::Private)
+            || self.at_keyword(Keyword::Extern)
+            || self.at_keyword(Keyword::Unsafe)
+            || self.at_keyword(Keyword::Fn)
+            || self.at_keyword(Keyword::Const)
+            || self.at_keyword(Keyword::Type)
+            || self.at_keyword(Keyword::Trait)
+            || self.at_keyword(Keyword::Impl)
+            || self.at_keyword(Keyword::Let)
+            || self.at_keyword(Keyword::Copy)
+            || self.at_keyword(Keyword::Struct)
+            || self.at_keyword(Keyword::Enum)
+            || self.at_ident("repr")
+            || self.at_ident("pack")
+            || self.at_ident("bitfield")
+    }
+
+    fn sync_to_next_item_boundary(&mut self) {
+        // Why: Item-level recovery must skip malformed tails so later valid items still parse.
+        while !self.at_eof() {
+            if self.at_symbol(Symbol::LBrace) || self.at_symbol(Symbol::RBrace) {
+                self.bump();
+                continue;
+            }
+            if self.at_symbol(Symbol::Semi) {
+                self.consume_semis();
+                if self.at_item_boundary_start() || self.at_eof() {
+                    return;
+                }
+                continue;
+            }
+            if self.at_item_boundary_start() {
+                return;
+            }
+            self.bump();
+        }
+    }
+
     fn expect_symbol(&mut self, symbol: Symbol) {
         if !self.at_symbol(symbol) {
-            self.error_here("unexpected token");
+            self.error_expected_here(&format!("`{}`", symbol_name(symbol)));
         } else {
             self.bump();
         }
@@ -3526,7 +3595,7 @@ impl Parser {
 
     fn expect_keyword(&mut self, keyword: Keyword) {
         if !self.at_keyword(keyword) {
-            self.error_here("unexpected token");
+            self.error_expected_here(&format!("keyword `{}`", keyword_name(keyword)));
         } else {
             self.bump();
         }
@@ -3537,7 +3606,23 @@ impl Parser {
     }
 
     fn error_here(&mut self, message: &str) {
+        if matches!(self.peek().kind, TokenKind::LexError(_)) {
+            self.bump();
+            return;
+        }
         self.diags.push(message, self.peek_span());
+    }
+
+    fn error_expected_here(&mut self, expected: &str) {
+        if matches!(self.peek().kind, TokenKind::LexError(_)) {
+            self.bump();
+            return;
+        }
+        let found = token_kind_name(&self.peek().kind);
+        self.diags.push(
+            format!("expected {expected}, found {found}"),
+            self.peek_span(),
+        );
     }
 
     fn peek_binary_op(&self) -> Option<(u8, BinaryOp)> {
@@ -3580,6 +3665,118 @@ impl Parser {
             TokenKind::Symbol(Symbol::ShrEq) => Some(AssignOp::ShrAssign),
             _ => None,
         }
+    }
+}
+
+fn token_kind_name(kind: &TokenKind) -> String {
+    match kind {
+        TokenKind::Ident(name) => format!("identifier `{name}`"),
+        TokenKind::IntLit(value) => format!("integer literal `{value}`"),
+        TokenKind::FloatLit(value) => format!("float literal `{value}`"),
+        TokenKind::StringLit(_) => "string literal".to_string(),
+        TokenKind::CharLit(value) => format!("character literal `{value}`"),
+        TokenKind::LexError(kind) => kind.message(),
+        TokenKind::Unknown(ch) => format!("character `{ch}`"),
+        TokenKind::Keyword(kw) => format!("keyword `{}`", keyword_name(*kw)),
+        TokenKind::Symbol(sym) => format!("`{}`", symbol_name(*sym)),
+        TokenKind::Eof => "end of file".to_string(),
+    }
+}
+
+fn keyword_name(keyword: Keyword) -> &'static str {
+    match keyword {
+        Keyword::Module => "module",
+        Keyword::Import => "import",
+        Keyword::Pub => "pub",
+        Keyword::Private => "private",
+        Keyword::Const => "const",
+        Keyword::Type => "type",
+        Keyword::Extern => "extern",
+        Keyword::Unsafe => "unsafe",
+        Keyword::Fn => "fn",
+        Keyword::Struct => "struct",
+        Keyword::Enum => "enum",
+        Keyword::Copy => "copy",
+        Keyword::Let => "let",
+        Keyword::If => "if",
+        Keyword::Else => "else",
+        Keyword::Match => "match",
+        Keyword::While => "while",
+        Keyword::Loop => "loop",
+        Keyword::For => "for",
+        Keyword::In => "in",
+        Keyword::Mut => "mut",
+        Keyword::Return => "return",
+        Keyword::Break => "break",
+        Keyword::Continue => "continue",
+        Keyword::Select => "select",
+        Keyword::Case => "case",
+        Keyword::Default => "default",
+        Keyword::Go => "go",
+        Keyword::Defer => "defer",
+        Keyword::Send => "send",
+        Keyword::Recv => "recv",
+        Keyword::Close => "close",
+        Keyword::After => "after",
+        Keyword::True => "true",
+        Keyword::False => "false",
+        Keyword::Nil => "nil",
+        Keyword::Interface => "interface",
+        Keyword::Trait => "trait",
+        Keyword::Impl => "impl",
+        Keyword::As => "as",
+    }
+}
+
+fn symbol_name(symbol: Symbol) -> &'static str {
+    match symbol {
+        Symbol::LParen => "(",
+        Symbol::RParen => ")",
+        Symbol::LBrace => "{",
+        Symbol::RBrace => "}",
+        Symbol::LBracket => "[",
+        Symbol::RBracket => "]",
+        Symbol::Comma => ",",
+        Symbol::Semi => ";",
+        Symbol::Colon => ":",
+        Symbol::Dot => ".",
+        Symbol::DotDot => "..",
+        Symbol::DotDotEq => "..=",
+        Symbol::Arrow => "->",
+        Symbol::FatArrow => "=>",
+        Symbol::Pipe => "|",
+        Symbol::PipeGt => "|>",
+        Symbol::Amp => "&",
+        Symbol::Star => "*",
+        Symbol::Plus => "+",
+        Symbol::Minus => "-",
+        Symbol::Slash => "/",
+        Symbol::Percent => "%",
+        Symbol::Caret => "^",
+        Symbol::Tilde => "~",
+        Symbol::Bang => "!",
+        Symbol::Eq => "=",
+        Symbol::PlusEq => "+=",
+        Symbol::MinusEq => "-=",
+        Symbol::StarEq => "*=",
+        Symbol::SlashEq => "/=",
+        Symbol::PercentEq => "%=",
+        Symbol::AmpEq => "&=",
+        Symbol::PipeEq => "|=",
+        Symbol::CaretEq => "^=",
+        Symbol::Shl => "<<",
+        Symbol::Shr => ">>",
+        Symbol::ShlEq => "<<=",
+        Symbol::ShrEq => ">>=",
+        Symbol::EqEq => "==",
+        Symbol::NotEq => "!=",
+        Symbol::Lt => "<",
+        Symbol::Lte => "<=",
+        Symbol::Gt => ">",
+        Symbol::Gte => ">=",
+        Symbol::AndAnd => "&&",
+        Symbol::OrOr => "||",
+        Symbol::Question => "?",
     }
 }
 

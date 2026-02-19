@@ -15,13 +15,15 @@ use std::io::{ErrorKind, Read, Write as IoWrite};
 use std::mem::{self, MaybeUninit};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -859,10 +861,18 @@ unsafe fn os_mutex_unlock(m: *mut OsMutex) { pthread_mutex_unlock(m); }
 unsafe fn os_cond_init(c: *mut OsCond) {
     let mut attr: libc::pthread_condattr_t = mem::zeroed();
     if libc::pthread_condattr_init(&mut attr) == 0 {
-        let rc = libc::pthread_condattr_setclock(&mut attr, CLOCK_MONOTONIC);
-        if rc == 0 {
-            COND_CLOCK_MONOTONIC_OK.store(1, Ordering::Release);
-        } else {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let rc = libc::pthread_condattr_setclock(&mut attr, CLOCK_MONOTONIC);
+            if rc == 0 {
+                COND_CLOCK_MONOTONIC_OK.store(1, Ordering::Release);
+            } else {
+                COND_CLOCK_MONOTONIC_OK.store(0, Ordering::Release);
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            // Why: Apple libc does not expose `pthread_condattr_setclock`, so timed waits use realtime.
             COND_CLOCK_MONOTONIC_OK.store(0, Ordering::Release);
         }
         pthread_cond_init(c, &attr);
@@ -926,18 +936,36 @@ unsafe fn os_thread_join(t: OsThread) {
 
 #[cfg(not(windows))]
 unsafe fn os_thread_create_worker(out: *mut OsThread, arg: *mut c_void) -> i32 {
-    pthread_create(out, ptr::null(), Some(m_worker_entry), arg)
+    pthread_create_with_entry(out, m_worker_entry, arg)
 }
 
 #[cfg(not(windows))]
 unsafe fn os_thread_create_detached(arg: *mut c_void) -> i32 {
     let mut t: OsThread = mem::zeroed();
-    if pthread_create(&mut t, ptr::null(), Some(thread_entry), arg) == 0 {
+    if pthread_create_with_entry(&mut t, thread_entry, arg) == 0 {
         pthread_detach(t);
         0
     } else {
         -1
     }
+}
+
+#[cfg(all(not(windows), target_vendor = "apple"))]
+unsafe fn pthread_create_with_entry(
+    out: *mut OsThread,
+    entry: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+) -> i32 {
+    pthread_create(out, ptr::null(), entry, arg)
+}
+
+#[cfg(all(not(windows), not(target_vendor = "apple")))]
+unsafe fn pthread_create_with_entry(
+    out: *mut OsThread,
+    entry: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+) -> i32 {
+    pthread_create(out, ptr::null(), Some(entry), arg)
 }
 
 #[cfg(not(windows))]
@@ -1990,10 +2018,17 @@ unsafe fn netpoll_reg_add(pd: *mut gost_poll_desc) {
         return;
     }
     let key = pd as usize;
+    let mut inserted = false;
     let mut reg = netpoll_reg_lock();
     if reg.insert(key) {
+        inserted = true;
         #[cfg(windows)]
         NETPOLL_REG_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(reg);
+    if inserted {
+        // Why: poll-based backends snapshot fds; wake waiter so new registrations are observed promptly.
+        netpoll_break();
     }
 }
 
@@ -2003,10 +2038,17 @@ unsafe fn netpoll_reg_remove(pd: *mut gost_poll_desc) {
         return;
     }
     let key = pd as usize;
+    let mut removed = false;
     let mut reg = netpoll_reg_lock();
     if reg.remove(&key) {
+        removed = true;
         #[cfg(windows)]
         NETPOLL_REG_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+    drop(reg);
+    if removed {
+        // Why: poll-based backends snapshot fds; wake waiter so stale registrations are dropped promptly.
+        netpoll_break();
     }
 }
 
@@ -2341,8 +2383,7 @@ impl Drop for poll_desc_guard {
 
 #[cfg(unix)]
 fn net_open_pd_listener(sock: &TcpListener) -> *mut gost_poll_desc {
-    // SAFETY: FD originates from a live `TcpListener`; poll layer takes only numeric descriptor value.
-    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+    __gost_poll_open(sock.as_raw_fd() as i32)
 }
 
 #[cfg(windows)]
@@ -2368,8 +2409,7 @@ fn net_open_pd_listener(_sock: &TcpListener) -> *mut gost_poll_desc {
 
 #[cfg(unix)]
 fn net_open_pd_stream(sock: &TcpStream) -> *mut gost_poll_desc {
-    // SAFETY: FD originates from a live `TcpStream`; poll layer takes only numeric descriptor value.
-    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+    __gost_poll_open(sock.as_raw_fd() as i32)
 }
 
 #[cfg(windows)]
@@ -2384,8 +2424,7 @@ fn net_open_pd_stream(_sock: &TcpStream) -> *mut gost_poll_desc {
 
 #[cfg(unix)]
 fn net_open_pd_udp(sock: &UdpSocket) -> *mut gost_poll_desc {
-    // SAFETY: FD originates from a live `UdpSocket`; poll layer takes only numeric descriptor value.
-    unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
+    __gost_poll_open(sock.as_raw_fd() as i32)
 }
 
 #[cfg(windows)]
@@ -3382,7 +3421,6 @@ unsafe fn netpoll_init() {
             let mut reg = netpoll_reg_lock();
             reg.clear();
         }
-        NETPOLL_REG_COUNT.store(0, Ordering::Release);
         {
             let mut reg = netpoll_pd_reg_lock();
             reg.clear();
@@ -3496,7 +3534,7 @@ unsafe fn netpoll_break() {
         return;
     }
     let one: u64 = 1;
-    let _ = write(
+    let _ = c_fd_write(
         NETPOLL_BREAKFD,
         (&one as *const u64).cast::<c_void>(),
         mem::size_of::<u64>(),
@@ -3512,7 +3550,7 @@ unsafe fn netpoll_break() {
         return;
     }
     let one: [u8; 1] = [1];
-    let _ = write(
+    let _ = c_fd_write(
         NETPOLL_BREAK_WFD,
         one.as_ptr().cast::<c_void>(),
         one.len(),
@@ -3625,6 +3663,8 @@ unsafe fn netpoll_arm(pd: *mut gost_poll_desc, want: u32) -> i32 {
     }
     (*pd).state.store(state, Ordering::Release);
     netpoll_reg_add(pd);
+    // Why: `poll(2)` observes a prebuilt fd list; wake waiter so updated interest masks are reloaded.
+    netpoll_break();
     0
 }
 
@@ -3976,14 +4016,16 @@ unsafe fn netpoll_wait_collect(ready: &mut Vec<*mut gost_g>, wait_ms: i64) {
             continue;
         }
         let mut clear_mask = 0u32;
-        if (revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0 {
+        let read_mask = (POLLIN | POLLERR | POLLHUP | POLLNVAL) as i32;
+        if (revents & read_mask) != 0 {
             clear_mask |= PD_ARMED_READ;
             let g = (*pd).r_wait.swap(ptr::null_mut(), Ordering::AcqRel);
             if !g.is_null() {
                 ready.push(g);
             }
         }
-        if (revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0 {
+        let write_mask = (POLLOUT | POLLERR | POLLHUP | POLLNVAL) as i32;
+        if (revents & write_mask) != 0 {
             clear_mask |= PD_ARMED_WRITE;
             let g = (*pd).w_wait.swap(ptr::null_mut(), Ordering::AcqRel);
             if !g.is_null() {
@@ -5858,12 +5900,15 @@ unsafe fn gopark_committed() {
     gost_ctx_swap(&mut (*g).ctx, &mut (*m).sched_ctx);
 }
 
-unsafe extern "C" fn m_worker_entry(arg: *mut c_void) -> *mut c_void {
-    let m = arg as *mut gost_m;
-    tls_m_set(m);
-    tls_g_set(ptr::null_mut());
-    sched_loop(m);
-    ptr::null_mut()
+extern "C" fn m_worker_entry(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: Entry is invoked by OS thread bootstrap with a runtime-owned scheduler pointer.
+    unsafe {
+        let m = arg as *mut gost_m;
+        tls_m_set(m);
+        tls_g_set(ptr::null_mut());
+        sched_loop(m);
+        ptr::null_mut()
+    }
 }
 
 unsafe fn sched_run_g(m: *mut gost_m, g: *mut gost_g) {
@@ -7563,13 +7608,16 @@ pub extern "C" fn __gost_free(p: *mut c_void, _size: usize, _align: usize) {
 #[repr(C)]
 struct thread_start { f: gost_thread_fn, ctx: *mut c_void }
 
-unsafe extern "C" fn thread_entry(arg: *mut c_void) -> *mut c_void {
-    let start = arg as *mut thread_start;
-    let f = (*start).f;
-    let ctx = (*start).ctx;
-    libc::free(start as *mut c_void);
-    f(ctx);
-    ptr::null_mut()
+extern "C" fn thread_entry(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: `arg` originates from `thread_start` allocation in spawn APIs and is consumed exactly once here.
+    unsafe {
+        let start = arg as *mut thread_start;
+        let f = (*start).f;
+        let ctx = (*start).ctx;
+        libc::free(start as *mut c_void);
+        f(ctx);
+        ptr::null_mut()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -7599,6 +7647,13 @@ pub extern "C" fn __gost_go_spawn(f: gost_thread_fn, ctx: *mut c_void) {
         }
         let g = new_g(f, ctx, false);
         if !(*m).p.is_null() && p_push_enq((*m).p, g) {
+            // Why: Caller may immediately enter a blocking runtime call; wake a sleeper so local-P
+            // work can be stolen instead of waiting for this M to return to the scheduler loop.
+            let sched = g_sched_ptr();
+            os_mutex_lock(&mut (*sched).mu);
+            os_cond_signal(&mut (*sched).cv);
+            os_mutex_unlock(&mut (*sched).mu);
+            netpoll_break();
             return;
         }
         goready(g);

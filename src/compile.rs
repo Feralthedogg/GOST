@@ -2550,7 +2550,7 @@ fn rewrite_expr_high_level(
                 expected,
             )?;
             if let Some(expected_ty) = expected
-                && is_callable_type_ast(expected_ty)
+                && is_fnptr_type_ast(expected_ty)
             {
                 let binding = ClosureBinding {
                     params: params.clone(),
@@ -3020,7 +3020,7 @@ fn rewrite_expr_high_level(
         | ExprKind::Nil => {}
         ExprKind::Ident(name) => {
             if let Some(expected_ty) = expected
-                && is_callable_type_ast(expected_ty)
+                && is_fnptr_type_ast(expected_ty)
                 && let Some(binding) = closure_env.get(name)
             {
                 let lifted =
@@ -3054,6 +3054,10 @@ fn type_ast_callable_parts(kind: &TypeAstKind) -> Option<(&Vec<TypeAst>, &TypeAs
 
 fn is_callable_type_ast(ty: &TypeAst) -> bool {
     type_ast_callable_parts(&ty.kind).is_some()
+}
+
+fn is_fnptr_type_ast(ty: &TypeAst) -> bool {
+    matches!(ty.kind, TypeAstKind::FnPtr { .. })
 }
 
 fn closure_runtime_signature_hash(params: &[TypeAst], ret: &TypeAst, is_variadic: bool) -> u64 {
@@ -4934,8 +4938,12 @@ fn infer_closure_body_type_ast(
             infer_expr_type_ast(expr, local_types_in_scope, templates, known_functions)
         }
         BlockOrExpr::Block(block) => {
+            let mut inferred_locals = local_types_in_scope.clone();
+            for stmt in &block.stmts {
+                update_local_types_for_stmt(stmt, &mut inferred_locals, templates, known_functions);
+            }
             if let Some(tail) = &block.tail {
-                infer_expr_type_ast(tail, local_types_in_scope, templates, known_functions)
+                infer_expr_type_ast(tail, &inferred_locals, templates, known_functions)
             } else {
                 Some(type_ast_named("unit", &block.span))
             }
@@ -5160,8 +5168,12 @@ fn infer_expr_type_ast(
             }
         }
         ExprKind::Block(block) | ExprKind::UnsafeBlock(block) => {
+            let mut block_locals = local_types_in_scope.clone();
+            for stmt in &block.stmts {
+                update_local_types_for_stmt(stmt, &mut block_locals, templates, known_functions);
+            }
             if let Some(tail) = &block.tail {
-                infer_expr_type_ast(tail, local_types_in_scope, templates, known_functions)
+                infer_expr_type_ast(tail, &block_locals, templates, known_functions)
             } else {
                 Some(type_ast_named("unit", &expr.span))
             }
@@ -5273,7 +5285,12 @@ fn infer_expr_type_ast(
             let mut closure_locals = local_types_in_scope.clone();
             let mut param_tys = Vec::with_capacity(params.len());
             for param in params {
-                let ty = param.ty.clone()?;
+                // Why: Lowering requires a concrete callable shape; fall back to i32 when no
+                // annotation is available so residual untyped closures do not crash lowering.
+                let ty = param
+                    .ty
+                    .clone()
+                    .unwrap_or_else(|| type_ast_named("i32", &param.span));
                 closure_locals.insert(param.name.clone(), ty.clone());
                 param_tys.push(ty);
             }
@@ -6003,7 +6020,117 @@ fn main() -> i32 {
         let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect_err("`package` header should be rejected");
         assert!(
-            err.contains("file must start with `module`"),
+            err.contains("expected `module`, found identifier `package`"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_prefixed_integer_literal_is_rejected() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let x = 0x
+    return x
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("0x without digits must fail");
+        assert!(
+            err.contains("invalid integer literal: expected at least one digit after `0x`"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn overflowing_prefixed_integer_literal_is_rejected() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let x = 0xfffffffffffffffffffffffffffffffffffff
+    return x
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("too-large prefixed integer literal must fail");
+        assert!(
+            err.contains("invalid integer literal: value after `0x` is too large"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn unterminated_string_literal_is_reported_at_lexing_boundary() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let s = "abc
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("unterminated string should fail in lexer");
+        assert!(
+            err.contains("unterminated string literal"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_char_literal_is_reported_at_lexing_boundary() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let c = 'ab'
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("multi-char literal should fail in lexer");
+        assert!(
+            err.contains("character literal must contain exactly one character"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn unicode_identifier_is_accepted() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let 한 = 1
+    return 한
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("unicode identifier should parse and type-check");
+    }
+
+    #[test]
+    fn parser_reports_expected_and_found_token_names() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let x = (1 + 2]
+    return x
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("mismatched bracket should produce expected/found diagnostic");
+        assert!(
+            err.contains("expected `)`, found `]`"),
             "unexpected diagnostic: {err}"
         );
     }

@@ -4,6 +4,7 @@
 // Gotchas: Numeric/range/operator edge cases can silently shift parse trees if changed.
 
 use super::ast::Span;
+use unicode_ident::{is_xid_continue, is_xid_start};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
@@ -12,10 +13,45 @@ pub enum TokenKind {
     FloatLit(String),
     StringLit(String),
     CharLit(char),
+    LexError(LexErrorKind),
     Unknown(char),
     Keyword(Keyword),
     Symbol(Symbol),
     Eof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LexErrorKind {
+    InvalidIntegerLiteral(String),
+    UnterminatedStringLiteral,
+    UnterminatedCharLiteral,
+    EmptyCharLiteral,
+    CharLiteralTooLong,
+    InvalidEscapeSequence(char),
+    UnterminatedBlockComment,
+}
+
+impl LexErrorKind {
+    // Postcondition: Returns a user-facing diagnostic message for this lexing failure.
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidIntegerLiteral(detail) => {
+                format!("invalid integer literal: {detail}")
+            }
+            Self::UnterminatedStringLiteral => "unterminated string literal".to_string(),
+            Self::UnterminatedCharLiteral => "unterminated character literal".to_string(),
+            Self::EmptyCharLiteral => {
+                "character literal must contain exactly one character".to_string()
+            }
+            Self::CharLiteralTooLong => {
+                "character literal must contain exactly one character".to_string()
+            }
+            Self::InvalidEscapeSequence(ch) => {
+                format!("invalid escape sequence `\\{ch}`")
+            }
+            Self::UnterminatedBlockComment => "unterminated block comment".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,7 +156,7 @@ pub struct Token {
 }
 
 pub struct Lexer<'a> {
-    bytes: &'a [u8],
+    src: &'a str,
     idx: usize,
     line: usize,
     col: usize,
@@ -129,12 +165,11 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
-    // Postcondition: Returns a value/state transition that preserves module invariants.
-    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
+    // Precondition: `src` is valid UTF-8 source text.
+    // Postcondition: Lexer state is reset to the first source location.
     pub fn new(src: &'a str) -> Self {
         Self {
-            bytes: src.as_bytes(),
+            src,
             idx: 0,
             line: 1,
             col: 1,
@@ -143,9 +178,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
-    // Postcondition: Returns a value/state transition that preserves module invariants.
-    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
+    // Postcondition: Returned stream always ends with exactly one EOF token.
     pub fn lex_all(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {
@@ -162,32 +195,21 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Token {
         if self.pending_semi {
             self.pending_semi = false;
-            return Token {
-                kind: TokenKind::Symbol(Symbol::Semi),
-                span: Span {
-                    start: self.idx,
-                    end: self.idx,
-                    line: self.line,
-                    column: self.col,
-                },
-            };
+            return self.inserted_semi_token();
         }
-        self.skip_whitespace_and_comments();
+
+        if let Some(tok) = self.skip_whitespace_and_comments() {
+            return tok;
+        }
+
         if self.pending_semi {
             self.pending_semi = false;
-            return Token {
-                kind: TokenKind::Symbol(Symbol::Semi),
-                span: Span {
-                    start: self.idx,
-                    end: self.idx,
-                    line: self.line,
-                    column: self.col,
-                },
-            };
+            return self.inserted_semi_token();
         }
+
         let start = self.idx;
         let (line, column) = (self.line, self.col);
-        if self.idx >= self.bytes.len() {
+        if self.idx >= self.src.len() {
             return Token {
                 kind: TokenKind::Eof,
                 span: Span {
@@ -198,6 +220,7 @@ impl<'a> Lexer<'a> {
                 },
             };
         }
+
         let ch = self.peek_char();
         if is_ident_start(ch) {
             let ident = self.read_while(is_ident_continue);
@@ -245,46 +268,32 @@ impl<'a> Lexer<'a> {
                 "as" => TokenKind::Keyword(Keyword::As),
                 _ => TokenKind::Ident(ident),
             };
-            let end = self.idx;
-            self.prev_can_insert_semi = can_insert_semi_after(&kind);
-            return Token {
-                kind,
-                span: Span {
-                    start,
-                    end,
-                    line,
-                    column,
-                },
-            };
+            return self.make_token(start, line, column, kind);
         }
+
         if ch.is_ascii_digit() {
-            let number = self.read_number();
-            let kind = if number.contains('.') || number.contains('e') || number.contains('E') {
-                TokenKind::FloatLit(number)
-            } else {
-                TokenKind::IntLit(number)
+            let kind = match self.read_number() {
+                Ok(number) => {
+                    if number.contains('.') || number.contains('e') || number.contains('E') {
+                        TokenKind::FloatLit(number)
+                    } else {
+                        TokenKind::IntLit(number)
+                    }
+                }
+                Err(err) => TokenKind::LexError(err),
             };
-            let end = self.idx;
-            self.prev_can_insert_semi = can_insert_semi_after(&kind);
-            return Token {
-                kind,
-                span: Span {
-                    start,
-                    end,
-                    line,
-                    column,
-                },
-            };
+            return self.make_token(start, line, column, kind);
         }
+
         let kind = match ch {
-            '"' => {
-                let s = self.read_string();
-                TokenKind::StringLit(s)
-            }
-            '\'' => {
-                let c = self.read_char_lit();
-                TokenKind::CharLit(c)
-            }
+            '"' => match self.read_string() {
+                Ok(s) => TokenKind::StringLit(s),
+                Err(err) => TokenKind::LexError(err),
+            },
+            '\'' => match self.read_char_lit() {
+                Ok(c) => TokenKind::CharLit(c),
+                Err(err) => TokenKind::LexError(err),
+            },
             '(' => {
                 self.advance();
                 TokenKind::Symbol(Symbol::LParen)
@@ -487,23 +496,38 @@ impl<'a> Lexer<'a> {
                 TokenKind::Unknown(ch)
             }
         };
-        let end = self.idx;
+        self.make_token(start, line, column, kind)
+    }
+
+    fn inserted_semi_token(&self) -> Token {
+        Token {
+            kind: TokenKind::Symbol(Symbol::Semi),
+            span: Span {
+                start: self.idx,
+                end: self.idx,
+                line: self.line,
+                column: self.col,
+            },
+        }
+    }
+
+    fn make_token(&mut self, start: usize, line: usize, column: usize, kind: TokenKind) -> Token {
         self.prev_can_insert_semi = can_insert_semi_after(&kind);
         Token {
             kind,
             span: Span {
                 start,
-                end,
+                end: self.idx,
                 line,
                 column,
             },
         }
     }
 
-    fn skip_whitespace_and_comments(&mut self) {
+    fn skip_whitespace_and_comments(&mut self) -> Option<Token> {
         loop {
-            if self.idx >= self.bytes.len() {
-                return;
+            if self.idx >= self.src.len() {
+                return None;
             }
             let ch = self.peek_char();
             match ch {
@@ -515,35 +539,48 @@ impl<'a> Lexer<'a> {
                     if self.prev_can_insert_semi {
                         self.prev_can_insert_semi = false;
                         self.pending_semi = true;
-                        return;
+                        return None;
                     }
                 }
                 '/' if self.peek_next_char() == '/' => {
                     self.advance();
                     self.advance();
-                    while self.idx < self.bytes.len() && self.peek_char() != '\n' {
+                    while self.idx < self.src.len() && self.peek_char() != '\n' {
                         self.advance();
                     }
                 }
                 '/' if self.peek_next_char() == '*' => {
-                    let saw_newline = self.consume_block_comment();
-                    if saw_newline && self.prev_can_insert_semi {
-                        self.prev_can_insert_semi = false;
-                        self.pending_semi = true;
-                        return;
+                    let start = self.idx;
+                    let (line, column) = (self.line, self.col);
+                    match self.consume_block_comment() {
+                        Ok(saw_newline) => {
+                            if saw_newline && self.prev_can_insert_semi {
+                                self.prev_can_insert_semi = false;
+                                self.pending_semi = true;
+                                return None;
+                            }
+                        }
+                        Err(err) => {
+                            return Some(self.make_token(
+                                start,
+                                line,
+                                column,
+                                TokenKind::LexError(err),
+                            ));
+                        }
                     }
                 }
-                _ => return,
+                _ => return None,
             }
         }
     }
 
-    fn consume_block_comment(&mut self) -> bool {
+    fn consume_block_comment(&mut self) -> Result<bool, LexErrorKind> {
         self.advance(); // '/'
         self.advance(); // '*'
         let mut depth = 1usize;
         let mut saw_newline = false;
-        while self.idx < self.bytes.len() && depth > 0 {
+        while self.idx < self.src.len() && depth > 0 {
             let ch = self.peek_char();
             if ch == '\n' {
                 saw_newline = true;
@@ -564,22 +601,30 @@ impl<'a> Lexer<'a> {
             }
             self.advance();
         }
-        saw_newline
+        if depth == 0 {
+            Ok(saw_newline)
+        } else {
+            Err(LexErrorKind::UnterminatedBlockComment)
+        }
     }
 
-    fn read_string(&mut self) -> String {
+    fn read_string(&mut self) -> Result<String, LexErrorKind> {
         self.advance(); // opening quote
         let mut s = String::new();
-        while self.idx < self.bytes.len() {
+        while self.idx < self.src.len() {
             let ch = self.peek_char();
             if ch == '"' {
                 self.advance();
-                break;
+                return Ok(s);
+            }
+            if ch == '\n' {
+                self.advance();
+                return Err(LexErrorKind::UnterminatedStringLiteral);
             }
             if ch == '\\' {
                 self.advance();
-                if self.idx >= self.bytes.len() {
-                    break;
+                if self.idx >= self.src.len() {
+                    return Err(LexErrorKind::UnterminatedStringLiteral);
                 }
                 let esc = self.peek_char();
                 self.advance();
@@ -590,7 +635,7 @@ impl<'a> Lexer<'a> {
                     '\\' => '\\',
                     '"' => '"',
                     '\'' => '\'',
-                    _ => esc,
+                    _ => return Err(LexErrorKind::InvalidEscapeSequence(esc)),
                 };
                 s.push(actual);
             } else {
@@ -598,13 +643,28 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
         }
-        s
+        Err(LexErrorKind::UnterminatedStringLiteral)
     }
 
-    fn read_char_lit(&mut self) -> char {
-        self.advance();
+    fn read_char_lit(&mut self) -> Result<char, LexErrorKind> {
+        self.advance(); // opening quote
+        if self.idx >= self.src.len() {
+            return Err(LexErrorKind::UnterminatedCharLiteral);
+        }
+        if self.peek_char() == '\n' {
+            self.advance();
+            return Err(LexErrorKind::UnterminatedCharLiteral);
+        }
+        if self.peek_char() == '\'' {
+            self.advance();
+            return Err(LexErrorKind::EmptyCharLiteral);
+        }
+
         let ch = if self.peek_char() == '\\' {
             self.advance();
+            if self.idx >= self.src.len() {
+                return Err(LexErrorKind::UnterminatedCharLiteral);
+            }
             let esc = self.peek_char();
             self.advance();
             match esc {
@@ -614,30 +674,49 @@ impl<'a> Lexer<'a> {
                 '\\' => '\\',
                 '"' => '"',
                 '\'' => '\'',
-                _ => esc,
+                _ => return Err(LexErrorKind::InvalidEscapeSequence(esc)),
             }
         } else {
             let c = self.peek_char();
             self.advance();
             c
         };
-        if self.peek_char() == '\'' {
-            self.advance();
+
+        if self.peek_char() != '\'' {
+            let mut saw_closing_quote = false;
+            while self.idx < self.src.len() {
+                let c = self.peek_char();
+                if c == '\'' {
+                    self.advance();
+                    saw_closing_quote = true;
+                    break;
+                }
+                if c == '\n' {
+                    break;
+                }
+                self.advance();
+            }
+            if saw_closing_quote {
+                return Err(LexErrorKind::CharLiteralTooLong);
+            }
+            return Err(LexErrorKind::UnterminatedCharLiteral);
         }
-        ch
+
+        self.advance(); // closing quote
+        Ok(ch)
     }
 
-    fn read_number(&mut self) -> String {
+    fn read_number(&mut self) -> Result<String, LexErrorKind> {
         if self.peek_char() == '0' {
             let next = self.peek_next_char();
             if next == 'x' || next == 'X' {
-                return self.read_prefixed_int(16);
+                return self.read_prefixed_int(16, 'x');
             }
             if next == 'o' || next == 'O' {
-                return self.read_prefixed_int(8);
+                return self.read_prefixed_int(8, 'o');
             }
             if next == 'b' || next == 'B' {
-                return self.read_prefixed_int(2);
+                return self.read_prefixed_int(2, 'b');
             }
         }
 
@@ -645,7 +724,7 @@ impl<'a> Lexer<'a> {
         self.read_decimal_digits(&mut s);
 
         if self.peek_char() == '.' {
-            // Keep range operators (`..`, `..=`) out of numeric literals.
+            // Why: Keep range operators (`..`, `..=`) out of numeric literals.
             let next = self.peek_next_char();
             if next != '.' && next.is_ascii_digit() {
                 s.push('.');
@@ -665,14 +744,14 @@ impl<'a> Lexer<'a> {
             self.read_decimal_digits(&mut s);
         }
 
-        s
+        Ok(s)
     }
 
-    fn read_prefixed_int(&mut self, radix: u32) -> String {
+    fn read_prefixed_int(&mut self, radix: u32, prefix: char) -> Result<String, LexErrorKind> {
         self.advance(); // 0
         self.advance(); // x/o/b
         let mut digits = String::new();
-        while self.idx < self.bytes.len() {
+        while self.idx < self.src.len() {
             let ch = self.peek_char();
             if ch == '_' {
                 self.advance();
@@ -686,16 +765,23 @@ impl<'a> Lexer<'a> {
             break;
         }
         if digits.is_empty() {
-            return "0".to_string();
+            return Err(LexErrorKind::InvalidIntegerLiteral(format!(
+                "expected at least one digit after `0{prefix}`"
+            )));
         }
-        u128::from_str_radix(&digits, radix)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "0".to_string())
+        u128::from_str_radix(&digits, radix).map_or_else(
+            |_| {
+                Err(LexErrorKind::InvalidIntegerLiteral(format!(
+                    "value after `0{prefix}` is too large (max 128-bit)"
+                )))
+            },
+            |v| Ok(v.to_string()),
+        )
     }
 
     fn read_decimal_digits(&mut self, out: &mut String) -> usize {
         let mut count = 0usize;
-        while self.idx < self.bytes.len() {
+        while self.idx < self.src.len() {
             let ch = self.peek_char();
             if ch == '_' {
                 self.advance();
@@ -713,22 +799,18 @@ impl<'a> Lexer<'a> {
     }
 
     fn has_valid_exponent_tail(&self) -> bool {
-        let mut i = self.idx + 1;
-        if i >= self.bytes.len() {
+        let mut iter = self.src[self.idx..].chars();
+        let _ = iter.next(); // e/E
+        let Some(mut ch) = iter.next() else {
             return false;
-        }
-        let mut ch = self.bytes[i] as char;
+        };
         if ch == '+' || ch == '-' {
-            i += 1;
-            if i >= self.bytes.len() {
+            let Some(next) = iter.next() else {
                 return false;
-            }
-            ch = self.bytes[i] as char;
+            };
+            ch = next;
         }
-        if !ch.is_ascii_digit() {
-            return false;
-        }
-        true
+        ch.is_ascii_digit()
     }
 
     fn read_while<F>(&mut self, f: F) -> String
@@ -736,7 +818,7 @@ impl<'a> Lexer<'a> {
         F: Fn(char) -> bool,
     {
         let mut s = String::new();
-        while self.idx < self.bytes.len() {
+        while self.idx < self.src.len() {
             let ch = self.peek_char();
             if !f(ch) {
                 break;
@@ -748,11 +830,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn advance(&mut self) {
-        if self.idx >= self.bytes.len() {
+        if self.idx >= self.src.len() {
             return;
         }
         let ch = self.peek_char();
-        self.idx += 1;
+        self.idx += ch.len_utf8();
         if ch == '\n' {
             self.line += 1;
             self.col = 1;
@@ -762,20 +844,22 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek_char(&self) -> char {
-        self.bytes.get(self.idx).copied().unwrap_or(b'\0') as char
+        self.src[self.idx..].chars().next().unwrap_or('\0')
     }
 
     fn peek_next_char(&self) -> char {
-        self.bytes.get(self.idx + 1).copied().unwrap_or(b'\0') as char
+        let mut it = self.src[self.idx..].chars();
+        let _ = it.next();
+        it.next().unwrap_or('\0')
     }
 }
 
 fn is_ident_start(ch: char) -> bool {
-    ch.is_ascii_alphabetic() || ch == '_'
+    ch == '_' || is_xid_start(ch)
 }
 
 fn is_ident_continue(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+    ch == '_' || is_xid_continue(ch)
 }
 
 fn can_insert_semi_after(kind: &TokenKind) -> bool {

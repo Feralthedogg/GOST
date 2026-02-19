@@ -116,6 +116,7 @@ struct MapKeyOps {
 pub(crate) struct FnEmitter<'a> {
     fn_name: String,
     fn_sigs: &'a HashMap<String, FunctionSig>,
+    fn_symbols: &'a HashMap<String, String>,
     extern_globals: &'a HashMap<String, ExternGlobalSig>,
     globals: &'a HashMap<String, GlobalVarSig>,
     consts: &'a HashMap<String, ConstSig>,
@@ -151,6 +152,7 @@ impl<'a> FnEmitter<'a> {
     pub(crate) fn new(
         fn_name: impl Into<String>,
         fn_sigs: &'a HashMap<String, FunctionSig>,
+        fn_symbols: &'a HashMap<String, String>,
         extern_globals: &'a HashMap<String, ExternGlobalSig>,
         globals: &'a HashMap<String, GlobalVarSig>,
         consts: &'a HashMap<String, ConstSig>,
@@ -165,6 +167,7 @@ impl<'a> FnEmitter<'a> {
         Self {
             fn_name: fn_name.into(),
             fn_sigs,
+            fn_symbols,
             extern_globals,
             globals,
             consts,
@@ -242,8 +245,23 @@ impl<'a> FnEmitter<'a> {
         self.blocks[self.current].terminated
     }
 
+    fn llvm_function_symbol(&self, name: &str) -> String {
+        self.fn_symbols
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     fn invariant_violation(msg: &str) -> String {
         format!("internal codegen invariant violated: {}", msg)
+    }
+
+    fn is_integer_literal_ir(ir: &str) -> bool {
+        if ir.is_empty() {
+            return false;
+        }
+        let body = ir.strip_prefix('-').unwrap_or(ir);
+        !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())
     }
 
     fn require_invariant(&self, cond: bool, msg: &str) -> Result<(), String> {
@@ -1256,7 +1274,7 @@ impl<'a> FnEmitter<'a> {
                             ret: Box::new(sig.ret.clone()),
                             is_variadic: sig.is_variadic,
                         },
-                        ir: format!("@{}", name),
+                        ir: format!("@{}", self.llvm_function_symbol(name)),
                     })
                 } else if let Some(global) = self.globals.get(name) {
                     let ty = global.ty.clone();
@@ -1642,8 +1660,10 @@ impl<'a> FnEmitter<'a> {
                 let end_idx = self.add_block(end_name.clone());
                 let nomatch_name = self.new_block("match_nomatch");
                 let nomatch_idx = self.add_block(nomatch_name.clone());
-                let mut incoming: Vec<(String, String)> = Vec::new();
-                let mut result_ty: Option<Type> = None;
+                let mut incoming: Vec<(String, String, Type)> = Vec::new();
+                let mut result_ty: Option<Type> =
+                    (match_result_ty != Type::Builtin(BuiltinType::Unit))
+                        .then_some(match_result_ty.clone());
                 for (idx, arm) in arms.iter().enumerate() {
                     let is_last = idx + 1 == arms.len();
                     let arm_name = self.new_block("match_arm");
@@ -1700,12 +1720,43 @@ impl<'a> FnEmitter<'a> {
                         if !self.current_block_terminated() {
                             self.terminate(format!("br label %{}", end_name));
                         }
-                        if result_ty.is_none() {
-                            result_ty = Some(value.ty.clone());
-                        }
                         if value.ty != Type::Builtin(BuiltinType::Unit) {
+                            if result_ty.is_none() {
+                                result_ty = Some(value.ty.clone());
+                            }
+                            let mut target_ty = result_ty
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| value.ty.clone());
+                            if target_ty != value.ty
+                                && self.is_int_type(&target_ty)
+                                && self.is_int_type(&value.ty)
+                                && let (Some((_t_signed, t_bits)), Some((_v_signed, v_bits))) =
+                                    (self.int_info(&target_ty), self.int_info(&value.ty))
+                                && v_bits > t_bits
+                            {
+                                for (prev_ir, _prev_block, prev_ty) in &mut incoming {
+                                    if *prev_ty == target_ty
+                                        && !Self::is_integer_literal_ir(prev_ir)
+                                    {
+                                        return self.invariant_err(
+                                            "match integer arm widening requires literal earlier arm values",
+                                        );
+                                    }
+                                    if self.is_int_type(prev_ty) && Self::is_integer_literal_ir(prev_ir) {
+                                        *prev_ty = value.ty.clone();
+                                    }
+                                }
+                                target_ty = value.ty.clone();
+                                result_ty = Some(target_ty.clone());
+                            }
+                            let value = if value.ty != target_ty {
+                                self.cast_value(value, &target_ty)?
+                            } else {
+                                value
+                            };
                             let incoming_block = self.blocks[self.current].name.clone();
-                            incoming.push((value.ir, incoming_block));
+                            incoming.push((value.ir, incoming_block, target_ty));
                         }
                     }
                     if let Some(next_name) = next_name {
@@ -1733,7 +1784,7 @@ impl<'a> FnEmitter<'a> {
                     } else {
                         let phi = self.new_temp();
                         let mut incoming_ir = Vec::new();
-                        for (val, block) in incoming {
+                        for (val, block, _ty) in incoming {
                             incoming_ir.push(format!("[ {}, %{} ]", val, block));
                         }
                         self.emit(format!(
@@ -2126,7 +2177,7 @@ impl<'a> FnEmitter<'a> {
                                     ret: Box::new(sig.ret.clone()),
                                     is_variadic: sig.is_variadic,
                                 },
-                                ir: format!("@{}", namespaced),
+                                ir: format!("@{}", self.llvm_function_symbol(&namespaced)),
                             });
                         }
                     }
@@ -4287,12 +4338,13 @@ impl<'a> FnEmitter<'a> {
         }
         let ret_ty = llvm_type(&fn_sig.ret)?;
         let cc = llvm_call_conv(fn_sig.extern_abi.as_deref());
+        let callee_symbol = self.llvm_function_symbol(name);
         if fn_sig.ret == Type::Builtin(BuiltinType::Unit) {
             self.emit(format!(
                 "call {}{} @{}({})",
                 cc,
                 ret_ty,
-                name,
+                callee_symbol,
                 args_ir.join(", ")
             ));
             Ok(Value {
@@ -4306,7 +4358,7 @@ impl<'a> FnEmitter<'a> {
                 tmp,
                 cc,
                 ret_ty,
-                name,
+                callee_symbol,
                 args_ir.join(", ")
             ));
             Ok(Value {
@@ -5751,18 +5803,19 @@ impl<'a> FnEmitter<'a> {
                 .ok_or_else(|| Self::invariant_violation("unknown function for go thunk"))?
                 .ret,
         )?;
+        let callee_symbol = self.llvm_function_symbol(callee_name);
         if ret_ty == "void" {
             lines.push(format!(
                 "  call {} @{}({})",
                 ret_ty,
-                callee_name,
+                callee_symbol,
                 args_rendered.join(", ")
             ));
         } else {
             lines.push(format!(
                 "  %_ = call {} @{}({})",
                 ret_ty,
-                callee_name,
+                callee_symbol,
                 args_rendered.join(", ")
             ));
         }

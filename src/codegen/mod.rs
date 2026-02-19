@@ -7,6 +7,7 @@ use crate::frontend::ast::{ExternGlobal, Item};
 use crate::mir::MirModule;
 use crate::sema::types::{BuiltinType, Type, TypeDefKind};
 use crate::sema::{ConstValue, GlobalInit, Program};
+use std::collections::HashMap;
 use std::fmt;
 
 mod emitter;
@@ -66,6 +67,7 @@ struct Codegen<'a> {
     program: &'a Program,
     output: String,
     globals: Vec<String>,
+    fn_symbols: HashMap<String, String>,
 }
 
 impl<'a> Codegen<'a> {
@@ -74,10 +76,12 @@ impl<'a> Codegen<'a> {
             program,
             output: String::new(),
             globals: Vec::new(),
+            fn_symbols: HashMap::new(),
         }
     }
 
     fn emit_module_from_mir(&mut self, mir: &MirModule) -> Result<(), String> {
+        self.rebuild_function_symbols(mir);
         self.emit_prelude()?;
         self.emit_user_extern_decls()?;
         self.emit_user_global_decls()?;
@@ -99,6 +103,48 @@ impl<'a> Codegen<'a> {
         }
         self.emit_globals();
         Ok(())
+    }
+
+    fn rebuild_function_symbols(&mut self, mir: &MirModule) {
+        self.fn_symbols.clear();
+        for func in &mir.functions {
+            let symbol = if func.name == "main" {
+                "__gost_user_main".to_string()
+            } else {
+                Self::mangle_defined_function_symbol(&func.name)
+            };
+            self.fn_symbols.insert(func.name.clone(), symbol);
+        }
+    }
+
+    fn mangle_defined_function_symbol(name: &str) -> String {
+        // Why: User-level std wrappers can collide with libc names (`setenv`, `pipe`), so emit
+        // all defined functions under a private, deterministic link symbol namespace.
+        let mut stem = String::new();
+        for ch in name.chars().take(48) {
+            if ch.is_ascii_alphanumeric() {
+                stem.push(ch);
+            } else {
+                stem.push('_');
+            }
+        }
+        if stem.is_empty() {
+            stem.push_str("fn");
+        }
+
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in name.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("__gost_fn_{}_{}", stem, hash)
+    }
+
+    fn llvm_function_symbol(&self, name: &str) -> String {
+        self.fn_symbols
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     fn emit_prelude(&mut self) -> Result<(), String> {
@@ -424,6 +470,7 @@ impl<'a> Codegen<'a> {
             .functions
             .get(&func.name)
             .ok_or_else(|| format!("missing signature for {}", func.name))?;
+        let llvm_name = self.llvm_function_symbol(&func.name);
         let ret_ty = llvm_type(&sig.ret)?;
         let mut params_ir = Vec::new();
         for (idx, param) in sig.params.iter().enumerate() {
@@ -435,12 +482,13 @@ impl<'a> Codegen<'a> {
         self.output.push_str(&format!(
             "define {} @{}({}) {{\n",
             ret_ty,
-            func.name,
+            llvm_name,
             params_ir.join(", ")
         ));
         let mut emitter = FnEmitter::new(
             &func.name,
             &self.program.functions,
+            &self.fn_symbols,
             &self.program.extern_globals,
             &self.program.globals,
             &self.program.consts,
@@ -458,7 +506,8 @@ impl<'a> Codegen<'a> {
                 .functions
                 .contains_key("__gost_global_init_user")
         {
-            emitter.emit_raw("call void @__gost_global_init_user()");
+            let init_name = self.llvm_function_symbol("__gost_global_init_user");
+            emitter.emit_raw(format!("call void @{}()", init_name));
         }
         let mut block_map = Vec::new();
         let mut block_names = Vec::new();
@@ -574,6 +623,7 @@ impl<'a> Codegen<'a> {
         let mut emitter = FnEmitter::new(
             name_override,
             &self.program.functions,
+            &self.fn_symbols,
             &self.program.extern_globals,
             &self.program.globals,
             &self.program.consts,
@@ -591,7 +641,8 @@ impl<'a> Codegen<'a> {
                 .functions
                 .contains_key("__gost_global_init_user")
         {
-            emitter.emit_raw("call void @__gost_global_init_user()");
+            let init_name = self.llvm_function_symbol("__gost_global_init_user");
+            emitter.emit_raw(format!("call void @{}()", init_name));
         }
         let mut block_map = Vec::new();
         let mut block_names = Vec::new();

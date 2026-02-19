@@ -3,6 +3,7 @@
 // Invariants: Option precedence and policy flags (offline/online/mod mode) are centralized here.
 // Gotchas: Keep help text, parser behavior, and default mode policy in sync.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -940,6 +941,9 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
         .unwrap_or(true);
     let mut link_args = vec![obj_path.display().to_string(), rt_lib.display().to_string()];
     link_args.push(opt_level.clang_flag());
+    if let Some(target) = macos_deployment_target() {
+        link_args.push(format!("-mmacosx-version-min={}", target));
+    }
     if opt_level.is_optimized() && native {
         link_args.push("-march=native".into());
         link_args.push("-mtune=native".into());
@@ -965,6 +969,13 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
         link_args.push("-lgdi32".into());
         link_args.push("-lwinmm".into());
         link_args.push("-lsecur32".into());
+    }
+    if cfg!(target_os = "macos") {
+        // Why: Runtime TLS stack pulls security-framework symbols that require explicit framework linkage.
+        link_args.push("-framework".into());
+        link_args.push("CoreFoundation".into());
+        link_args.push("-framework".into());
+        link_args.push("Security".into());
     }
     if let Ok(ldflags) = std::env::var("GOST_LDFLAGS") {
         for tok in ldflags.split_whitespace() {
@@ -1001,15 +1012,9 @@ fn build_runtime_rust(
     let target = if let Ok(t) = std::env::var("GOST_RUST_TARGET") {
         Some(t)
     } else if let Some(triple) = compiler_triple(cc) {
-        if triple.contains("msvc") {
-            Some("x86_64-pc-windows-msvc".to_string())
-        } else if triple.contains("mingw") || triple.contains("gnu") {
-            Some("x86_64-pc-windows-gnu".to_string())
-        } else {
-            Some(triple)
-        }
+        rust_target_from_compiler_triple(&triple).or_else(rustc_host_triple)
     } else {
-        None
+        rustc_host_triple()
     };
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -1041,6 +1046,9 @@ fn build_runtime_rust(
     }
     if !rustflags.is_empty() {
         cmd.env("RUSTFLAGS", rustflags);
+    }
+    if let Some(target) = macos_deployment_target() {
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", target);
     }
     cmd.env("CC", cc);
     let status = cmd
@@ -1076,6 +1084,10 @@ fn build_runtime_rust(
 fn resolve_cc() -> String {
     if let Ok(cc) = std::env::var("GOST_CC") {
         return cc;
+    }
+    #[cfg(target_os = "macos")]
+    if command_exists("clang") {
+        return "clang".to_string();
     }
     if command_exists("gcc") {
         return "gcc".to_string();
@@ -1124,6 +1136,10 @@ fn compile_ll_to_obj(
             obj_path.display().to_string(),
         ];
         args.push(opt_level.clang_flag());
+        if let Some(target) = macos_deployment_target() {
+            args.push(format!("-mmacosx-version-min={}", target));
+            args.push("-Wno-override-module".into());
+        }
         if opt_level.is_optimized() && native {
             args.push("-march=native".into());
         }
@@ -1175,8 +1191,124 @@ fn compiler_triple(cc: &str) -> Option<String> {
     }
 }
 
+fn rustc_host_triple() -> Option<String> {
+    let output = Command::new("rustc").arg("-vV").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("host:") {
+            let host = rest.trim();
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn rust_target_from_compiler_triple(raw: &str) -> Option<String> {
+    let triple = raw.trim().to_ascii_lowercase();
+    if triple.is_empty() {
+        return None;
+    }
+    let arch_raw = triple.split('-').next()?;
+    let arch = normalize_rust_arch(arch_raw);
+    if triple.contains("darwin") || triple.contains("macos") {
+        return Some(format!("{}-apple-darwin", arch));
+    }
+    if triple.contains("windows") || triple.contains("mingw") {
+        let abi = if triple.contains("msvc") {
+            "msvc"
+        } else {
+            "gnu"
+        };
+        return Some(format!("{}-pc-windows-{}", arch, abi));
+    }
+    if triple.contains("linux") {
+        let libc = if triple.contains("musl") {
+            "musl"
+        } else {
+            "gnu"
+        };
+        return Some(format!("{}-unknown-linux-{}", arch, libc));
+    }
+    if triple.contains("freebsd") {
+        return Some(format!("{}-unknown-freebsd", arch));
+    }
+    if triple.contains("openbsd") {
+        return Some(format!("{}-unknown-openbsd", arch));
+    }
+    if triple.contains("netbsd") {
+        return Some(format!("{}-unknown-netbsd", arch));
+    }
+    if triple.contains("dragonfly") {
+        return Some(format!("{}-unknown-dragonfly", arch));
+    }
+    let mut parts = triple.split('-');
+    let _ = parts.next();
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        Some(arch.into_owned())
+    } else {
+        Some(format!("{}-{}", arch, rest.join("-")))
+    }
+}
+
+fn normalize_rust_arch(arch: &str) -> Cow<'_, str> {
+    match arch {
+        "arm64" => Cow::Borrowed("aarch64"),
+        "amd64" => Cow::Borrowed("x86_64"),
+        "x86" | "i386" | "i486" | "i586" => Cow::Borrowed("i686"),
+        _ => Cow::Borrowed(arch),
+    }
+}
+
+fn macos_deployment_target() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    if let Ok(raw) = std::env::var("MACOSX_DEPLOYMENT_TARGET") {
+        let v = raw.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    let output = Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.trim().split('.');
+    let major = parts.next()?.trim();
+    if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let minor = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("0");
+    Some(format!("{}.{}", major, minor))
+}
+
 fn is_clang(cc: &str) -> bool {
-    cc.to_ascii_lowercase().contains("clang")
+    if cc.to_ascii_lowercase().contains("clang") {
+        return true;
+    }
+    if let Ok(output) = Command::new(cc).arg("--version").output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        if stdout.contains("clang") {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_gcc(cc: &str) -> bool {
@@ -1497,4 +1629,30 @@ fn tool_in_cc_dir(cc: &str, tool: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rust_target_from_compiler_triple;
+
+    #[test]
+    fn rust_target_normalizes_macos_arm64_dumpmachine() {
+        let target = rust_target_from_compiler_triple("arm64-apple-darwin25.2.0")
+            .expect("target should be inferred");
+        assert_eq!(target, "aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn rust_target_normalizes_linux_gnu_dumpmachine() {
+        let target = rust_target_from_compiler_triple("x86_64-linux-gnu")
+            .expect("target should be inferred");
+        assert_eq!(target, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn rust_target_normalizes_mingw_dumpmachine() {
+        let target = rust_target_from_compiler_triple("x86_64-w64-mingw32")
+            .expect("target should be inferred");
+        assert_eq!(target, "x86_64-pc-windows-gnu");
+    }
 }
