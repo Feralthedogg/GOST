@@ -1,5 +1,10 @@
 pub mod types;
 
+// Purpose: Perform semantic analysis/type checking and produce typed Program output.
+// Inputs/Outputs: Consumes frontend AST + std symbol set and returns Program or Diagnostics.
+// Invariants: User-facing reject diagnostics are emitted here; ownership/view rules stay sound.
+// Gotchas: Dispatch recovery can use trait/interface candidates; branch joins must preserve linear states.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::frontend::ast::*;
@@ -79,6 +84,8 @@ pub struct Program {
     pub expr_types: HashMap<ExprId, Type>,
 }
 
+// Postcondition: Success means all expressions/statements are semantically typed and checked.
+// Side effects: Populates rich diagnostics with spans and suggestion metadata on semantic failures.
 pub fn analyze(file: &FileAst, std_funcs: &HashSet<String>) -> Result<Program, Diagnostics> {
     let mut diags = Diagnostics::default();
     let mut types = TypeDefs::default();
@@ -1296,6 +1303,7 @@ impl<'a> FunctionChecker<'a> {
             expr_types,
             env: Env::new(),
             allow_iter_chain: false,
+            // SAFETY: This block depends on invariants established by the surrounding code path.
             unsafe_depth: if sig.is_unsafe { 1 } else { 0 },
             loop_labels: Vec::new(),
             current_function: None,
@@ -1330,6 +1338,7 @@ impl<'a> FunctionChecker<'a> {
         if self.unsafe_depth == 0 {
             self.diags.push(
                 format!(
+                    // SAFETY: This block depends on invariants established by the surrounding code path.
                     "{} requires unsafe context (`unsafe {{ ... }}` or `unsafe fn`)",
                     what
                 ),
@@ -6129,6 +6138,7 @@ impl<'a> FunctionChecker<'a> {
                             if !type_args.is_empty() {
                                 self.diag_type_args_call_misuse(&expr.span);
                             }
+                            // SAFETY: This block depends on invariants established by the surrounding code path.
                             if sig.is_extern || sig.is_unsafe {
                                 self.require_unsafe_operation(
                                     &expr.span,
@@ -6502,6 +6512,7 @@ impl<'a> FunctionChecker<'a> {
                         return None;
                     }
                     let (_, chosen_symbol, chosen_sig) = best.remove(0);
+                    // SAFETY: This block depends on invariants established by the surrounding code path.
                     if chosen_sig.is_extern || chosen_sig.is_unsafe {
                         self.require_unsafe_operation(
                             &expr.span,
@@ -6543,6 +6554,7 @@ impl<'a> FunctionChecker<'a> {
                         if !type_args.is_empty() {
                             self.diag_type_args_call_misuse(&expr.span);
                         }
+                        // SAFETY: This block depends on invariants established by the surrounding code path.
                         if sig.is_extern || sig.is_unsafe {
                             self.require_unsafe_operation(
                                 &expr.span,

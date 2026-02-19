@@ -1,3 +1,8 @@
+// Purpose: Provide typo and nearest-match suggestion helpers for diagnostics.
+// Inputs/Outputs: Consumes candidate sets and misspelled identifiers to produce suggestions.
+// Invariants: Suggestion ranking must be deterministic for stable diagnostics/tests.
+// Gotchas: Expensive distance checks should stay bounded to avoid compile-time regressions.
+
 use strsim::levenshtein;
 
 /// Return up to 3 suggestions by edit distance.

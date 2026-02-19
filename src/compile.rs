@@ -1,5 +1,10 @@
 #![allow(clippy::too_many_arguments)]
 
+// Purpose: Orchestrate full front-end compilation from source/module inputs to LLVM IR.
+// Inputs/Outputs: Consumes entry source + module mode and returns LLVM IR text or diagnostics.
+// Invariants: User-facing rejects must complete before backend; codegen receives lowered MIR only.
+// Gotchas: Import loading has module-aware and legacy paths; ExprId allocation must stay globally unique.
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -18,6 +23,9 @@ use crate::frontend::symbols::{is_impl_mangled, logical_method_name, mangle_impl
 use crate::pkg::resolve::{self, ModMode};
 use crate::sema::analyze;
 
+// Precondition: `path` points to an entry source file and module mode is already chosen by CLI.
+// Postcondition: Success returns LLVM IR emitted from sema-validated, MIR-lowered program state.
+// Side effects: Reads source/import/module metadata, may consult cache/network per resolver policy.
 pub fn compile_to_llvm(
     path: &Path,
     mode: ModMode,
@@ -120,6 +128,8 @@ fn parse_source_with_ids(
     next_expr_id: usize,
     file_path: Option<&Path>,
 ) -> Result<(FileAst, usize), String> {
+    // Why: Import merge depends on globally unique ExprId values, so parser state is threaded through.
+    // Why: Module disambiguator keeps diagnostics and generic naming stable across same-package files.
     let tokens = Lexer::new(source).lex_all();
     let mut parser = Parser::new_with_expr_id(tokens, next_expr_id);
     if let Some(path) = file_path {
@@ -143,6 +153,9 @@ fn load_imports(
     visited: &mut std::collections::HashSet<String>,
     std_funcs: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
+    // Precondition: `visited` is shared across the import walk to break cycles deterministically.
+    // Postcondition: `items` receives imported declarations in a stable traversal order.
+    // Side effects: Reads imported source files and mutates import accumulator state.
     for import in imports {
         if !visited.insert(import.path.clone()) {
             continue;
@@ -199,6 +212,9 @@ fn load_imports_mod(
     visited: &mut std::collections::HashSet<String>,
     std_funcs: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
+    // Precondition: `ctx` was created from module resolution policy for this compile invocation.
+    // Postcondition: Imported module files are merged with the same wrapper/alias rules as legacy path.
+    // Side effects: Resolves packages via mod/cache layers and appends imported AST items.
     for import in imports {
         if !visited.insert(import.path.clone()) {
             continue;
@@ -409,6 +425,7 @@ fn render_diags(diags: &Diagnostics, source: &str, file_path: Option<&Path>) -> 
 }
 
 fn lower_high_level_features(file: &mut FileAst, next_expr_id: &mut usize) -> Result<(), String> {
+    // Why: Global init injection must run before monomorphization so generated assignments are rewritten too.
     inject_global_initializer_function(file, next_expr_id);
     monomorphize_and_rewrite(file)
 }
@@ -634,6 +651,9 @@ fn refresh_expr_ids(expr: &mut Expr, next_expr_id: &mut usize) {
 }
 
 fn monomorphize_and_rewrite(file: &mut FileAst) -> Result<(), String> {
+    // Precondition: Function/type declarations are parsed and sema will run after this rewrite stage.
+    // Postcondition: Generic/template calls are concretized so backend sees only lowered callable forms.
+    // Side effects: Replaces `file.items` with rewritten/instantiated function set and drops dead templates.
     let trait_methods = collect_trait_method_requirements(&file.items);
     let mut non_functions = Vec::new();
     let mut regular_functions = Vec::new();
@@ -5967,6 +5987,24 @@ fn main() -> i32 {
         assert!(
             llvm.contains("define i32 @main()"),
             "expected runtime entry wrapper in llvm output"
+        );
+    }
+
+    #[test]
+    fn package_header_is_rejected() {
+        let src = r#"
+package main
+
+fn main() -> i32 {
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("`package` header should be rejected");
+        assert!(
+            err.contains("file must start with `module`"),
+            "unexpected diagnostic: {err}"
         );
     }
 

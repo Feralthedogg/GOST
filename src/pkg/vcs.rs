@@ -1,3 +1,8 @@
+// Purpose: Provide VCS interaction helpers used by module resolution/fetch operations.
+// Inputs/Outputs: Executes git-oriented commands and normalizes source/revision information.
+// Invariants: VCS calls must be policy-aware and deterministic under offline constraints.
+// Gotchas: URL normalization and transport handling can affect cache identity.
+
 use anyhow::{Context, bail};
 use std::fs;
 use std::path::{Path, PathBuf};

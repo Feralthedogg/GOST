@@ -1,3 +1,8 @@
+// Purpose: Implement gs mod subcommands (init/tidy/verify/download/graph).
+// Inputs/Outputs: Executes module operations and returns actionable user-facing results/errors.
+// Invariants: Offline/online policy and readonly guarantees are enforced centrally here.
+// Gotchas: Verification and resolve phases must not mutate lock state in readonly flows.
+
 use anyhow::{Context, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
@@ -87,6 +92,9 @@ fn guess_module_from_git(cwd: &Path) -> Option<String> {
     }
 }
 
+// Precondition: Working directory is writable and not already initialized with gost.mod.
+// Postcondition: Creates deterministic `gost.mod` (and `gost.lock` when missing).
+// Side effects: Writes module metadata files and emits init status text.
 pub fn cmd_init(cwd: PathBuf, module_opt: Option<String>) -> anyhow::Result<()> {
     let root = find_mod_root(cwd.clone()).unwrap_or(cwd);
     let mod_path = root.join("gost.mod");
@@ -166,6 +174,9 @@ fn infer_module_root(import: &str) -> Option<String> {
     None
 }
 
+// Precondition: `gost.mod` exists and project sources are readable.
+// Postcondition: Require set matches discovered imports; readonly mode performs verification only.
+// Side effects: Scans source tree, may update mod/lock files, and may resolve dependencies.
 pub fn cmd_tidy(cwd: PathBuf, mode: ModMode, offline: bool) -> anyhow::Result<()> {
     let root = find_mod_root(cwd).context("gost.mod not found (run `gs mod init` first)")?;
     let mod_path = root.join("gost.mod");
@@ -230,6 +241,9 @@ pub fn cmd_tidy(cwd: PathBuf, mode: ModMode, offline: bool) -> anyhow::Result<()
     Ok(())
 }
 
+// Precondition: Called from `gs mod download`; `online` encodes user intent for fetch behavior.
+// Postcondition: Dependency cache is validated/populated according to offline/online policy.
+// Side effects: May access network (when online), cache filesystem, and print command status.
 pub fn cmd_download(cwd: PathBuf, offline: bool, online: bool) -> anyhow::Result<()> {
     let root = find_mod_root(cwd).context("gost.mod not found (run `gs mod init` first)")?;
     let want_fetch = online;
@@ -239,6 +253,9 @@ pub fn cmd_download(cwd: PathBuf, offline: bool, online: bool) -> anyhow::Result
     Ok(())
 }
 
+// Precondition: `gost.mod` exists in current or ancestor directory.
+// Postcondition: Emits deterministic dependency graph view from mod/lock/cache state.
+// Side effects: Reads module/lock files and cache metadata; writes graph text to stderr.
 pub fn cmd_graph(cwd: PathBuf, _offline: bool) -> anyhow::Result<()> {
     let root = find_mod_root(cwd).context("gost.mod not found (run `gs mod init` first)")?;
     let mod_path = root.join("gost.mod");
@@ -349,6 +366,9 @@ pub fn cmd_graph(cwd: PathBuf, _offline: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Precondition: Project is module-enabled with `gost.mod`; lock may be missing only when invalid.
+// Postcondition: Ensures readonly tidy checks and resolve checks both succeed.
+// Side effects: Performs filesystem/network reads under policy and prints verification outcome.
 pub fn cmd_verify(cwd: PathBuf, online: bool, _offline: bool) -> anyhow::Result<()> {
     // 1) pure readonly verification (no network)
     cmd_tidy(cwd.clone(), ModMode::Readonly, true)?;

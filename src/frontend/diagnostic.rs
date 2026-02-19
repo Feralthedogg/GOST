@@ -1,3 +1,8 @@
+// Purpose: Define diagnostic codes/messages and rendering helpers for user-facing errors.
+// Inputs/Outputs: Converts spans and error metadata into stable, explainable diagnostics.
+// Invariants: Diagnostic codes are externally referenced and should remain backward-compatible.
+// Gotchas: Message wording changes can break tests and docs tied to exact phrasing.
+
 use super::ast::Span;
 
 pub const E_UNDEFINED_NAME: &str = "E1002";
@@ -26,6 +31,9 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn new(message: impl Into<String>, span: Option<Span>) -> Self {
         Self {
             message: message.into(),
@@ -37,26 +45,41 @@ impl Diagnostic {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn code(mut self, code: &str) -> Self {
         self.code = Some(code.to_string());
         self
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.span = Some(span);
         self.label = Some(message.into());
         self
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn help(mut self, message: impl Into<String>) -> Self {
         self.helps.push(HelpMsg::Plain(message.into()));
         self
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn with_help(self, message: impl Into<String>) -> Self {
         self.help(message)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn with_help_snippet(mut self, span: Span, template: impl Into<String>) -> Self {
         self.helps.push(HelpMsg::Snippet {
             span,
@@ -65,6 +88,9 @@ impl Diagnostic {
         self
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn note(mut self, message: impl Into<String>) -> Self {
         self.notes.push(message.into());
         self
@@ -77,14 +103,23 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn push(&mut self, message: impl Into<String>, span: Option<Span>) {
         self.items.push(Diagnostic::new(message, span));
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn push_diag(&mut self, diag: Diagnostic) {
         self.items.push(diag);
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

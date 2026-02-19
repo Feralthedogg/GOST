@@ -1,3 +1,8 @@
+// Purpose: Tokenize source text into lexical tokens with span metadata.
+// Inputs/Outputs: Consumes UTF-8 source string and emits ordered token stream.
+// Invariants: Token boundaries and keyword classification must match parser grammar assumptions.
+// Gotchas: Numeric/range/operator edge cases can silently shift parse trees if changed.
+
 use super::ast::Span;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +129,9 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn new(src: &'a str) -> Self {
         Self {
             bytes: src.as_bytes(),
@@ -135,6 +143,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn lex_all(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {

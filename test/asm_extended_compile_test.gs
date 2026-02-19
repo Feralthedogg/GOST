@@ -1,5 +1,4 @@
 module main
-
 import "std/fmt"
 
 unsafe fn demo(x: i64) -> i64 {

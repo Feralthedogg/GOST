@@ -1,3 +1,8 @@
+// Purpose: Run MIR validation and normalization passes before backend emission.
+// Inputs/Outputs: Consumes mutable MIR module/functions and enforces required invariants.
+// Invariants: Passes must preserve semantics while rejecting structurally invalid MIR.
+// Gotchas: Pass ordering matters; some checks assume prior canonicalization completed.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::frontend::ast::{Block, BlockOrExpr, Expr, ExprKind, Pattern, Stmt};
@@ -351,6 +356,9 @@ pub fn linear_check(func: &mut MirFunction) -> Result<(), String> {
     Ok(())
 }
 
+// Precondition: Function MIR has completed lowering and basic block construction.
+// Postcondition: Confirms strict MIR invariants required before backend-readiness checks.
+// Side effects: None; returns first invariant violation as deterministic error text.
 pub fn verify_mir_strict(func: &MirFunction) -> Result<(), String> {
     let block_count = func.blocks.len();
     if block_count == 0 {
@@ -663,6 +671,9 @@ fn check_backend_ready_expr(
     Ok(())
 }
 
+// Precondition: `verify_mir_strict` has already succeeded for this function.
+// Postcondition: Guarantees MIR contains only backend-supported constructs and lowered forms.
+// Side effects: None; emits descriptive invariant violation strings for debugging regressions.
 pub fn verify_backend_ready_mir(func: &MirFunction) -> Result<(), String> {
     if type_contains_iter(&func.ret_ty) {
         return Err(format!(

@@ -1,3 +1,8 @@
+// Purpose: Centralize symbol mangling and name-shape helpers for dispatch/codegen paths.
+// Inputs/Outputs: Converts logical names to internal mangled symbols and back where needed.
+// Invariants: Mangling scheme must stay consistent across sema, lowering, and codegen.
+// Gotchas: Renaming mangling components is ABI-sensitive for cached/generated artifacts.
+
 pub const IMPL_MANGLE_PREFIX: &str = "__impl_";
 
 fn stable_fnv1a64(text: &str) -> u64 {

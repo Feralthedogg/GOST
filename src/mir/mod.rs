@@ -1,3 +1,8 @@
+// Purpose: Define MIR core data structures, CFG containers, and shared MIR utilities.
+// Inputs/Outputs: Represents lowered program state passed between lowering, passes, and codegen.
+// Invariants: MIR node semantics and ids must remain stable across transformation passes.
+// Gotchas: Structural MIR edits require verifier/passes/codegen coordination.
+
 use crate::frontend::ast::{AssignOp, Block, Expr, ExprId, Pattern, SelectArm};
 use crate::sema::types::{Type, TypeClass};
 use std::collections::HashMap;
@@ -129,6 +134,9 @@ pub enum Terminator {
 }
 
 impl BasicBlock {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn new(term: Terminator) -> Self {
         Self {
             stmts: Vec::new(),

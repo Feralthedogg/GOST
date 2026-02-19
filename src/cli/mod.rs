@@ -1,5 +1,10 @@
+// Purpose: Parse CLI commands/options and orchestrate compile/run/mod subcommands.
+// Inputs/Outputs: Consumes argv/environment and returns user-facing exit codes/messages.
+// Invariants: Option precedence and policy flags (offline/online/mod mode) are centralized here.
+// Gotchas: Keep help text, parser behavior, and default mode policy in sync.
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::pkg::resolve::ModMode;
 
@@ -95,6 +100,9 @@ where
     run_cli_with_mode(args, default_mode)
 }
 
+// Precondition: `args` must include executable name as the first element.
+// Postcondition: Returns normalized process exit code for all CLI paths.
+// Side effects: Reads environment variables, prints diagnostics/help, and may invoke build/run flows.
 pub fn run_cli_with_mode<I>(args: I, default_mode: CliMode) -> i32
 where
     I: IntoIterator<Item = String>,
@@ -144,6 +152,22 @@ where
             }
         };
         return explain_code(&code);
+    }
+    if first == "lsp" {
+        let mut lsp_help = false;
+        for arg in args.by_ref() {
+            if arg == "--help" || arg == "-h" {
+                lsp_help = true;
+                continue;
+            }
+            eprintln!("unknown argument: {}", arg);
+            return 1;
+        }
+        if lsp_help {
+            print_help_lsp();
+            return 0;
+        }
+        return run_external_lsp();
     }
     if first == "mod" {
         let sub = match args.next() {
@@ -458,6 +482,7 @@ fn print_help_global() {
     eprintln!("COMMANDS:");
     eprintln!("  run       Run a .gs entry file");
     eprintln!("  build     Build a .gs entry file");
+    eprintln!("  lsp       Run Gost language server over stdio");
     eprintln!("  mod       Module/dependency management");
     eprintln!("  bindgen   Generate gost extern bindings from C headers");
     eprintln!("  explain   Show detailed explanation for a diagnostic code");
@@ -489,6 +514,7 @@ fn print_help_global() {
     eprintln!("  gs mod download --online");
     eprintln!("  gs mod graph");
     eprintln!("  gs bindgen native.h -o native.gs --module native");
+    eprintln!("  gs lsp");
     eprintln!("  gs explain E1101");
     eprintln!("  gs --explain E1101");
 }
@@ -504,6 +530,101 @@ fn print_help_bindgen() {
     eprintln!("  --module <name>      Module name for generated file (default: header stem)");
     eprintln!("  --abi <name>         Extern ABI string (default: C)");
     eprintln!("  -h, --help           Print help");
+}
+
+fn print_help_lsp() {
+    eprintln!("Run Gost Language Server Protocol endpoint over stdio.");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  gs lsp");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -h, --help        Print help");
+    eprintln!();
+    eprintln!("ENV:");
+    eprintln!("  GOST_LSP_BIN      Path to gost-lsp executable (optional)");
+    eprintln!();
+    eprintln!("NOTES:");
+    eprintln!("  - Launches external `gost-lsp` process and proxies stdio.");
+    eprintln!("  - Use with extensions that send LSP JSON-RPC over stdin/stdout.");
+}
+
+#[cfg(windows)]
+const LSP_BIN_NAME: &str = "gost-lsp.exe";
+#[cfg(not(windows))]
+const LSP_BIN_NAME: &str = "gost-lsp";
+
+fn run_external_lsp() -> i32 {
+    if let Some(bin) = std::env::var_os("GOST_LSP_BIN") {
+        let mut cmd = Command::new(&bin);
+        return match run_lsp_command(&mut cmd) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!(
+                    "error: failed to launch GOST_LSP_BIN `{}`: {}",
+                    PathBuf::from(bin).display(),
+                    err
+                );
+                1
+            }
+        };
+    }
+
+    let mut last_error: Option<String> = None;
+    for candidate in lsp_binary_candidates() {
+        let mut cmd = Command::new(&candidate);
+        match run_lsp_command(&mut cmd) {
+            Ok(code) => return code,
+            Err(err) => {
+                last_error = Some(format!("{} ({})", err, candidate.display()));
+            }
+        }
+    }
+
+    let mut cmd = Command::new("gost-lsp");
+    match run_lsp_command(&mut cmd) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: failed to launch `gost-lsp`: {}", err);
+            if let Some(prev) = last_error {
+                eprintln!("note: also tried candidate binaries: {}", prev);
+            }
+            eprintln!("hint: build/install gost-lsp or set GOST_LSP_BIN to its executable path.");
+            1
+        }
+    }
+}
+
+fn lsp_binary_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::<PathBuf>::new();
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        out.push(dir.join(LSP_BIN_NAME));
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(projects_dir) = manifest.parent() {
+        let lsp_dir = projects_dir.join("gost-lsp");
+        out.push(lsp_dir.join("target").join("debug").join(LSP_BIN_NAME));
+        out.push(lsp_dir.join("target").join("release").join(LSP_BIN_NAME));
+    }
+
+    out.retain(|path| path.is_file());
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn run_lsp_command(cmd: &mut Command) -> Result<i32, String> {
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| e.to_string())?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn explain_code(code: &str) -> i32 {
@@ -799,6 +920,9 @@ fn print_help_mod_graph() {
     eprintln!("  gs mod graph --online");
 }
 
+// Precondition: `ll_path` points to valid LLVM IR produced by compile pipeline.
+// Postcondition: Produces executable at input-derived path and runs it when linking succeeds.
+// Side effects: Builds runtime artifacts, writes object/executable files, and executes subprocesses.
 fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Result<(), String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runtime_dir = manifest_dir.join("runtime");

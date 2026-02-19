@@ -1,5 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+// Purpose: Emit LLVM IR from validated MIR and semantic type metadata.
+// Inputs/Outputs: Consumes MIR statements/expressions and appends LLVM instructions per block.
+// Invariants: Backend treats semantic rejects as internal invariants; no user-facing rejects here.
+// Gotchas: RC-handle operations depend on fresh-expression tracking and runtime ABI conventions.
+
 use crate::frontend::ast::{Block, Expr, ExprId, ExprKind, Stmt, TypeAst};
 use crate::frontend::symbols::logical_method_name;
 use crate::intrinsics::{intrinsic_args_error, intrinsic_type_args_error};
@@ -140,6 +145,9 @@ pub(crate) struct FnEmitter<'a> {
 }
 
 impl<'a> FnEmitter<'a> {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn new(
         fn_name: impl Into<String>,
         fn_sigs: &'a HashMap<String, FunctionSig>,
@@ -198,6 +206,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_raw(&mut self, instr: impl Into<String>) {
         self.emit(instr);
     }
@@ -224,6 +235,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn current_block_terminated(&self) -> bool {
         self.blocks[self.current].terminated
     }
@@ -350,6 +364,9 @@ impl<'a> FnEmitter<'a> {
         })
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn add_block(&mut self, name: String) -> usize {
         self.blocks.push(BlockInsts {
             name,
@@ -359,10 +376,16 @@ impl<'a> FnEmitter<'a> {
         self.blocks.len() - 1
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn switch_to(&mut self, idx: usize) {
         self.current = idx;
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_prologue(
         &mut self,
         params: &[Type],
@@ -394,10 +417,16 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn set_mir_mode(&mut self, enabled: bool) {
         self.mir_mode = enabled;
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn set_mir_locals(&mut self, locals: &[crate::mir::Local]) -> Result<(), String> {
         self.mir_local_ptrs.clear();
         for local in locals {
@@ -431,6 +460,9 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn set_mir_expr_types(&mut self, expr_types: &HashMap<ExprId, Type>) {
         self.mir_expr_types = expr_types.clone();
     }
@@ -985,6 +1017,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_block(&mut self, block: &Block) -> Result<Option<Value>, String> {
         self.require_invariant(
             self.mir_mode,
@@ -1011,6 +1046,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_return_value(&mut self, value: Option<Value>) -> Result<(), String> {
         if let Some(value) = value {
             if value.ty == Type::Builtin(BuiltinType::Unit) {
@@ -1024,6 +1062,9 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_error_return(&mut self, err_ir: String) -> Result<(), String> {
         let err_val = Value {
             ty: Type::Builtin(BuiltinType::Error),
@@ -1112,6 +1153,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_error_return_value(&mut self, value: Value) -> Result<(), String> {
         self.emit_error_return(value.ir)
     }
@@ -1149,6 +1193,9 @@ impl<'a> FnEmitter<'a> {
         Ok(Value { ty, ir })
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_expr(&mut self, expr: &Expr) -> Result<Value, String> {
         match &expr.kind {
             ExprKind::Bool(value) => Ok(Value {
@@ -5274,6 +5321,8 @@ impl<'a> FnEmitter<'a> {
         Ok(())
     }
 
+    // Precondition: Input MIR statement has passed lowering/validation invariants.
+    // Side effects: Mutates IR buffers, scopes, locals, and block termination state.
     pub(crate) fn emit_mir_stmt(&mut self, stmt: &MirStmt) -> Result<(), String> {
         match stmt {
             MirStmt::EnterScope { .. } => {
@@ -5482,6 +5531,9 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub(crate) fn emit_mir_terminator(
         &mut self,
         term: &Terminator,

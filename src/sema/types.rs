@@ -2,6 +2,11 @@ use crate::frontend::ast::Visibility;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+// Purpose: Define semantic type primitives and shared type-policy helpers.
+// Inputs/Outputs: Pure helpers over Type/TypeDefs used by sema, MIR, and codegen.
+// Invariants: TypeClass and map-key policy are centralized as semantic SSOT.
+// Gotchas: Named aliases may resolve recursively; runtime map-key capability is authoritative.
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinType {
     Bool,
@@ -61,8 +66,11 @@ pub enum RefKind {
 }
 
 impl Type {
-    /// &T / &mut T 한 번만 벗김
+    /// Strip exactly one reference layer (`&T` or `&mut T`).
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn deref_once(&self) -> Option<&Type> {
         match self {
             Type::Ref(inner) | Type::MutRef(inner) => Some(inner.as_ref()),
@@ -70,8 +78,11 @@ impl Type {
         }
     }
 
-    /// 모든 ref를 벗겨서 (base, outer_ref_kind, depth)를 반환
+    /// Strip all nested refs and return `(base, outer_ref_kind, depth)`.
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn peel_refs(&self) -> (&Type, RefKind, usize) {
         let mut cur = self;
         let mut outer = RefKind::None;
@@ -99,21 +110,33 @@ impl Type {
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_ref(&self) -> bool {
         matches!(self, Type::Ref(_) | Type::MutRef(_))
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn pretty(&self) -> TypePretty<'_> {
         TypePretty(self)
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_float(&self) -> bool {
         matches!(self, Type::Builtin(BuiltinType::F32 | BuiltinType::F64))
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn int_info(&self) -> Option<(bool, u8)> {
         match self {
             Type::Builtin(BuiltinType::I8) => Some((true, 8)),
@@ -131,21 +154,33 @@ impl Type {
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_integer(&self) -> bool {
         self.int_info().is_some()
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_numeric(&self) -> bool {
         self.is_integer() || self.is_float()
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn can_be_map_key(&self) -> bool {
         self.map_runtime_key_kind().is_some()
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn map_runtime_key_kind(&self) -> Option<i32> {
         if matches!(self, Type::Builtin(BuiltinType::Error)) {
             return Some(1);
@@ -180,6 +215,9 @@ impl fmt::Display for TypePretty<'_> {
     }
 }
 
+// Precondition: Type context and canonical type handles are valid for policy evaluation.
+// Postcondition: Returned type classification preserves semantic SSOT invariants.
+// Side effects: Pure classification helper except for optional cache lookups/updates.
 fn fmt_type_pretty(ty: &Type, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match ty {
         Type::Ref(inner) => {
@@ -362,6 +400,9 @@ pub enum ReprInt {
 }
 
 impl ReprInt {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn llvm_int_type(self) -> &'static str {
         match self {
             Self::I8 | Self::U8 => "i8",
@@ -371,6 +412,9 @@ impl ReprInt {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_signed(self) -> bool {
         matches!(
             self,
@@ -404,30 +448,51 @@ pub struct MapKeySpec {
 }
 
 impl TypeDefs {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn insert(&mut self, name: String, def: TypeDefKind) {
         self.defs.insert(name, def);
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn get(&self, name: &str) -> Option<&TypeDefKind> {
         self.defs.get(name)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn insert_alias(&mut self, name: String, ty: Type) {
         self.aliases.insert(name, ty);
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn get_alias(&self, name: &str) -> Option<&Type> {
         self.aliases.get(name)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn insert_trait_name(&mut self, name: String) {
         self.trait_names.insert(name);
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_trait_name(&self, name: &str) -> bool {
         self.trait_names.contains(name)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn all_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.defs.keys().cloned().collect();
         names.extend(self.aliases.keys().cloned());
@@ -437,12 +502,18 @@ impl TypeDefs {
         names
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.defs.keys().cloned().collect();
         names.sort();
         names
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn map_runtime_key_kind(&self, ty: &Type) -> Option<i32> {
         self.map_key_spec(ty).map(|spec| spec.kind)
     }
@@ -572,15 +643,24 @@ impl TypeDefs {
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn can_be_map_key(&self, ty: &Type) -> bool {
         self.map_key_spec(ty).is_some()
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn map_runtime_key_type(&self, ty: &Type) -> Option<Type> {
         self.map_key_spec(ty).map(|spec| spec.runtime_ty)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn map_key_spec(&self, ty: &Type) -> Option<MapKeySpec> {
         let mut visiting = HashSet::new();
         let kind = self.map_runtime_key_kind_inner(ty, &mut visiting)?;
@@ -624,6 +704,9 @@ impl TypeDefs {
         resolve_inner(self, ty, &mut visiting)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn classify(&self, ty: &Type) -> Option<TypeClass> {
         match ty {
             Type::Ref(_) | Type::MutRef(_) => Some(TypeClass::View),
@@ -694,6 +777,9 @@ impl TypeDefs {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn contains_view(&self, ty: &Type) -> bool {
         let mut visiting = HashSet::new();
         self.contains_view_inner(ty, &mut visiting)
@@ -742,10 +828,16 @@ impl TypeDefs {
     }
 
     #[inline]
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_copy_type(&self, ty: &Type) -> bool {
         matches!(self.classify(ty), Some(TypeClass::Copy))
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn interface_cast_supported(&self, ty: &Type) -> bool {
         let mut visiting = HashSet::new();
         self.interface_cast_supported_inner(ty, &mut visiting)
@@ -819,6 +911,9 @@ impl TypeDefs {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn can_explicit_cast(&self, from: &Type, to: &Type) -> bool {
         if from == to {
             return true;

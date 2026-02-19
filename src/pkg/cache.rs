@@ -1,3 +1,8 @@
+// Purpose: Implement module cache read/write primitives for resolved dependencies.
+// Inputs/Outputs: Persists and loads cached module metadata/artifacts on disk.
+// Invariants: Cache format and locking behavior must prevent partial-write corruption.
+// Gotchas: File-open flags and truncation policy are critical for Windows compatibility.
+
 use anyhow::Context;
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -35,6 +40,9 @@ pub struct CacheLock {
 }
 
 impl CacheLock {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn acquire(root: &Path) -> anyhow::Result<Self> {
         ensure_dir(root)?;
         let lock_path = root.join("cache.lock");

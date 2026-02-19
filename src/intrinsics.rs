@@ -1,3 +1,8 @@
+// Purpose: Define intrinsic registry metadata and shared validation error builders.
+// Inputs/Outputs: Maps intrinsic names to expected type-arg/arg arity and policy rules.
+// Invariants: Intrinsic signatures are semantic SSOT consumed by sema and codegen.
+// Gotchas: Any signature drift must be updated in docs/runtime expectations simultaneously.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arity {
     Any,

@@ -1,3 +1,8 @@
+// Purpose: Build module-level LLVM IR scaffold and coordinate function/global emission.
+// Inputs/Outputs: Consumes typed program + MIR and returns complete LLVM IR module text.
+// Invariants: Backend assumes sema/lowering already validated user program semantics.
+// Gotchas: Declaration ordering and runtime symbol signatures must remain consistent.
+
 use crate::frontend::ast::{ExternGlobal, Item};
 use crate::mir::MirModule;
 use crate::sema::types::{BuiltinType, Type, TypeDefKind};
@@ -19,10 +24,16 @@ pub enum CodegenError {
 }
 
 impl CodegenError {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn frontend(message: impl Into<String>) -> Self {
         Self::FrontendDiagnostic(message.into())
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::InternalCompilerError(message.into())
     }

@@ -1,5 +1,10 @@
 // #![allow(private_interfaces)]
 #![allow(non_camel_case_types, non_snake_case, dead_code, unsafe_op_in_unsafe_fn, static_mut_refs)]
+// Purpose: Provide runtime primitives and platform bindings used by generated programs.
+// Inputs/Outputs: Exposes C ABI entry points consumed by LLVM-emitted Gost binaries.
+// Invariants: Runtime object layouts and symbol signatures must stay ABI-stable.
+// Gotchas: Scheduler and socket behavior diverge by platform; keep cfg-gated paths aligned.
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "stats")]
@@ -1134,6 +1139,8 @@ static NETPOLL_REAP_TICK: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(feature = "stats")]
 fn stat_inc(slot: &StatSlot) {
+    // SAFETY: `tls_m_get` returns either null or a scheduler-owned `gost_m` for this thread.
+    // SAFETY: Stats arrays are runtime-internal and indexed by compile-time slot constants.
     unsafe {
         let m = tls_m_get();
         if !m.is_null() {
@@ -1145,6 +1152,8 @@ fn stat_inc(slot: &StatSlot) {
 }
 #[cfg(feature = "stats")]
 fn stat_add(slot: &StatSlot, v: i64) {
+    // SAFETY: `tls_m_get` returns either null or a scheduler-owned `gost_m` for this thread.
+    // SAFETY: Stats arrays are runtime-internal and indexed by compile-time slot constants.
     unsafe {
         let m = tls_m_get();
         if !m.is_null() {
@@ -1156,6 +1165,8 @@ fn stat_add(slot: &StatSlot, v: i64) {
 }
 #[cfg(feature = "stats")]
 fn stat_max(slot: &StatSlot, v: i64) {
+    // SAFETY: `tls_m_get` returns either null or a scheduler-owned `gost_m` for this thread.
+    // SAFETY: Stats arrays are runtime-internal and indexed by compile-time slot constants.
     unsafe {
         let m = tls_m_get();
         if !m.is_null() {
@@ -1255,8 +1266,8 @@ fn default_gomaxprocs() -> i32 {
     #[cfg(windows)]
     {
         return match std::thread::available_parallelism() {
-            // Current runtime still has global scheduler hot spots; on Windows
-            // this benchmark is consistently faster with a smaller M count.
+            // PERF: Current runtime still has global scheduler hot spots.
+            // PERF: On Windows this workload is consistently faster with smaller M counts.
             Ok(nz) => (nz.get() as i32).clamp(1, 2),
             Err(_) => 1,
         };
@@ -1264,8 +1275,8 @@ fn default_gomaxprocs() -> i32 {
     #[cfg(not(windows))]
     {
         match std::thread::available_parallelism() {
-            // The current scheduler still contends on shared locks, so a small worker
-            // count is usually faster for mixed net/channel workloads.
+            // PERF: Shared-lock contention in scheduler hot paths still dominates mixed workloads.
+            // PERF: A small worker cap is currently faster for net/channel-heavy programs.
             Ok(nz) => (nz.get() as i32).clamp(1, 4),
             Err(_) => 1,
         }
@@ -1434,7 +1445,8 @@ unsafe fn gost_alloc_new_block_aligned(size: usize, align: usize) -> *mut gost_a
     let base = raw.add(header) as usize;
     let payload_addr = gost_alloc_align_up(base, align);
     let hdr = (payload_addr - header) as *mut gost_alloc_hdr;
-    // For aligned-large blocks, store the raw malloc pointer in `next`.
+    // SAFETY: For aligned large blocks, `next` stores the original malloc pointer so free uses
+    // the allocator base address, not the aligned payload-adjacent header address.
     (*hdr).next = raw as *mut gost_alloc_hdr;
     (*hdr).class_idx = GOST_ALLOC_CLASS_LARGE;
     (*hdr)._pad = 1;
@@ -1667,6 +1679,7 @@ unsafe fn gost_string_set_bytes(out: *mut gost_string, bytes: &[u8]) {
 }
 
 fn net_insert_handle_with_cache(h: NetHandle, warm_cache: bool) -> i64 {
+    // PERF: Shard selection spreads writes across lock shards to reduce handle-table contention.
     let shard = (NET_HANDLE_NEXT.fetch_add(1, Ordering::Relaxed) as usize) & (NET_TABLE_SHARD_COUNT - 1);
     let mut table = net_table_write_by_shard(shard);
 
@@ -1698,6 +1711,7 @@ fn net_insert_handle_with_cache(h: NetHandle, warm_cache: bool) -> i64 {
     };
 
     if warm_cache {
+        // PERF: Warm cache avoids immediate read-back from sharded table on connect-heavy call paths.
         if let Some(handle) = entry.val.as_ref() {
             match handle {
                 NetHandle::TcpStream { sock, pd } => {
@@ -1724,6 +1738,8 @@ fn net_cache_clear_id(id: i64) {
     if !NET_HANDLE_CACHE_ENABLED {
         return;
     }
+    // INVALIDATION: Cache entries are keyed by runtime handle id and generation.
+    // INVALIDATION: Any remove/close path must clear matching cached weak references.
     NET_HANDLE_CACHE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let clear = match slot.as_ref() {
@@ -1743,6 +1759,7 @@ fn net_cache_set_tcp_listener(id: i64, sock: &Arc<TcpListener>, pd: *mut gost_po
     if !NET_HANDLE_CACHE_ENABLED {
         return;
     }
+    // INVALIDATION: Cache uses weak refs and handle id; stale entries are cleared on upgrade/acquire failure.
     NET_HANDLE_CACHE.with(|cell| {
         *cell.borrow_mut() = Some(net_handle_cache_entry::TcpListener {
             id,
@@ -1809,6 +1826,8 @@ fn net_cache_take_tcp_listener(id: i64) -> Option<(Arc<TcpListener>, *mut gost_p
         }
     });
     let (sock, pd) = out?;
+    // SAFETY: `pd` comes from cache entry tied to the same handle generation.
+    // SAFETY: Acquire failure means descriptor was retired; cache must be invalidated.
     if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
         net_cache_clear_id(id);
         return None;
@@ -1834,6 +1853,8 @@ fn net_cache_take_tcp_stream(id: i64) -> Option<(Arc<TcpStream>, *mut gost_poll_
         }
     });
     let (sock, pd) = out?;
+    // SAFETY: `pd` comes from cache entry tied to the same handle generation.
+    // SAFETY: Acquire failure means descriptor was retired; cache must be invalidated.
     if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
         net_cache_clear_id(id);
         return None;
@@ -1859,6 +1880,8 @@ fn net_cache_take_udp_socket(id: i64) -> Option<(Arc<UdpSocket>, *mut gost_poll_
         }
     });
     let (sock, pd) = out?;
+    // SAFETY: `pd` comes from cache entry tied to the same handle generation.
+    // SAFETY: Acquire failure means descriptor was retired; cache must be invalidated.
     if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
         net_cache_clear_id(id);
         return None;
@@ -1884,6 +1907,8 @@ fn net_cache_take_ws(id: i64) -> Option<(Arc<Mutex<GostWs>>, *mut gost_poll_desc
         }
     });
     let (ws, pd) = out?;
+    // SAFETY: `pd` comes from cache entry tied to the same handle generation.
+    // SAFETY: Acquire failure means descriptor was retired; cache must be invalidated.
     if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
         net_cache_clear_id(id);
         return None;
@@ -1943,6 +1968,7 @@ fn net_remove_handle(id: i64) -> bool {
     drop(table);
     net_cache_clear_id(id);
     if let Some(h) = removed {
+        // SAFETY: `h` is removed from handle table before close, so no future lookup can alias this descriptor.
         unsafe { net_handle_close_poll(&h); }
         true
     } else {
@@ -2306,6 +2332,7 @@ impl poll_desc_guard {
 
 impl Drop for poll_desc_guard {
     fn drop(&mut self) {
+        // SAFETY: Guard is constructed only after successful `netpoll_pd_acquire`, so drop balances that acquire.
         unsafe {
             netpoll_pd_release(self.pd);
         }
@@ -2314,12 +2341,14 @@ impl Drop for poll_desc_guard {
 
 #[cfg(unix)]
 fn net_open_pd_listener(sock: &TcpListener) -> *mut gost_poll_desc {
+    // SAFETY: FD originates from a live `TcpListener`; poll layer takes only numeric descriptor value.
     unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
 }
 
 #[cfg(windows)]
 fn net_open_pd_listener(sock: &TcpListener) -> *mut gost_poll_desc {
     let pd = __gost_poll_open_socket(sock.as_raw_socket() as u64);
+    // SAFETY: `pd` is either null or freshly opened for this socket; listener mark writes only poll metadata.
     unsafe {
         if !pd.is_null() {
             let family = match sock.local_addr() {
@@ -2339,6 +2368,7 @@ fn net_open_pd_listener(_sock: &TcpListener) -> *mut gost_poll_desc {
 
 #[cfg(unix)]
 fn net_open_pd_stream(sock: &TcpStream) -> *mut gost_poll_desc {
+    // SAFETY: FD originates from a live `TcpStream`; poll layer takes only numeric descriptor value.
     unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
 }
 
@@ -2354,6 +2384,7 @@ fn net_open_pd_stream(_sock: &TcpStream) -> *mut gost_poll_desc {
 
 #[cfg(unix)]
 fn net_open_pd_udp(sock: &UdpSocket) -> *mut gost_poll_desc {
+    // SAFETY: FD originates from a live `UdpSocket`; poll layer takes only numeric descriptor value.
     unsafe { __gost_poll_open(sock.as_raw_fd() as i32) }
 }
 
@@ -2384,6 +2415,7 @@ fn net_get_tcp_listener(id: i64) -> Result<(Arc<TcpListener>, *mut gost_poll_des
     match entry.val.as_ref() {
         Some(NetHandle::TcpListener { sock, pd }) => {
             let pd = *pd as *mut gost_poll_desc;
+            // SAFETY: `pd` came from handle table entry validated by `(id, generation)` pair above.
             if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
                 return Err("poll descriptor is closed".to_string());
             }
@@ -2412,6 +2444,7 @@ fn net_get_tcp_stream(id: i64) -> Result<(Arc<TcpStream>, *mut gost_poll_desc), 
     match entry.val.as_ref() {
         Some(NetHandle::TcpStream { sock, pd }) => {
             let pd = *pd as *mut gost_poll_desc;
+            // SAFETY: `pd` came from handle table entry validated by `(id, generation)` pair above.
             if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
                 return Err("poll descriptor is closed".to_string());
             }
@@ -2440,6 +2473,7 @@ fn net_get_udp_socket(id: i64) -> Result<(Arc<UdpSocket>, *mut gost_poll_desc), 
     match entry.val.as_ref() {
         Some(NetHandle::UdpSocket { sock, pd }) => {
             let pd = *pd as *mut gost_poll_desc;
+            // SAFETY: `pd` came from handle table entry validated by `(id, generation)` pair above.
             if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
                 return Err("poll descriptor is closed".to_string());
             }
@@ -2468,6 +2502,7 @@ fn net_get_ws(id: i64) -> Result<(Arc<Mutex<GostWs>>, *mut gost_poll_desc), Stri
     match entry.val.as_ref() {
         Some(NetHandle::WsSocket { ws, pd }) => {
             let pd = *pd as *mut gost_poll_desc;
+            // SAFETY: `pd` came from handle table entry validated by `(id, generation)` pair above.
             if !pd.is_null() && unsafe { !netpoll_pd_acquire(pd) } {
                 return Err("poll descriptor is closed".to_string());
             }
@@ -2561,6 +2596,7 @@ fn net_tcp_connect_blocking(addr: &str) -> Result<(TcpStream, *mut gost_poll_des
 
 fn net_parse_socket_addr_cached(addr: &str) -> Option<SocketAddr> {
     NET_CONNECT_SA_CACHE.with(|cell| {
+        // PERF: Per-thread single-entry cache avoids repeated `SocketAddr` parse in reconnect loops.
         if let Some((cached_addr, cached_sa)) = cell.borrow().as_ref() {
             if cached_addr == addr {
                 return Some(*cached_sa);
@@ -2578,11 +2614,13 @@ fn net_parse_socket_addr_cached(addr: &str) -> Option<SocketAddr> {
 
 fn net_resolve_socket_addrs_cached(addr: &str) -> Result<Vec<SocketAddr>, String> {
     NET_CONNECT_RESOLVE_CACHE.with(|cell| {
+        // PERF: DNS/resolve cache is thread-local to avoid global locks on hot connect paths.
         if let Some((cached_addr, cached_addrs)) = cell.borrow().as_ref() {
             if cached_addr == addr {
                 return Ok(cached_addrs.clone());
             }
         }
+        // INVALIDATION: Miss replaces the single cached entry; policy prefers freshness-by-overwrite over TTL state.
         let addrs = addr
             .to_socket_addrs()
             .map_err(|e| format!("tcp resolve failed: {}", e))?
@@ -2622,6 +2660,7 @@ fn net_tcp_connect_nonblocking_one(sa: SocketAddr) -> Result<(TcpStream, *mut go
                 return Err("tcp connect failed: netpoll unavailable".to_string());
             }
             loop {
+                // SAFETY: `pd` is opened from a live socket and waited via netpoll APIs that validate descriptor state.
                 match unsafe { net_wait_write(pd) } {
                     Ok(()) => {}
                     Err(msg) => {
@@ -2692,6 +2731,7 @@ struct net_http_task {
 }
 
 fn net_http_pool_worker_count() -> usize {
+    // PERF: Clamp worker count to bound scheduler pressure and avoid oversubscription spikes.
     let defv = match std::thread::available_parallelism() {
         Ok(v) => v.get().clamp(2, 16),
         Err(_) => 4,
@@ -2700,6 +2740,7 @@ fn net_http_pool_worker_count() -> usize {
 }
 
 fn net_http_pool_queue_cap() -> usize {
+    // PERF: Bounded queue provides backpressure so burst traffic cannot grow memory without limit.
     env_usize_clamp("GOST_HTTP_QUEUE_CAP", 2048, 64, 1 << 20)
 }
 
@@ -2718,6 +2759,7 @@ fn net_http_pool_worker_loop(pool: Arc<net_http_pool>) {
             }
             q.pop_front().unwrap_or(0)
         };
+        // SAFETY: Task pointers come from runtime-owned queue/context and are consumed exactly once per worker dispatch.
         unsafe {
             net_http_worker_run(task_key as *mut net_http_task);
         }
@@ -2761,6 +2803,7 @@ fn net_http_pool_push(task: *mut net_http_task) -> Result<(), String> {
         Err(e) => e.into_inner(),
     };
     if q.len() >= pool.cap {
+        // PERF: Fail-fast on full queue keeps latency bounded and prevents allocator thrash.
         return Err("http worker queue is full".to_string());
     }
     q.push_back(task as usize);
@@ -2796,6 +2839,7 @@ unsafe fn net_http_worker_run(task_ptr: *mut net_http_task) {
 }
 
 extern "C" fn net_http_worker_entry(ctx: *mut c_void) {
+    // SAFETY: Task pointers come from runtime-owned queue/context and are consumed exactly once per worker dispatch.
     unsafe {
         net_http_worker_run(ctx as *mut net_http_task);
     }
@@ -3002,6 +3046,7 @@ fn netpoll_iocp_op_pool_lock() -> std::sync::MutexGuard<'static, Vec<usize>> {
 unsafe fn netpoll_iocp_op_alloc() -> *mut netpoll_iocp_op {
     let mut pool = netpoll_iocp_op_pool_lock();
     if let Some(raw) = pool.pop() {
+        // PERF: Reuse overlapped-op structs to avoid calloc/free churn on high I/O rates.
         let op = raw as *mut netpoll_iocp_op;
         drop(pool);
         ptr::write_bytes(op, 0, 1);
@@ -3018,6 +3063,7 @@ unsafe fn netpoll_iocp_op_free(op: *mut netpoll_iocp_op) {
     }
     let mut pool = netpoll_iocp_op_pool_lock();
     if pool.len() < NETPOLL_IOCP_OP_POOL_MAX {
+        // PERF: Keep a bounded free-list to amortize allocation cost without unbounded memory retention.
         pool.push(op as usize);
         return;
     }
@@ -3273,6 +3319,7 @@ unsafe fn netpoll_set_nonblock(_fd: i32) -> i32 {
 
 #[cfg(target_os = "linux")]
 unsafe fn netpoll_init() {
+    // SAFETY: One-time poller bootstrap owns global fd/socket state and runs under `NETPOLL_INIT_ONCE` serialization.
     NETPOLL_INIT_ONCE.call_once(|| unsafe {
         let epfd = epoll_create1(EPOLL_CLOEXEC);
         if epfd < 0 {
@@ -3318,6 +3365,7 @@ unsafe fn netpoll_init() {
 
 #[cfg(target_os = "macos")]
 unsafe fn netpoll_init() {
+    // SAFETY: One-time poller bootstrap owns global fd/socket state and runs under `NETPOLL_INIT_ONCE` serialization.
     NETPOLL_INIT_ONCE.call_once(|| unsafe {
         let mut fds: [i32; 2] = [0; 2];
         if pipe(fds.as_mut_ptr()) != 0 {
@@ -3357,6 +3405,7 @@ unsafe fn netpoll_init() {
 
 #[cfg(windows)]
 unsafe fn netpoll_init() {
+    // SAFETY: One-time poller bootstrap owns global fd/socket state and runs under `NETPOLL_INIT_ONCE` serialization.
     NETPOLL_INIT_ONCE.call_once(|| unsafe {
         let iocp = netpoll_iocp_open();
         if iocp.is_null() {
@@ -4273,6 +4322,7 @@ unsafe fn poll_desc_free(pd: *mut gost_poll_desc) {
 #[cfg(not(windows))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_poll_open(fd: i32) -> *mut gost_poll_desc {
+    // SAFETY: Poll descriptor pointers/handles are runtime-created; this block only uses validated OS resources.
     unsafe {
         if fd < 0 {
             return ptr::null_mut();
@@ -4298,6 +4348,7 @@ pub extern "C" fn __gost_poll_open(fd: i32) -> *mut gost_poll_desc {
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_poll_open_socket(sock: u64) -> *mut gost_poll_desc {
+    // SAFETY: Poll descriptor pointers/handles are runtime-created; this block only uses validated OS resources.
     unsafe {
         if sock == 0 || sock == u64::MAX {
             return ptr::null_mut();
@@ -4325,6 +4376,7 @@ pub extern "C" fn __gost_poll_open_socket(sock: u64) -> *mut gost_poll_desc {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_poll_close(pd: *mut gost_poll_desc) {
+    // SAFETY: Poll descriptor pointers/handles are runtime-created; this block only uses validated OS resources.
     unsafe {
         if pd.is_null() {
             return;
@@ -4361,6 +4413,7 @@ pub extern "C" fn __gost_poll_close(pd: *mut gost_poll_desc) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_poll_arm(pd: *mut gost_poll_desc, want: i32) -> i32 {
+    // SAFETY: Poll descriptor pointers/handles are runtime-created; this block only uses validated OS resources.
     unsafe {
         if pd.is_null() {
             return -1;
@@ -4390,6 +4443,7 @@ unsafe fn os_yield() {
 
 #[inline(always)]
 unsafe fn park_fuzz_point() {
+    // SAFETY: Fuzz hook mutates scheduler test knobs behind runtime synchronization and does not escape raw pointers.
     PARK_FUZZ_ONCE.call_once(|| unsafe {
         PARK_FUZZ_MODE = env_i("GOST_PARK_FUZZ", 0);
     });
@@ -4422,6 +4476,7 @@ unsafe fn stack_cache_take(reserve: usize, commit: usize) -> Option<gost_stack_c
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
+    // PERF: Reusing reserved stacks avoids expensive virtual-memory map/protect cycles on goroutine churn.
     let idx = cache
         .iter()
         .rposition(|ent| ent.reserve == reserve && ent.commit == commit)?;
@@ -4439,6 +4494,7 @@ unsafe fn stack_cache_put(base: *mut c_void, reserve: usize, commit: usize) -> b
     if cache.len() >= G_STACK_CACHE_MAX {
         return false;
     }
+    // INVALIDATION: Cache key includes both reserve and commit sizes; mismatched layouts are never reused.
     cache.push(gost_stack_cache_ent {
         base: base as usize,
         reserve,
@@ -4520,6 +4576,7 @@ unsafe fn stack_free(base: *mut c_void, _reserve: usize) {
 }
 
 unsafe fn ctx_init_g(g: *mut gost_g) {
+    // SAFETY: Runtime bootstrap touches global scheduler/context state before user code can concurrently observe it.
     G_STACK_ONCE.call_once(|| unsafe { stack_init_once() });
     (*g).stack_reserve = G_STACK_RESERVE;
     let mut reused = false;
@@ -4593,6 +4650,7 @@ unsafe fn ctx_init_g(g: *mut gost_g) {
 
 fn now_ms() -> i64 {
     #[cfg(windows)]
+    // SAFETY: Platform clock FFI writes to local stack-owned structs; no aliasing pointers escape this call.
     unsafe {
         return GetTickCount64() as i64;
     }
@@ -4613,6 +4671,7 @@ pub extern "C" fn __gost_now_ms() -> i64 {
 #[allow(unreachable_code)]
 pub extern "C" fn __gost_process_exit(code: i32) -> i32 {
     #[cfg(windows)]
+    // SAFETY: Process-exit FFI does not return; preceding runtime state writes are completed before termination call.
     unsafe {
         ExitProcess(code as u32);
     }
@@ -4630,6 +4689,7 @@ pub extern "C" fn __gost_os_last_status() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_last_error(out: *mut gost_string) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             return;
@@ -4640,6 +4700,7 @@ pub extern "C" fn __gost_os_last_error(out: *mut gost_string) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_last_output(out: *mut gost_string) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             return;
@@ -4650,6 +4711,7 @@ pub extern "C" fn __gost_os_last_output(out: *mut gost_string) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_exec(cmd_ptr: *const u8, cmd_len: i64) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let cmd = match raw_utf8_from(cmd_ptr, cmd_len) {
             Ok(v) => v,
@@ -4675,6 +4737,7 @@ pub extern "C" fn __gost_os_exec(cmd_ptr: *const u8, cmd_len: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_pipe(cmd_ptr: *const u8, cmd_len: i64) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let cmd = match raw_utf8_from(cmd_ptr, cmd_len) {
             Ok(v) => v,
@@ -4700,6 +4763,7 @@ pub extern "C" fn __gost_os_pipe(cmd_ptr: *const u8, cmd_len: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_read_file(out: *mut gost_string, path_ptr: *const u8, path_len: i64) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             os_set_err("read_file out is null".to_string());
@@ -4732,6 +4796,7 @@ pub extern "C" fn __gost_os_write_file(
     data_ptr: *const u8,
     data_len: i64,
 ) -> i64 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let path = match raw_utf8_from(path_ptr, path_len) {
             Ok(v) => v,
@@ -4762,6 +4827,7 @@ pub extern "C" fn __gost_os_write_file(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_remove(path_ptr: *const u8, path_len: i64) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let path = match raw_utf8_from(path_ptr, path_len) {
             Ok(v) => v,
@@ -4785,6 +4851,7 @@ pub extern "C" fn __gost_os_remove(path_ptr: *const u8, path_len: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_mkdir(path_ptr: *const u8, path_len: i64) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let path = match raw_utf8_from(path_ptr, path_len) {
             Ok(v) => v,
@@ -4808,6 +4875,7 @@ pub extern "C" fn __gost_os_mkdir(path_ptr: *const u8, path_len: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_readdir(out: *mut gost_string, path_ptr: *const u8, path_len: i64) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             os_set_err("readdir out is null".to_string());
@@ -4847,6 +4915,7 @@ pub extern "C" fn __gost_os_readdir(out: *mut gost_string, path_ptr: *const u8, 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_stat_size(path_ptr: *const u8, path_len: i64) -> i64 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let path = match raw_utf8_from(path_ptr, path_len) {
             Ok(v) => v,
@@ -4870,6 +4939,7 @@ pub extern "C" fn __gost_os_stat_size(path_ptr: *const u8, path_len: i64) -> i64
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_getwd(out: *mut gost_string) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             os_set_err("getwd out is null".to_string());
@@ -4891,6 +4961,7 @@ pub extern "C" fn __gost_os_getwd(out: *mut gost_string) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_chdir(path_ptr: *const u8, path_len: i64) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let path = match raw_utf8_from(path_ptr, path_len) {
             Ok(v) => v,
@@ -4914,6 +4985,7 @@ pub extern "C" fn __gost_os_chdir(path_ptr: *const u8, path_len: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_getenv(out: *mut gost_string, key_ptr: *const u8, key_len: i64) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             os_set_err("getenv out is null".to_string());
@@ -4947,6 +5019,7 @@ pub extern "C" fn __gost_os_setenv(
     val_ptr: *const u8,
     val_len: i64,
 ) -> i32 {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         let key = match raw_utf8_from(key_ptr, key_len) {
             Ok(v) => v,
@@ -4970,6 +5043,7 @@ pub extern "C" fn __gost_os_setenv(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_os_args(out: *mut gost_string) {
+    // SAFETY: FFI inputs/outputs are null-checked and converted to bounded Rust views before OS interaction.
     unsafe {
         if out.is_null() {
             os_set_err("args out is null".to_string());
@@ -5006,6 +5080,7 @@ unsafe fn sync_once_from_handle(handle: i64) -> *mut gost_sync_once {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_mutex_new() -> i64 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = libc::malloc(mem::size_of::<gost_sync_mutex>()) as *mut gost_sync_mutex;
         if p.is_null() {
@@ -5021,6 +5096,7 @@ pub extern "C" fn __gost_sync_mutex_new() -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_mutex_lock(handle: i64) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_mutex_from_handle(handle);
         if p.is_null() {
@@ -5038,6 +5114,7 @@ pub extern "C" fn __gost_sync_mutex_lock(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_mutex_try_lock(handle: i64) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_mutex_from_handle(handle);
         if p.is_null() {
@@ -5057,6 +5134,7 @@ pub extern "C" fn __gost_sync_mutex_try_lock(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_mutex_unlock(handle: i64) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_mutex_from_handle(handle);
         if p.is_null() {
@@ -5076,6 +5154,7 @@ pub extern "C" fn __gost_sync_mutex_unlock(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_waitgroup_new() -> i64 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = libc::malloc(mem::size_of::<gost_sync_waitgroup>()) as *mut gost_sync_waitgroup;
         if p.is_null() {
@@ -5091,6 +5170,7 @@ pub extern "C" fn __gost_sync_waitgroup_new() -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_waitgroup_add(handle: i64, delta: i32) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_waitgroup_from_handle(handle);
         if p.is_null() {
@@ -5113,6 +5193,7 @@ pub extern "C" fn __gost_sync_waitgroup_add(handle: i64, delta: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_waitgroup_wait(handle: i64) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_waitgroup_from_handle(handle);
         if p.is_null() {
@@ -5129,6 +5210,7 @@ pub extern "C" fn __gost_sync_waitgroup_wait(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_once_new() -> i64 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = libc::malloc(mem::size_of::<gost_sync_once>()) as *mut gost_sync_once;
         if p.is_null() {
@@ -5143,6 +5225,7 @@ pub extern "C" fn __gost_sync_once_new() -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_sync_once_begin(handle: i64) -> i32 {
+    // SAFETY: Opaque sync handles are allocated by matching constructors, so casts map to the correct runtime layout.
     unsafe {
         let p = sync_once_from_handle(handle);
         if p.is_null() {
@@ -5509,6 +5592,7 @@ unsafe fn p_steal_locked(m: *mut gost_m, max_take: i32) -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn gost_ctx_entry(arg: *mut c_void) -> ! {
+    // SAFETY: Runtime bootstrap touches global scheduler/context state before user code can concurrently observe it.
     unsafe {
         let g = arg as *mut gost_g;
         tls_g_set(g);
@@ -5529,6 +5613,7 @@ pub extern "C" fn gost_ctx_entry(arg: *mut c_void) -> ! {
 }
 
 extern "C" fn gost_main_tramp(ctx: *mut c_void) {
+    // SAFETY: Runtime bootstrap touches global scheduler/context state before user code can concurrently observe it.
     unsafe {
         let main_fn: gost_main_fn = mem::transmute(ctx);
         let code = main_fn();
@@ -5630,7 +5715,7 @@ unsafe fn goready_try_local_fast(g: *mut gost_g) -> bool {
     if st == G_DEAD || st == G_RUNNING {
         return true;
     }
-    // PARKING wakeup needs the locked park_ready handoff path.
+    // SAFETY: PARKING wakeup must use the locked `park_ready` handoff to avoid lost wakeups.
     if st == G_PARKING {
         return false;
     }
@@ -5641,6 +5726,7 @@ unsafe fn goready_try_local_fast(g: *mut gost_g) -> bool {
     if m.is_null() || (*m).p.is_null() {
         return false;
     }
+    // PERF: Prefer local P run queue first to avoid taking global scheduler lock on frequent wakeups.
     let _ = p_push_enq((*m).p, g);
     true
 }
@@ -5789,7 +5875,7 @@ unsafe fn sched_run_g(m: *mut gost_m, g: *mut gost_g) {
     tls_g_set(g);
     stat_inc(&ST_SCHED_SWITCH);
     gost_ctx_swap(&mut (*m).sched_ctx, &mut (*g).ctx);
-    // Back on scheduler context: clear TLS G to avoid stale/dangling pointers.
+    // SAFETY: After switching back to scheduler context, clear TLS `G` to avoid stale pointers.
     tls_g_set(ptr::null_mut());
     (*m).curg = ptr::null_mut();
     if g_state_load(g) == G_PARKING {
@@ -5935,6 +6021,7 @@ unsafe fn selq_unlink_locked(ch: *mut __gost_chan, n: *mut gost_selnode) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_retain(ch: *mut __gost_chan) {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let Some(key) = chan_registry_key(ch) else { return; };
         let idx = chan_registry_shard_idx(ch);
@@ -5978,6 +6065,7 @@ struct chan_ref_guard {
 
 impl Drop for chan_ref_guard {
     fn drop(&mut self) {
+        // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
         unsafe {
             __gost_chan_release(self.ch);
         }
@@ -6085,11 +6173,13 @@ unsafe fn select_notify_chan(ch: *mut __gost_chan) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_rt_init() {
+    // SAFETY: Runtime bootstrap touches global scheduler/context state before user code can concurrently observe it.
     G_SCHED_ONCE.call_once(|| unsafe { sched_init_once() });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
+    // SAFETY: Runtime bootstrap touches global scheduler/context state before user code can concurrently observe it.
     unsafe {
         os_console_utf8_init();
         __gost_rt_init();
@@ -6150,8 +6240,8 @@ pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
 
         sched_loop(ms);
 
-        // Ensure every worker observes shutdown before join. In rare races a worker
-        // can remain asleep if it missed the earlier wake path.
+        // SAFETY: Ensure every worker observes shutdown before join.
+        // SAFETY: In rare races a sleeper can miss an earlier wake signal.
         os_mutex_lock(&mut (*sched).mu);
         (*sched).shutting_down = 1;
         os_cond_broadcast(&mut (*sched).cv);
@@ -6183,6 +6273,7 @@ pub extern "C" fn __gost_rt_start(main_fn: Option<gost_main_fn>) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_panic(msg: *const u8, len: usize) {
+    // SAFETY: Panic message pointer is treated as read-only bytes with explicit length and never written through.
     unsafe {
         if !msg.is_null() && len > 0 {
             fd_write_bytes(2, std::slice::from_raw_parts(msg, len));
@@ -6194,6 +6285,7 @@ pub extern "C" fn __gost_panic(msg: *const u8, len: usize) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_println_str(ptr: *const u8, len: usize) {
+    // SAFETY: String pointer/length pair is validated before converting to byte slice for output routines.
     unsafe {
         if !ptr.is_null() && len > 0 {
             fd_write_bytes(1, std::slice::from_raw_parts(ptr, len));
@@ -6209,6 +6301,7 @@ pub extern "C" fn __gost_error_new(msg: *const u8, len: usize) -> i32 {
     let text = if msg.is_null() || len == 0 {
         String::new()
     } else {
+        // SAFETY: Error/singleton pointers are runtime allocations with null guards before dereference or ownership updates.
         unsafe {
             let bytes = std::slice::from_raw_parts(msg, len);
             String::from_utf8_lossy(bytes).to_string()
@@ -6226,6 +6319,7 @@ pub extern "C" fn __gost_error_message(out: *mut gost_string, err: i32) {
         return;
     }
     if err == 0 {
+        // SAFETY: Error/singleton pointers are runtime allocations with null guards before dereference or ownership updates.
         unsafe { gost_string_set_bytes(out, &[]) };
         return;
     }
@@ -6234,6 +6328,7 @@ pub extern "C" fn __gost_error_message(out: *mut gost_string, err: i32) {
     } else {
         format!("error#{}", err)
     };
+    // SAFETY: Error/singleton pointers are runtime allocations with null guards before dereference or ownership updates.
     unsafe { gost_string_set_bytes(out, msg.as_bytes()) };
 }
 
@@ -6255,6 +6350,7 @@ pub extern "C" fn __gost_recover() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_singleton_acquire(name_ptr: *const u8, name_len: i64) -> i32 {
     #[cfg(windows)]
+    // SAFETY: Error/singleton pointers are runtime allocations with null guards before dereference or ownership updates.
     unsafe {
         const ERROR_ALREADY_EXISTS: u32 = 183;
         let name = match raw_utf8_from(name_ptr, name_len) {
@@ -6301,6 +6397,7 @@ pub extern "C" fn __gost_string_len(ptr: *const u8, len: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_string_get(ptr: *const u8, len: i64, idx: i64) -> i32 {
+    // SAFETY: Runtime string headers are validated by null/length checks before creating borrowed byte slices.
     unsafe {
         if ptr.is_null() {
             __gost_panic(b"string is null\0".as_ptr(), 14);
@@ -6315,6 +6412,7 @@ pub extern "C" fn __gost_string_get(ptr: *const u8, len: i64, idx: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_string_slice(out: *mut gost_string, ptr: *const u8, slen: i64, start: i64, len: i64) {
+    // SAFETY: Runtime string headers are validated by null/length checks before creating borrowed byte slices.
     unsafe {
         if out.is_null() {
             __gost_panic(b"string out is null\0".as_ptr(), 18);
@@ -6349,6 +6447,7 @@ pub extern "C" fn __gost_string_slice(out: *mut gost_string, ptr: *const u8, sle
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_string_concat(out: *mut gost_string, a_ptr: *const u8, a_len: i64, b_ptr: *const u8, b_len: i64) {
+    // SAFETY: Runtime string headers are validated by null/length checks before creating borrowed byte slices.
     unsafe {
         if out.is_null() {
             __gost_panic(b"string out is null\0".as_ptr(), 18);
@@ -6383,6 +6482,7 @@ pub extern "C" fn __gost_string_concat(out: *mut gost_string, a_ptr: *const u8, 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_string_from_byte(out: *mut gost_string, b: i32) {
+    // SAFETY: Runtime string headers are validated by null/length checks before creating borrowed byte slices.
     unsafe {
         if out.is_null() {
             __gost_panic(b"string out is null\0".as_ptr(), 18);
@@ -6409,6 +6509,7 @@ pub extern "C" fn __gost_net_last_http_status() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_last_error(out: *mut gost_string) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         if out.is_null() {
             return;
@@ -6424,6 +6525,7 @@ pub extern "C" fn __gost_net_last_error(out: *mut gost_string) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_last_peer(out: *mut gost_string) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         if out.is_null() {
             return;
@@ -6434,6 +6536,7 @@ pub extern "C" fn __gost_net_last_peer(out: *mut gost_string) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_tcp_listen(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let addr = match raw_utf8_slice(addr_ptr, addr_len) {
             Ok(v) => v,
@@ -6477,6 +6580,7 @@ pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
     loop {
         #[cfg(windows)]
         {
+            // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
             unsafe {
                 if !pd.is_null() {
                     if let Some(raw_sock) = netpoll_acceptq_pop(pd) {
@@ -6500,6 +6604,7 @@ pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
             }
         }
         #[cfg(target_os = "linux")]
+        // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
         match unsafe { net_tcp_accept_nonblocking(&listener) } {
             Ok(stream) => {
                 net_tune_tcp_stream_with_mode(&stream, true);
@@ -6512,6 +6617,7 @@ pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
                 match unsafe { net_wait_read(pd) } {
                     Ok(()) => continue,
                     Err(msg) => {
@@ -6538,6 +6644,7 @@ pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
                 match unsafe { net_wait_read(pd) } {
                     Ok(()) => continue,
                     Err(msg) => {
@@ -6556,6 +6663,7 @@ pub extern "C" fn __gost_net_tcp_accept(listener_handle: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_tcp_peer(out: *mut gost_string, handle: i64) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         let (stream, pd) = match net_get_tcp_stream(handle) {
@@ -6580,6 +6688,7 @@ pub extern "C" fn __gost_net_tcp_peer(out: *mut gost_string, handle: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_tcp_connect(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let addr = match raw_utf8_slice(addr_ptr, addr_len) {
             Ok(v) => v,
@@ -6624,6 +6733,7 @@ pub extern "C" fn __gost_net_tcp_close(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_tcp_write(handle: i64, data_ptr: *const u8, data_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let (stream, pd) = match net_get_tcp_stream(handle) {
             Ok(v) => v,
@@ -6692,6 +6802,7 @@ pub extern "C" fn __gost_net_tcp_write(handle: i64, data_ptr: *const u8, data_le
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_tcp_read(out: *mut gost_string, handle: i64, max_len: i32) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         let (stream, pd) = match net_get_tcp_stream(handle) {
@@ -6768,6 +6879,7 @@ pub extern "C" fn __gost_net_tcp_read(out: *mut gost_string, handle: i64, max_le
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_udp_bind(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let addr = match raw_utf8_from(addr_ptr, addr_len) {
             Ok(v) => v,
@@ -6799,6 +6911,7 @@ pub extern "C" fn __gost_net_udp_bind(addr_ptr: *const u8, addr_len: i64) -> i64
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_udp_connect(addr_ptr: *const u8, addr_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let addr = match raw_utf8_from(addr_ptr, addr_len) {
             Ok(v) => v,
@@ -6874,6 +6987,7 @@ pub extern "C" fn __gost_net_udp_close(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_udp_send(handle: i64, data_ptr: *const u8, data_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let (sock, pd) = match net_get_udp_socket(handle) {
             Ok(v) => v,
@@ -6927,6 +7041,7 @@ pub extern "C" fn __gost_net_udp_send_to(
     data_ptr: *const u8,
     data_len: i64,
 ) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let (sock, pd) = match net_get_udp_socket(handle) {
             Ok(v) => v,
@@ -6977,6 +7092,7 @@ pub extern "C" fn __gost_net_udp_send_to(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_udp_recv(out: *mut gost_string, handle: i64, max_len: i32) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         net_clear_last_peer();
@@ -7019,6 +7135,7 @@ pub extern "C" fn __gost_net_udp_recv(out: *mut gost_string, handle: i64, max_le
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_udp_recv_from(out: *mut gost_string, handle: i64, max_len: i32) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         net_clear_last_peer();
@@ -7062,6 +7179,7 @@ pub extern "C" fn __gost_net_udp_recv_from(out: *mut gost_string, handle: i64, m
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_ws_connect(url_ptr: *const u8, url_len: i64) -> i64 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let url = match raw_utf8_from(url_ptr, url_len) {
             Ok(v) => v,
@@ -7123,6 +7241,7 @@ pub extern "C" fn __gost_net_ws_close(handle: i64) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_ws_send_text(handle: i64, data_ptr: *const u8, data_len: i64) -> i32 {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         let (ws, pd) = match net_get_ws(handle) {
             Ok(v) => v,
@@ -7174,6 +7293,7 @@ pub extern "C" fn __gost_net_ws_send_text(handle: i64, data_ptr: *const u8, data
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_net_ws_recv_text(out: *mut gost_string, handle: i64) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         let (ws, pd) = match net_get_ws(handle) {
@@ -7235,6 +7355,7 @@ pub extern "C" fn __gost_net_http_request(
     content_type_ptr: *const u8,
     content_type_len: i64,
 ) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         net_set_http_status(0);
@@ -7302,6 +7423,7 @@ pub extern "C" fn __gost_net_http_request_headers(
     headers_ptr: *const u8,
     headers_len: i64,
 ) {
+    // SAFETY: Handle/pointer arguments are validated via runtime tables and poll-acquire checks before I/O operations.
     unsafe {
         gost_string_set_bytes(out, &[]);
         net_set_http_status(0);
@@ -7364,6 +7486,7 @@ pub extern "C" fn __gost_net_http_request_headers(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_alloc(size: usize, align: usize) -> *mut c_void {
+    // SAFETY: Allocator metadata is runtime-owned; pointer arithmetic follows stored size/alignment invariants.
     unsafe {
         let size = if size == 0 { 1 } else { size };
         let align = gost_alloc_normalize_align(align);
@@ -7371,6 +7494,7 @@ pub extern "C" fn __gost_alloc(size: usize, align: usize) -> *mut c_void {
         let can_use_cache = align <= mem::align_of::<usize>();
         if can_use_cache {
             if let Some(class_idx) = gost_alloc_class_idx(size) {
+                // PERF: Thread-local size-class freelists remove allocator lock contention for hot small objects.
                 TLS_ALLOC_CACHE.with(|cache_cell| {
                     let mut cache = cache_cell.borrow_mut();
                     let head = cache.heads[class_idx];
@@ -7398,6 +7522,7 @@ pub extern "C" fn __gost_alloc(size: usize, align: usize) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_free(p: *mut c_void, _size: usize, _align: usize) {
+    // SAFETY: Allocator metadata is runtime-owned; pointer arithmetic follows stored size/alignment invariants.
     unsafe {
         if p.is_null() {
             return;
@@ -7421,6 +7546,7 @@ pub extern "C" fn __gost_free(p: *mut c_void, _size: usize, _align: usize) {
         TLS_ALLOC_CACHE.with(|cache_cell| {
             let mut cache = cache_cell.borrow_mut();
             if cache.lens[idx] < GOST_ALLOC_CACHE_LIMIT {
+                // PERF: Return small blocks to TLS cache for fast recycle and improved locality.
                 (*hdr).next = cache.heads[idx];
                 cache.heads[idx] = hdr;
                 cache.lens[idx] += 1;
@@ -7428,6 +7554,7 @@ pub extern "C" fn __gost_free(p: *mut c_void, _size: usize, _align: usize) {
             }
         });
         if !cached {
+            // INVALIDATION: Blocks over per-class cache limit bypass cache to cap retained memory per thread.
             libc::free(hdr as *mut c_void);
         }
     }
@@ -7447,6 +7574,7 @@ unsafe extern "C" fn thread_entry(arg: *mut c_void) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_spawn_thread(f: gost_thread_fn, ctx: *mut c_void) {
+    // SAFETY: Spawn payload/context pointers are runtime-allocated and transferred with clear ownership to worker entry.
     unsafe {
         let start = libc::malloc(mem::size_of::<thread_start>()) as *mut thread_start;
         if start.is_null() { __gost_panic(b"out of memory\0".as_ptr(), 13); }
@@ -7461,6 +7589,7 @@ pub extern "C" fn __gost_spawn_thread(f: gost_thread_fn, ctx: *mut c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_go_spawn(f: gost_thread_fn, ctx: *mut c_void) {
+    // SAFETY: Spawn payload/context pointers are runtime-allocated and transferred with clear ownership to worker entry.
     unsafe {
         __gost_rt_init();
         let m = tls_m_get();
@@ -7478,6 +7607,7 @@ pub extern "C" fn __gost_go_spawn(f: gost_thread_fn, ctx: *mut c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_new(elem_size: usize, cap: i32) -> *mut __gost_chan {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let ch = libc::malloc(mem::size_of::<__gost_chan>()) as *mut __gost_chan;
         if ch.is_null() { __gost_panic(b"out of memory\0".as_ptr(), 13); }
@@ -7508,6 +7638,7 @@ pub extern "C" fn __gost_chan_new(elem_size: usize, cap: i32) -> *mut __gost_cha
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_send(ch: *mut __gost_chan, elem: *const c_void) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let _hold = match chan_try_acquire(ch) {
             Some(h) => h,
@@ -7573,6 +7704,7 @@ pub extern "C" fn __gost_chan_send(ch: *mut __gost_chan, elem: *const c_void) ->
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_recv(ch: *mut __gost_chan, out_elem: *mut c_void) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let _hold = match chan_try_acquire(ch) {
             Some(h) => h,
@@ -7654,6 +7786,7 @@ pub extern "C" fn __gost_chan_recv(ch: *mut __gost_chan, out_elem: *mut c_void) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_close(ch: *mut __gost_chan) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let _hold = match chan_try_acquire(ch) {
             Some(h) => h,
@@ -7697,6 +7830,7 @@ pub extern "C" fn __gost_chan_close(ch: *mut __gost_chan) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_drop(ch: *mut __gost_chan) {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         __gost_chan_release(ch);
     }
@@ -7704,6 +7838,7 @@ pub extern "C" fn __gost_chan_drop(ch: *mut __gost_chan) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_can_send(ch: *mut __gost_chan) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let _hold = match chan_try_acquire(ch) {
             Some(h) => h,
@@ -7727,6 +7862,7 @@ pub extern "C" fn __gost_chan_can_send(ch: *mut __gost_chan) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_chan_can_recv(ch: *mut __gost_chan) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let _hold = match chan_try_acquire(ch) {
             Some(h) => h,
@@ -7748,6 +7884,7 @@ pub extern "C" fn __gost_chan_can_recv(ch: *mut __gost_chan) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, ops: *const i32, n: u32) -> i32 {
+    // SAFETY: Channel pointers are runtime-owned and accessed under channel lock/refcount discipline in this path.
     unsafe {
         let g = tls_g_get();
         let m = tls_m_get();
@@ -7803,7 +7940,8 @@ pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, ops: *const i
             return 0;
         }
 
-        // Re-check readiness after enqueue to avoid missing a close/send/recv
+        // INVALIDATION: Re-check readiness after enqueue to avoid missing close/send/recv
+        // transitions that raced with queue linkage.
         let mut ready = false;
         for i in 0..n {
             let ch = *chans.add(i as usize);
@@ -7863,6 +8001,8 @@ pub extern "C" fn __gost_select_wait(chans: *mut *mut __gost_chan, ops: *const i
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_new(elem_size: usize, len: i64, cap: i64, elem_drop: Option<extern "C" fn(*mut c_void)>) -> *mut __gost_slice {
+    // SAFETY: Returned pointer is runtime-allocated and fully initialized before crossing FFI boundary.
+    // SAFETY: Allocation size is derived from checked `(elem_size, cap)` fields maintained by sema/codegen.
     unsafe {
         if cap < len {
             __gost_panic(b"slice cap < len\0".as_ptr(), 15);
@@ -7884,6 +8024,8 @@ pub extern "C" fn __gost_slice_new(elem_size: usize, len: i64, cap: i64, elem_dr
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_drop(s: *mut __gost_slice) {
+    // SAFETY: `s` is runtime-owned memory allocated by slice constructors in this runtime.
+    // SAFETY: Element drop callback and element strides are validated by sema/codegen contracts.
     unsafe {
         if s.is_null() { return; }
         if let Some(drop_fn) = (*s).elem_drop {
@@ -7900,16 +8042,19 @@ pub extern "C" fn __gost_slice_drop(s: *mut __gost_slice) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_len(s: *mut __gost_slice) -> i64 {
+    // SAFETY: Null is treated as empty; non-null pointer is expected to be a valid runtime slice header.
     unsafe { if s.is_null() { 0 } else { (*s).len } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_data(s: *mut __gost_slice) -> *mut c_void {
+    // SAFETY: Null is treated as empty; non-null pointer is expected to be a valid runtime slice header.
     unsafe { if s.is_null() { ptr::null_mut() } else { (*s).data as *mut c_void } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_bounds_check(s: *mut __gost_slice, i: i64) {
+    // SAFETY: Reads only slice metadata; panic path prevents out-of-bounds pointer arithmetic downstream.
     unsafe {
         if s.is_null() || i < 0 || i >= (*s).len {
             __gost_panic(b"slice index out of bounds\0".as_ptr(), 25);
@@ -7919,6 +8064,8 @@ pub extern "C" fn __gost_slice_bounds_check(s: *mut __gost_slice, i: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_push(s: *mut __gost_slice, elem_bytes: *const c_void) {
+    // SAFETY: Caller passes a valid runtime slice header and element bytes for `elem_size`.
+    // SAFETY: Reallocation preserves previous initialized prefix before length increment.
     unsafe {
         if s.is_null() { __gost_panic(b"slice is null\0".as_ptr(), 13); }
         if (*s).len == (*s).cap {
@@ -7926,7 +8073,7 @@ pub extern "C" fn __gost_slice_push(s: *mut __gost_slice, elem_bytes: *const c_v
             let total = (*s).elem_size * new_cap as usize;
             let new_data = __gost_alloc(total, 1) as *mut u8;
             if !(*s).data.is_null() && (*s).elem_size > 0 && (*s).len > 0 {
-                // Use memmove semantics to tolerate allocator-level aliasing edge cases.
+                // SAFETY: Use memmove semantics (`ptr::copy`) to tolerate overlap/aliasing edges.
                 ptr::copy((*s).data, new_data, (*s).elem_size * (*s).len as usize);
             }
             if !(*s).data.is_null() { __gost_free((*s).data as *mut c_void, 0, 1); }
@@ -7945,6 +8092,7 @@ pub extern "C" fn __gost_slice_push(s: *mut __gost_slice, elem_bytes: *const c_v
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_slice_pop(s: *mut __gost_slice, out_elem_bytes: *mut c_void) -> i32 {
+    // SAFETY: Pop updates len before exposing element bytes, preserving initialized-prefix invariant.
     unsafe {
         if s.is_null() || (*s).len == 0 { return 1; }
         (*s).len -= 1;
@@ -7957,6 +8105,8 @@ pub extern "C" fn __gost_slice_pop(s: *mut __gost_slice, out_elem_bytes: *mut c_
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_new(payload_size: usize, drop_payload: Option<extern "C" fn(*mut c_void)>, payload_bytes: *const c_void) -> *mut __gost_shared {
+    // SAFETY: Shared object layout is runtime-internal; payload copy size is guarded by payload_size.
+    // SAFETY: `drop_payload` is invoked only when strong count reaches zero.
     unsafe {
         let total = mem::size_of::<__gost_shared>() + if payload_size > 0 { payload_size } else { 1 };
         let s = __gost_alloc(total, 1) as *mut __gost_shared;
@@ -7972,11 +8122,14 @@ pub extern "C" fn __gost_shared_new(payload_size: usize, drop_payload: Option<ex
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_inc(s: *mut __gost_shared) {
+    // SAFETY: Null is ignored; non-null pointer is a runtime-managed shared header with atomic counters.
     unsafe { if !s.is_null() { (*s).strong.fetch_add(1, Ordering::Relaxed); } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_dec(s: *mut __gost_shared) {
+    // SAFETY: Strong-count decrement owns final-drop path when transition `1 -> 0` is observed.
+    // SAFETY: Payload drop executes at most once before weak finalization frees header memory.
     unsafe {
         if s.is_null() { return; }
         if (*s).strong.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -7988,16 +8141,20 @@ pub extern "C" fn __gost_shared_dec(s: *mut __gost_shared) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_get_ptr(s: *mut __gost_shared) -> *mut c_void {
+    // SAFETY: Null is propagated; otherwise payload is embedded inside shared header allocation.
     unsafe { if s.is_null() { ptr::null_mut() } else { (*s).payload.as_mut_ptr() as *mut c_void } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_is_unique(s: *mut __gost_shared) -> i32 {
+    // SAFETY: Relaxed load is sufficient for advisory uniqueness check used by language runtime fast paths.
     unsafe { if s.is_null() { 0 } else { if (*s).strong.load(Ordering::Relaxed) == 1 { 1 } else { 0 } } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_shared_take_unique(s: *mut __gost_shared, out_payload: *mut c_void, payload_size: usize) -> i32 {
+    // SAFETY: Unique-take is allowed only when strong count is exactly one (Acquire check).
+    // SAFETY: Payload copy uses caller-provided destination size contract from codegen.
     unsafe {
         if s.is_null() {
             return 1;
@@ -8015,6 +8172,7 @@ pub extern "C" fn __gost_shared_take_unique(s: *mut __gost_shared, out_payload: 
 }
 
 unsafe fn __gost_shared_weak_dec_inner(s: *mut __gost_shared) {
+    // SAFETY: Final weak-release owns deallocation; header is freed only on `weak` transition `1 -> 0`.
     if s.is_null() { return; }
     if (*s).weak.fetch_sub(1, Ordering::AcqRel) == 1 {
         __gost_free(s as *mut c_void, 0, 1);
@@ -8023,6 +8181,7 @@ unsafe fn __gost_shared_weak_dec_inner(s: *mut __gost_shared) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_weak_new(s: *mut __gost_shared) -> *mut __gost_weak {
+    // SAFETY: Weak wrapper stores non-owning pointer while incrementing shared `weak` count first.
     unsafe {
         if s.is_null() { return ptr::null_mut(); }
         (*s).weak.fetch_add(1, Ordering::Relaxed);
@@ -8034,6 +8193,8 @@ pub extern "C" fn __gost_weak_new(s: *mut __gost_shared) -> *mut __gost_weak {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_weak_upgrade(w: *mut __gost_weak) -> *mut __gost_shared {
+    // SAFETY: CAS loop prevents resurrecting objects with zero strong count.
+    // SAFETY: Returned pointer has one newly acquired strong ref on success.
     unsafe {
         if w.is_null() { return ptr::null_mut(); }
         let s = (*w).inner;
@@ -8056,6 +8217,7 @@ pub extern "C" fn __gost_weak_upgrade(w: *mut __gost_weak) -> *mut __gost_shared
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_weak_dec(w: *mut __gost_weak) {
+    // SAFETY: Weak wrapper is runtime-owned allocation; dropping it always balances one weak reference.
     unsafe {
         if w.is_null() { return; }
         let s = (*w).inner;
@@ -8067,7 +8229,8 @@ pub extern "C" fn __gost_weak_dec(w: *mut __gost_weak) {
 }
 
 unsafe fn map_hash_bytes(ptr: *const u8, len: usize) -> u64 {
-    // 64-bit FNV-1a
+    // PERF: 64-bit FNV-1a is a low-overhead hash for map bytewise key paths.
+    // SAFETY: Caller guarantees `ptr..ptr+len` is a readable byte range.
     let mut h: u64 = 1469598103934665603;
     let mut i = 0usize;
     while i < len {
@@ -8080,6 +8243,7 @@ unsafe fn map_hash_bytes(ptr: *const u8, len: usize) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_hash_bytes(ptr: *const u8, len: i64) -> u64 {
+    // SAFETY: Null/empty is handled early; non-empty path forwards validated readable range to hasher.
     unsafe {
         if len <= 0 || ptr.is_null() {
             return 0;
@@ -8090,6 +8254,7 @@ pub extern "C" fn __gost_map_hash_bytes(ptr: *const u8, len: i64) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_eq_bytes(a: *const u8, b: *const u8, len: i64) -> i32 {
+    // SAFETY: Null/len guards ensure `memcmp` observes a valid byte range on both inputs.
     unsafe {
         if len <= 0 {
             return 1;
@@ -8294,6 +8459,7 @@ unsafe fn map_find_slot(
     if cap == 0 {
         return (0, false);
     }
+    // PERF: Linear probing keeps probe walk cache-friendly and avoids pointer chasing.
     let mut idx = (key_hash as usize) % cap;
     let mut first_tombstone: Option<usize> = None;
     for _ in 0..cap {
@@ -8429,6 +8595,7 @@ unsafe fn map_resize(m: *mut __gost_map, mut new_cap: i64) {
 
     (*m).entries = new_entries;
     (*m).cap = new_cap;
+    // INVALIDATION: Tombstones are dropped on resize; subsequent lookups must probe new table only.
     (*m).tombstones = 0;
 
     if old_entries.is_null() || old_cap == 0 {
@@ -8468,6 +8635,7 @@ pub extern "C" fn __gost_map_new(
     key_clone: Option<gost_map_key_clone>,
     key_drop: Option<gost_map_key_drop>,
 ) -> *mut __gost_map {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         let mut cap = cap;
         if cap < 0 { cap = 0; }
@@ -8491,6 +8659,7 @@ pub extern "C" fn __gost_map_new(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_get(m: *mut __gost_map, key_bytes: *const c_void, out_val_bytes: *mut c_void) -> i32 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         if m.is_null() { return 0; }
         if (*m).cap <= 0 || (*m).entries.is_null() {
@@ -8511,6 +8680,7 @@ pub extern "C" fn __gost_map_get(m: *mut __gost_map, key_bytes: *const c_void, o
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_set(m: *mut __gost_map, key_bytes: *const c_void, val_bytes: *const c_void) {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         if m.is_null() { return; }
         if (*m).cap <= 0 || (*m).entries.is_null() {
@@ -8552,6 +8722,7 @@ pub extern "C" fn __gost_map_set(m: *mut __gost_map, key_bytes: *const c_void, v
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_del(m: *mut __gost_map, key_bytes: *const c_void) -> i32 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         if m.is_null() { return 0; }
         if (*m).cap <= 0 || (*m).entries.is_null() {
@@ -8573,6 +8744,7 @@ pub extern "C" fn __gost_map_del(m: *mut __gost_map, key_bytes: *const c_void) -
         (*m).len -= 1;
         (*m).tombstones += 1;
         if (*m).tombstones * 4 > (*m).cap {
+            // INVALIDATION: Rehash into same capacity compacts tombstones to recover probe performance.
             map_resize(m, (*m).cap);
         }
         1
@@ -8581,11 +8753,13 @@ pub extern "C" fn __gost_map_del(m: *mut __gost_map, key_bytes: *const c_void) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_len(m: *mut __gost_map) -> i64 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe { if m.is_null() { 0 } else { (*m).len } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_next_slot(m: *mut __gost_map, prev_slot: i64) -> i64 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe { map_next_used_slot(m, prev_slot) }
 }
 
@@ -8595,6 +8769,7 @@ pub extern "C" fn __gost_map_slot_key(
     slot: i64,
     out_key_bytes: *mut c_void,
 ) -> i32 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         let entry = map_entry_ptr_at_slot(m, slot);
         map_write_entry_key_to_out(m, entry, out_key_bytes)
@@ -8607,6 +8782,7 @@ pub extern "C" fn __gost_map_slot_val(
     slot: i64,
     out_val_bytes: *mut c_void,
 ) -> i32 {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         if m.is_null() || out_val_bytes.is_null() {
             return 0;
@@ -8627,6 +8803,7 @@ pub extern "C" fn __gost_map_slot_val(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_map_drop(m: *mut __gost_map) {
+    // SAFETY: Map headers/slots are runtime-owned; key/value reads and writes obey stored size and occupancy metadata.
     unsafe {
         if m.is_null() { return; }
         for i in 0..(*m).cap {
@@ -8648,6 +8825,7 @@ pub extern "C" fn __gost_map_drop(m: *mut __gost_map) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __gost_after_ms(ms: i64) -> *mut __gost_chan {
+    // SAFETY: Timer payload is stack-local and wakeup uses runtime channel APIs that validate destination handles.
     unsafe {
         __gost_rt_init();
         let ch = __gost_chan_new(0, 1);

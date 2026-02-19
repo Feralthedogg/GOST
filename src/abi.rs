@@ -1,3 +1,8 @@
+// Purpose: Define supported external ABI names and normalization helpers.
+// Inputs/Outputs: Maps user ABI strings to canonical forms and validation checks.
+// Invariants: Accepted ABI set must match sema/codegen/runtime calling-convention handling.
+// Gotchas: Expanding ABI support requires coordinated backend and runtime updates.
+
 pub const EXTERN_ABI_C: &str = "c";
 pub const EXTERN_ABI_SYSTEM: &str = "system";
 pub const EXTERN_ABI_STDCALL: &str = "stdcall";

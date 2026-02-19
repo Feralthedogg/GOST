@@ -1,3 +1,8 @@
+// Purpose: Resolve imports/modules against workspace, lockfile, cache, and VCS sources.
+// Inputs/Outputs: Produces resolution context and materialized dependency mappings.
+// Invariants: Resolution honors mod mode and offline policy without hidden network side effects.
+// Gotchas: Path/module precedence is subtle; keep std/local/external ordering stable.
+
 use anyhow::{Context, bail};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -238,6 +243,9 @@ pub fn load_ctx(
     })
 }
 
+// Precondition: `entry` points to a path inside (or near) a potential Gost workspace.
+// Postcondition: Returns `Some(ctx)` only when a project root with module files is discoverable.
+// Side effects: May read mod/lock/cache files and optionally trigger fetch/checkouts per policy.
 pub fn try_load_ctx_from_entry(
     entry: PathBuf,
     mode: ModMode,

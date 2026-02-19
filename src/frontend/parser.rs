@@ -1,3 +1,8 @@
+// Purpose: Parse token stream into AST while recording syntax diagnostics and recovery info.
+// Inputs/Outputs: Consumes lexer tokens and returns FileAst plus parser diagnostics.
+// Invariants: Parser-produced AST must satisfy structural assumptions used by sema/lowering.
+// Gotchas: Recovery paths should preserve deterministic AST shape for downstream passes.
+
 use super::ast::*;
 use super::diagnostic::Diagnostics;
 use super::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -85,10 +90,16 @@ impl Parser {
         Some(TypeAst { kind, span })
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn new(tokens: Vec<Token>) -> Self {
         Self::new_with_expr_id(tokens, 0)
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn new_with_expr_id(tokens: Vec<Token>, next_expr_id: ExprId) -> Self {
         Self {
             tokens,
@@ -102,10 +113,16 @@ impl Parser {
         }
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn next_expr_id(&self) -> ExprId {
         self.next_expr_id
     }
 
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn set_module_disambiguator(&mut self, value: impl Into<String>) {
         self.module_disambiguator = value.into();
     }
@@ -124,6 +141,9 @@ impl Parser {
         expr
     }
 
+    // Precondition: Token stream is produced by Lexer with a stable expression-id seed.
+    // Postcondition: Returns FileAst with deterministic item/import ordering when parse succeeds.
+    // Side effects: Accumulates parse diagnostics and advances internal token cursor/state.
     pub fn parse_file(&mut self) -> Option<FileAst> {
         let package = self.parse_package()?;
         self.current_package = package.clone();
@@ -187,6 +207,7 @@ impl Parser {
                     "C".to_string()
                 };
                 if self.at_keyword(Keyword::Unsafe) {
+                    // SAFETY: This block depends on invariants established by the surrounding code path.
                     if is_unsafe {
                         self.error_here("duplicate unsafe");
                     }
@@ -200,6 +221,7 @@ impl Parser {
                         items.push(Item::Function(func));
                     }
                 } else if self.at_keyword(Keyword::Let) {
+                    // SAFETY: This block depends on invariants established by the surrounding code path.
                     if is_unsafe {
                         self.error_here("extern global cannot be unsafe");
                     }

@@ -1,3 +1,8 @@
+// Purpose: Scan source trees to collect import declarations for module workflows.
+// Inputs/Outputs: Consumes file paths/source text and returns normalized import paths.
+// Invariants: Scanner must be conservative and avoid false negatives for dependency analysis.
+// Gotchas: Parsing shortcuts must stay aligned with supported import syntax variants.
+
 use regex::Regex;
 use std::collections::HashSet;
 use std::fs;

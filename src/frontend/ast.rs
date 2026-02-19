@@ -1,3 +1,8 @@
+// Purpose: Define frontend AST node structures shared by parser, sema, and lowering.
+// Inputs/Outputs: Represents parsed source syntax with spans, ids, and type-ast forms.
+// Invariants: AST shape is parser-owned and must remain compatible with sema/lowering expectations.
+// Gotchas: Structural changes require synchronized updates across parser, sema, MIR, and tests.
+
 #[derive(Clone, Debug)]
 pub struct Span {
     pub start: usize,
@@ -20,6 +25,9 @@ pub enum Visibility {
 }
 
 impl Visibility {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn is_public(self) -> bool {
         matches!(self, Visibility::Public)
     }
@@ -180,6 +188,9 @@ pub struct LayoutAttr {
 }
 
 impl LayoutAttr {
+    // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
+    // Postcondition: Returns a value/state transition that preserves module invariants.
+    // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
     pub fn has_any(&self) -> bool {
         self.repr_c
             || self.repr_transparent

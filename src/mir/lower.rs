@@ -3,6 +3,11 @@ use crate::frontend::ast::{
 };
 use std::collections::{HashMap, HashSet};
 
+// Purpose: Lower sema-validated program AST into backend-consumable MIR.
+// Inputs/Outputs: Consumes Program and returns MirModule with per-function CFG bodies.
+// Invariants: Lowering must preserve typed semantics and emit only MIR primitives backend supports.
+// Gotchas: Control-flow rewrites (`select`, `for`, `?`) synthesize locals/blocks and labels.
+
 use super::{
     BasicBlock, CleanupItem, Local, LocalId, MirFunction, MirModule, MirStmt, ScopeFrame, ScopeId,
     Terminator,
@@ -12,6 +17,8 @@ use crate::frontend::symbols::logical_method_name;
 use crate::sema::types::{BuiltinType, Type, TypeClass, TypeDefKind, TypeDefs};
 use crate::sema::{FunctionSig, Program};
 
+// Precondition: Program has passed semantic analysis and type validation.
+// Postcondition: Returned MIR is structurally valid for MIR passes and codegen.
 pub fn lower_program(program: &Program) -> Result<MirModule, String> {
     let mut module = MirModule::default();
     let mut next_expr_id = max_expr_id(&program.file) + 1;
