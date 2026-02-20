@@ -6,6 +6,7 @@ export default defineConfig({
   title: 'Gost',
   description: 'Official documentation for the Gost language, compiler, runtime, and tooling',
   base,
+  appearance: 'force-dark',
   cleanUrls: true,
   lastUpdated: true,
   markdown: {
@@ -15,6 +16,7 @@ export default defineConfig({
   },
   themeConfig: {
     logo: '/logo.png',
+    siteTitle: false,
     nav: [
       { text: 'Home', link: '/' },
       { text: 'Getting Started', link: '/getting-started' },
