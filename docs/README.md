@@ -8,7 +8,6 @@ The goal is to keep docs aligned with the current compiler/runtime behavior in t
 - [Getting Started](getting-started.md)
 - [Gost by Example](gost-by-example.md)
 - [CLI Reference](cli-reference.md)
-- [Editor Setup](editor-setup.md)
 - [Language Guide](language-guide.md)
 - [Language Reference](language-reference.md)
 - [Intrinsics Reference](intrinsics-reference.md)

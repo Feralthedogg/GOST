@@ -300,10 +300,7 @@ pub fn load_ctx(
                     selected_req.insert(req.module.clone(), merged.clone());
                     resolved.remove(&req.module);
                 }
-                req.version = selected_req
-                    .get(&req.module)
-                    .cloned()
-                    .unwrap_or(merged);
+                req.version = selected_req.get(&req.module).cloned().unwrap_or(merged);
             } else {
                 selected_req.insert(req.module.clone(), req.version.clone());
             }

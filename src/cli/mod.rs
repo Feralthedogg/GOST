@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::incremental::{self, trace as inc_trace};
 use crate::pkg::resolve::ModMode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -931,13 +932,13 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
     let runtime_dir = manifest_dir.join("runtime");
     let cc = resolve_cc();
     ensure_native_compiler(&cc)?;
-    let rt_lib = build_runtime(&runtime_dir, &cc, opt_level)?;
+    let rt_lib = build_runtime(input_path, &runtime_dir, &cc, opt_level)?;
     let obj_path = input_path.with_extension("o");
     let exe_path = input_path.with_extension(if cfg!(windows) { "exe" } else { "" });
     if exe_path.exists() {
         let _ = std::fs::remove_file(&exe_path);
     }
-    compile_ll_to_obj(&cc, ll_path, &obj_path, opt_level)?;
+    compile_ll_to_obj(input_path, &cc, ll_path, &obj_path, opt_level)?;
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -988,21 +989,63 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
     }
     link_args.push("-o".into());
     link_args.push(exe_path.display().to_string());
-    run_cmd(&cc, &link_args)?;
+    let mut link_key_material = String::new();
+    link_key_material.push_str("gost-link-cache-v1\0");
+    link_key_material.push_str(&cc);
+    link_key_material.push('\0');
+    link_key_material.push_str(&tool_identity(&cc, &["--version"]));
+    link_key_material.push('\0');
+    link_key_material
+        .push_str(&incremental::hash_file_sha256(&obj_path).map_err(|e| e.to_string())?);
+    link_key_material.push('\0');
+    link_key_material.push_str(&incremental::hash_file_sha256(&rt_lib).map_err(|e| e.to_string())?);
+    link_key_material.push('\0');
+    for arg in &link_args {
+        link_key_material.push_str(arg);
+        link_key_material.push('\0');
+    }
+    let link_key = incremental::hash_bytes_sha256(link_key_material.as_bytes());
+    let bin_cache =
+        incremental::ensure_cache_namespace(input_path, "bin").map_err(|e| e.to_string())?;
+    let cached_exe = cache_path_with_template_ext(&bin_cache, &link_key, &exe_path);
+    if cached_exe.exists() {
+        std::fs::copy(&cached_exe, &exe_path).map_err(|e| {
+            format!(
+                "failed to restore linked executable from cache {} -> {}: {}",
+                cached_exe.display(),
+                exe_path.display(),
+                e
+            )
+        })?;
+        inc_trace(&format!("link cache hit: {}", cached_exe.display()));
+    } else {
+        run_cmd(&cc, &link_args)?;
+        if let Some(parent) = cached_exe.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&exe_path, &cached_exe);
+        inc_trace(&format!("link cache store: {}", cached_exe.display()));
+    }
     let exe_cmd = exe_path.canonicalize().unwrap_or_else(|_| exe_path.clone());
     run_cmd(exe_cmd.to_string_lossy().as_ref(), &[])?;
     Ok(())
 }
 
-fn build_runtime(runtime_dir: &Path, cc: &str, opt_level: OptLevel) -> Result<PathBuf, String> {
+fn build_runtime(
+    entry_path: &Path,
+    runtime_dir: &Path,
+    cc: &str,
+    opt_level: OptLevel,
+) -> Result<PathBuf, String> {
     let cargo_toml = runtime_dir.join("Cargo.toml");
     if !cargo_toml.exists() {
         return Err("runtime/Cargo.toml not found; Rust runtime required".to_string());
     }
-    build_runtime_rust(runtime_dir, cc, opt_level)
+    build_runtime_rust(entry_path, runtime_dir, cc, opt_level)
 }
 
 fn build_runtime_rust(
+    entry_path: &Path,
     runtime_dir: &Path,
     cc: &str,
     opt_level: OptLevel,
@@ -1018,6 +1061,22 @@ fn build_runtime_rust(
     } else {
         rustc_host_triple()
     };
+    let lib_name = if target.as_deref().unwrap_or("").contains("msvc") {
+        "gostrt.lib"
+    } else {
+        "libgostrt.a"
+    };
+    let profile = if release { "release" } else { "debug" };
+    let runtime_cache_key =
+        runtime_cache_key(runtime_dir, cc, opt_level, target.as_deref(), native)?;
+    let runtime_cache_root =
+        incremental::ensure_cache_namespace(entry_path, "runtime").map_err(|e| e.to_string())?;
+    let runtime_cached = runtime_cache_root.join(&runtime_cache_key).join(lib_name);
+    if runtime_cached.exists() {
+        inc_trace(&format!("runtime cache hit: {}", runtime_cached.display()));
+        return Ok(runtime_cached);
+    }
+
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("--manifest-path")
@@ -1059,12 +1118,7 @@ fn build_runtime_rust(
     if !status.success() {
         return Err("failed to build Rust runtime (is target installed?)".to_string());
     }
-    let lib_name = if target.as_deref().unwrap_or("").contains("msvc") {
-        "gostrt.lib"
-    } else {
-        "libgostrt.a"
-    };
-    let profile = if release { "release" } else { "debug" };
+
     let lib_path = if let Some(target) = target {
         runtime_dir
             .join("target")
@@ -1080,7 +1134,27 @@ fn build_runtime_rust(
             lib_path.display()
         ));
     }
-    Ok(lib_path)
+    if let Some(parent) = runtime_cached.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create runtime cache directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    std::fs::copy(&lib_path, &runtime_cached).map_err(|e| {
+        format!(
+            "failed to write runtime cache {}: {}",
+            runtime_cached.display(),
+            e
+        )
+    })?;
+    inc_trace(&format!(
+        "runtime cache store: {}",
+        runtime_cached.display()
+    ));
+    Ok(runtime_cached)
 }
 
 fn resolve_cc() -> String {
@@ -1122,6 +1196,7 @@ fn compiler_target(cc: &str) -> Option<String> {
 }
 
 fn compile_ll_to_obj(
+    entry_path: &Path,
     cc: &str,
     ll_path: &Path,
     obj_path: &Path,
@@ -1130,6 +1205,45 @@ fn compile_ll_to_obj(
     let native = std::env::var("GOST_NATIVE")
         .map(|v| v != "0")
         .unwrap_or(true);
+    let mut key_material = String::new();
+    key_material.push_str("gost-obj-cache-v1\0");
+    key_material.push_str(&incremental::hash_file_sha256(ll_path).map_err(|e| e.to_string())?);
+    key_material.push('\0');
+    key_material.push_str(cc);
+    key_material.push('\0');
+    key_material.push_str(&tool_identity(cc, &["--version"]));
+    key_material.push('\0');
+    key_material.push_str(&opt_level.as_digit().to_string());
+    key_material.push('\0');
+    key_material.push_str(if native { "native=1" } else { "native=0" });
+    key_material.push('\0');
+    if !is_clang(cc) {
+        let llc = resolve_llc();
+        key_material.push_str(&llc);
+        key_material.push('\0');
+        key_material.push_str(&tool_identity(&llc, &["--version"]));
+        key_material.push('\0');
+        if let Some(triple) = compiler_triple(cc) {
+            key_material.push_str(&triple);
+            key_material.push('\0');
+        }
+    }
+    let key = incremental::hash_bytes_sha256(key_material.as_bytes());
+    let obj_cache =
+        incremental::ensure_cache_namespace(entry_path, "obj").map_err(|e| e.to_string())?;
+    let cached_obj = obj_cache.join(format!("{}.o", key));
+    if cached_obj.exists() {
+        std::fs::copy(&cached_obj, obj_path).map_err(|e| {
+            format!(
+                "failed to restore object from cache {} -> {}: {}",
+                cached_obj.display(),
+                obj_path.display(),
+                e
+            )
+        })?;
+        inc_trace(&format!("obj cache hit: {}", cached_obj.display()));
+        return Ok(());
+    }
     if is_clang(cc) {
         let mut args = vec![
             "-c".into(),
@@ -1145,27 +1259,136 @@ fn compile_ll_to_obj(
         if opt_level.is_optimized() && native {
             args.push("-march=native".into());
         }
-        return run_cmd(cc, &args);
+        run_cmd(cc, &args)?;
+    } else {
+        let llc = resolve_llc();
+        if !command_exists(&llc) {
+            return Err("llc not found; install LLVM or set GOST_LLC".to_string());
+        }
+        let mut args = vec![
+            "-filetype=obj".into(),
+            "-o".into(),
+            obj_path.display().to_string(),
+        ];
+        args.push(opt_level.llc_flag());
+        if opt_level.is_optimized() && native {
+            args.push("-mcpu=native".into());
+        }
+        if let Some(triple) = compiler_triple(cc) {
+            args.push("-mtriple".into());
+            args.push(triple);
+        }
+        args.push(ll_path.display().to_string());
+        run_cmd(&llc, &args)?;
     }
-    let llc = resolve_llc();
-    if !command_exists(&llc) {
-        return Err("llc not found; install LLVM or set GOST_LLC".to_string());
+    let _ = std::fs::copy(obj_path, &cached_obj);
+    inc_trace(&format!("obj cache store: {}", cached_obj.display()));
+    Ok(())
+}
+
+fn cache_path_with_template_ext(cache_dir: &Path, key: &str, template: &Path) -> PathBuf {
+    if let Some(ext) = template.extension().and_then(|s| s.to_str())
+        && !ext.is_empty()
+    {
+        return cache_dir.join(format!("{}.{}", key, ext));
     }
-    let mut args = vec![
-        "-filetype=obj".into(),
-        "-o".into(),
-        obj_path.display().to_string(),
-    ];
-    args.push(opt_level.llc_flag());
-    if opt_level.is_optimized() && native {
-        args.push("-mcpu=native".into());
+    cache_dir.join(key)
+}
+
+fn runtime_cache_key(
+    runtime_dir: &Path,
+    cc: &str,
+    opt_level: OptLevel,
+    target: Option<&str>,
+    native: bool,
+) -> Result<String, String> {
+    let mut files = collect_runtime_input_files(runtime_dir)?;
+    files.sort();
+    let mut material = String::new();
+    material.push_str("gost-runtime-cache-v1\0");
+    material.push_str(cc);
+    material.push('\0');
+    material.push_str(&tool_identity(cc, &["--version"]));
+    material.push('\0');
+    material.push_str(&opt_level.as_digit().to_string());
+    material.push('\0');
+    material.push_str(target.unwrap_or(""));
+    material.push('\0');
+    material.push_str(if native { "native=1" } else { "native=0" });
+    material.push('\0');
+    material.push_str(
+        if std::env::var("GOST_STATS").ok().as_deref() == Some("1") {
+            "stats=1"
+        } else {
+            "stats=0"
+        },
+    );
+    material.push('\0');
+    for f in files {
+        material.push_str(&f);
+        material.push('\0');
+        let hash = incremental::hash_file_sha256(Path::new(&f)).map_err(|e| e.to_string())?;
+        material.push_str(&hash);
+        material.push('\0');
     }
-    if let Some(triple) = compiler_triple(cc) {
-        args.push("-mtriple".into());
-        args.push(triple);
+    Ok(incremental::hash_bytes_sha256(material.as_bytes()))
+}
+
+fn collect_runtime_input_files(runtime_dir: &Path) -> Result<Vec<String>, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {}", dir.display(), e))?;
+        for ent in entries {
+            let ent = ent.map_err(|e| e.to_string())?;
+            let path = ent.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && matches!(name, "target" | ".git")
+                {
+                    continue;
+                }
+                walk(root, &path, out)?;
+                continue;
+            }
+            if path.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push(root.join(rel.clone()).to_string_lossy().replace('\\', "/"));
+            }
+        }
+        Ok(())
     }
-    args.push(ll_path.display().to_string());
-    run_cmd(&llc, &args)
+
+    let mut out = Vec::new();
+    for fixed in ["Cargo.toml", "Cargo.lock", "build.rs"] {
+        let p = runtime_dir.join(fixed);
+        if p.exists() && p.is_file() {
+            out.push(p.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    let src = runtime_dir.join("src");
+    if src.exists() {
+        walk(runtime_dir, &src, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn tool_identity(tool: &str, args: &[&str]) -> String {
+    let mut cmd = Command::new(tool);
+    cmd.args(args);
+    match cmd.output() {
+        Ok(out) => {
+            let mut sig = String::new();
+            sig.push_str(&format!("status={};", out.status));
+            sig.push_str(&String::from_utf8_lossy(&out.stdout));
+            sig.push_str(&String::from_utf8_lossy(&out.stderr));
+            sig
+        }
+        Err(_) => format!("{}:<unavailable>", tool),
+    }
 }
 
 fn resolve_llc() -> String {

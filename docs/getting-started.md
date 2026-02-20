@@ -77,6 +77,7 @@ Default optimization level is `O3`.
 - `GOST_CACHE_DIR`: module cache root override
 - `GOST_PROXY`: module proxy base URL (example: `https://proxy.gost-lang.org`)
 - `GOST_PKG_JOBS`: max parallel dependency materialization workers (default: CPU count)
+- `GOST_INCREMENTAL_TRACE`: set to `1` to print incremental cache hit/miss logs
 
 ## Windows Toolchain Helper
 

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod codegen;
 pub mod compile;
 pub mod frontend;
+pub mod incremental;
 pub mod intrinsics;
 pub mod mir;
 pub mod pkg;

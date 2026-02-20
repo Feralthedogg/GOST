@@ -22,6 +22,7 @@ use crate::frontend::diagnostic::{
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
 use crate::frontend::symbols::{is_impl_mangled, logical_method_name, mangle_impl_method};
+use crate::incremental::{BuildCtx, ENTRY_PACKAGE, trace as inc_trace, try_load_cached_llvm_fast};
 use crate::pkg::resolve::{self, ModMode};
 use crate::sema::analyze;
 
@@ -34,20 +35,32 @@ pub fn compile_to_llvm(
     offline: bool,
     want_fetch: bool,
 ) -> Result<String, String> {
+    match try_load_cached_llvm_fast(path, mode, offline, want_fetch) {
+        Ok(Some(cached)) => {
+            inc_trace("compile_to_llvm: served from incremental fast-path LLVM cache");
+            return Ok(cached);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            inc_trace(&format!(
+                "compile_to_llvm: fast-path cache probe failed, fallback to parse: {}",
+                err
+            ));
+        }
+    }
     let source = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut next_expr_id = 0;
     let (file, next_after_main) = parse_source_with_ids(&source, next_expr_id, Some(path))
         .map_err(|e| format!("{}:\n{}", path.display(), e))?;
     next_expr_id = next_after_main;
+    let mut build_ctx = BuildCtx::new(path, mode, offline, want_fetch);
+    build_ctx.record_source_file(ENTRY_PACKAGE, path, &source, &file);
     let mut imported_items = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut std_funcs = std::collections::HashSet::new();
-    let cwd = path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    match resolve::try_load_ctx_from_entry(cwd, mode, offline, want_fetch) {
+    match resolve::try_load_ctx_from_entry(path.to_path_buf(), mode, offline, want_fetch) {
         Ok(Some(ctx)) => {
+            inc_trace("compile_to_llvm: module-aware import resolver enabled");
             load_imports_mod(
                 &ctx,
                 &file.imports,
@@ -55,9 +68,13 @@ pub fn compile_to_llvm(
                 &mut imported_items,
                 &mut visited,
                 &mut std_funcs,
+                &mut build_ctx,
             )?;
         }
         Ok(None) => {
+            inc_trace(
+                "compile_to_llvm: module resolver unavailable, using legacy import resolution",
+            );
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             load_imports(
                 &manifest_dir,
@@ -66,9 +83,11 @@ pub fn compile_to_llvm(
                 &mut imported_items,
                 &mut visited,
                 &mut std_funcs,
+                &mut build_ctx,
             )?;
         }
         Err(err) => {
+            inc_trace(&format!("compile_to_llvm: module resolver error: {}", err));
             let mut diags = Diagnostics::default();
             let d = Diagnostic::new(format!("{err}"), None).code("E2000");
             diags.push_diag(d);
@@ -80,6 +99,19 @@ pub fn compile_to_llvm(
             if let Item::Function(func) = item {
                 std_funcs.insert(func.name.clone());
             }
+        }
+    }
+    match build_ctx.try_load_cached_llvm() {
+        Ok(Some(cached)) => {
+            inc_trace("compile_to_llvm: served from incremental LLVM cache");
+            return Ok(cached);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            inc_trace(&format!(
+                "compile_to_llvm: cache lookup failed, fallback to full compile: {}",
+                err
+            ));
         }
     }
     let mut items = imported_items;
@@ -113,6 +145,12 @@ pub fn compile_to_llvm(
             }
         }
     })?;
+    if let Err(err) = build_ctx.store_cached_llvm(&module.text) {
+        inc_trace(&format!(
+            "compile_to_llvm: cache store failed (ignored): {}",
+            err
+        ));
+    }
     Ok(module.text)
 }
 
@@ -155,6 +193,7 @@ fn load_imports(
     items: &mut Vec<Item>,
     visited: &mut std::collections::HashSet<String>,
     std_funcs: &mut std::collections::HashSet<String>,
+    build_ctx: &mut BuildCtx,
 ) -> Result<(), String> {
     // Precondition: `visited` is shared across the import walk to break cycles deterministically.
     // Postcondition: `items` receives imported declarations in a stable traversal order.
@@ -178,6 +217,7 @@ fn load_imports(
                 ));
             }
             *next_expr_id = next;
+            build_ctx.record_source_file(&import.path, &path, &source, &file);
             let mut imported_items = file.items.clone();
             let nested_imports = file.imports.clone();
             if import.only.is_some() {
@@ -201,6 +241,7 @@ fn load_imports(
                 items,
                 visited,
                 std_funcs,
+                build_ctx,
             )?;
         }
     }
@@ -214,6 +255,7 @@ fn load_imports_mod(
     items: &mut Vec<Item>,
     visited: &mut std::collections::HashSet<String>,
     std_funcs: &mut std::collections::HashSet<String>,
+    build_ctx: &mut BuildCtx,
 ) -> Result<(), String> {
     // Precondition: `ctx` was created from module resolution policy for this compile invocation.
     // Postcondition: Imported module files are merged with the same wrapper/alias rules as legacy path.
@@ -238,6 +280,7 @@ fn load_imports_mod(
                 ));
             }
             *next_expr_id = next;
+            build_ctx.record_source_file(&import.path, &path, &source, &file);
             let mut imported_items = file.items.clone();
             if import.only.is_some() {
                 imported_items.retain(|item| import_item_allowed(item, import));
@@ -261,6 +304,7 @@ fn load_imports_mod(
                 items,
                 visited,
                 std_funcs,
+                build_ctx,
             )?;
         }
     }
