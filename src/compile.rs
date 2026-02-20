@@ -6064,6 +6064,44 @@ fn main() -> i32 {
     }
 
     #[test]
+    fn invalid_prefixed_integer_suffix_is_rejected() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let x = 0b102
+    return x
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("invalid binary digit should fail at lexing boundary");
+        assert!(
+            err.contains("invalid integer literal: invalid digit or suffix `2` in `0b` literal"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_float_exponent_literal_is_rejected() {
+        let src = r#"
+module main
+
+fn main() -> i32 {
+    let x = 1e+
+    return x
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect_err("invalid exponent literal should fail at lexing boundary");
+        assert!(
+            err.contains("invalid float literal: expected at least one digit after exponent marker"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn unterminated_string_literal_is_reported_at_lexing_boundary() {
         let src = r#"
 module main
@@ -7028,7 +7066,7 @@ fn main() -> i32 {
         let llvm = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect("global let with inferred type and non-const init should compile");
         assert!(
-            llvm.contains("call void @__gost_global_init_user()"),
+            llvm.contains("call void @__gost_fn___gost_global_init_user_"),
             "expected global runtime init call in main path"
         );
     }
@@ -7050,7 +7088,7 @@ fn main() -> i32 {
         let llvm = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect("non-extern variadic function should compile");
         assert!(
-            llvm.contains("define i32 @pick(i32 %arg0, ...)"),
+            llvm.contains("define i32 @__gost_fn_pick_") && llvm.contains("(i32 %arg0, ...)"),
             "expected variadic user function definition"
         );
     }

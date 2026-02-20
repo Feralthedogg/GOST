@@ -23,6 +23,7 @@ pub enum TokenKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LexErrorKind {
     InvalidIntegerLiteral(String),
+    InvalidFloatLiteral(String),
     UnterminatedStringLiteral,
     UnterminatedCharLiteral,
     EmptyCharLiteral,
@@ -37,6 +38,9 @@ impl LexErrorKind {
         match self {
             Self::InvalidIntegerLiteral(detail) => {
                 format!("invalid integer literal: {detail}")
+            }
+            Self::InvalidFloatLiteral(detail) => {
+                format!("invalid float literal: {detail}")
             }
             Self::UnterminatedStringLiteral => "unterminated string literal".to_string(),
             Self::UnterminatedCharLiteral => "unterminated character literal".to_string(),
@@ -734,7 +738,15 @@ impl<'a> Lexer<'a> {
         }
 
         let exp = self.peek_char();
-        if (exp == 'e' || exp == 'E') && self.has_valid_exponent_tail() {
+        if exp == 'e' || exp == 'E' {
+            if !self.has_valid_exponent_tail() {
+                // Why: `1e`, `1e+`, and similar forms should fail at lexing so users get
+                // precise literal diagnostics instead of parser/type-check cascades.
+                let suffix = self.consume_invalid_exponent_suffix();
+                return Err(LexErrorKind::InvalidFloatLiteral(format!(
+                    "expected at least one digit after exponent marker, found `{suffix}`"
+                )));
+            }
             s.push('e');
             self.advance();
             if self.peek_char() == '+' || self.peek_char() == '-' {
@@ -751,14 +763,17 @@ impl<'a> Lexer<'a> {
         self.advance(); // 0
         self.advance(); // x/o/b
         let mut digits = String::new();
+        let mut trailing_separator = false;
         while self.idx < self.src.len() {
             let ch = self.peek_char();
             if ch == '_' {
+                trailing_separator = true;
                 self.advance();
                 continue;
             }
             if ch.is_digit(radix) {
                 digits.push(ch);
+                trailing_separator = false;
                 self.advance();
                 continue;
             }
@@ -767,6 +782,19 @@ impl<'a> Lexer<'a> {
         if digits.is_empty() {
             return Err(LexErrorKind::InvalidIntegerLiteral(format!(
                 "expected at least one digit after `0{prefix}`"
+            )));
+        }
+        if trailing_separator {
+            return Err(LexErrorKind::InvalidIntegerLiteral(format!(
+                "trailing `_` is not allowed in `0{prefix}` literal"
+            )));
+        }
+        if is_numeric_suffix_char(self.peek_char()) {
+            // Why: Reject invalid radix digits/suffixes at lexing boundary to avoid later
+            // mis-parsing as separate identifiers or decimal fragments.
+            let suffix = self.read_while(is_numeric_suffix_char);
+            return Err(LexErrorKind::InvalidIntegerLiteral(format!(
+                "invalid digit or suffix `{suffix}` in `0{prefix}` literal"
             )));
         }
         u128::from_str_radix(&digits, radix).map_or_else(
@@ -811,6 +839,19 @@ impl<'a> Lexer<'a> {
             ch = next;
         }
         ch.is_ascii_digit()
+    }
+
+    fn consume_invalid_exponent_suffix(&mut self) -> String {
+        let mut suffix = String::new();
+        let marker = self.peek_char();
+        suffix.push(marker);
+        self.advance();
+        if self.peek_char() == '+' || self.peek_char() == '-' {
+            suffix.push(self.peek_char());
+            self.advance();
+        }
+        suffix.push_str(&self.read_while(is_numeric_suffix_char));
+        suffix
     }
 
     fn read_while<F>(&mut self, f: F) -> String
@@ -860,6 +901,10 @@ fn is_ident_start(ch: char) -> bool {
 
 fn is_ident_continue(ch: char) -> bool {
     ch == '_' || is_xid_continue(ch)
+}
+
+fn is_numeric_suffix_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn can_insert_semi_after(kind: &TokenKind) -> bool {
