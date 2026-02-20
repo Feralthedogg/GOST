@@ -9,13 +9,38 @@
   --vp-c-brand-3: #095d54;
   --vp-c-brand-soft: rgba(15, 143, 128, 0.14);
 
-  --vp-c-bg: #f7faf8;
-  --vp-c-bg-alt: #eef5f2;
+  --vp-c-bg: #d9e0dd;
+  --vp-c-bg-alt: #cbd4cf;
+  --vp-c-bg-soft: #bec8c3;
+  --vp-c-bg-elv: #e4ebe7;
+}
+
+.dark {
+  --vp-c-brand-1: #1ab7a4;
+  --vp-c-brand-2: #0f8f80;
+  --vp-c-brand-3: #0b7569;
+  --vp-c-brand-soft: rgba(26, 183, 164, 0.2);
+
+  --vp-c-bg: #0f1513;
+  --vp-c-bg-alt: #0a0f0e;
+  --vp-c-bg-soft: #151e1a;
+  --vp-c-bg-elv: #121915;
+}
+
+.Layout {
+  background:
+    radial-gradient(900px 460px at 92% -12%, rgba(11, 117, 105, 0.16), transparent 64%),
+    radial-gradient(720px 400px at -10% 10%, rgba(255, 125, 74, 0.12), transparent 60%),
+    var(--vp-c-bg);
 }
 
 .VPNavBar {
-  background: linear-gradient(90deg, rgba(238, 245, 242, 0.95), rgba(247, 250, 248, 0.95));
+  background: linear-gradient(90deg, rgba(203, 212, 207, 0.94), rgba(217, 224, 221, 0.94));
   backdrop-filter: blur(8px);
+}
+
+.dark .VPNavBar {
+  background: linear-gradient(90deg, rgba(10, 15, 14, 0.94), rgba(15, 21, 19, 0.94));
 }
 
 .VPHero .name {
@@ -34,13 +59,23 @@
 }
 
 .VPFeature {
-  border: 1px solid rgba(9, 93, 84, 0.12);
-  background: linear-gradient(160deg, rgba(255, 255, 255, 0.92), rgba(238, 245, 242, 0.88));
+  border: 1px solid rgba(9, 93, 84, 0.2);
+  background: linear-gradient(160deg, rgba(243, 248, 245, 0.84), rgba(203, 212, 207, 0.84));
 }
 
 .VPFeature:hover {
   border-color: rgba(15, 143, 128, 0.38);
   box-shadow: 0 16px 34px rgba(9, 93, 84, 0.12);
+}
+
+.dark .VPFeature {
+  border: 1px solid rgba(26, 183, 164, 0.3);
+  background: linear-gradient(160deg, rgba(18, 25, 21, 0.86), rgba(10, 15, 14, 0.86));
+}
+
+.dark .VPFeature:hover {
+  border-color: rgba(26, 183, 164, 0.55);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.4);
 }
 
 .vp-doc a {
