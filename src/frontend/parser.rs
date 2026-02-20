@@ -7,6 +7,7 @@ use super::ast::*;
 use super::diagnostic::Diagnostics;
 use super::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 use super::symbols::{mangle_impl_method, module_symbol_key};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +35,22 @@ pub struct Parser {
     current_package: String,
     module_disambiguator: String,
     impl_trait_records: Vec<ImplTraitRecord>,
+    expr_hash_base_id: ExprId,
+    expr_hash_by_id: Vec<[u8; 32]>,
+    ast_hash_sidecar: Option<AstHashSidecar>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AstHashSidecar {
+    pub interface_hash: [u8; 32],
+    pub expr_hash_by_id: Vec<[u8; 32]>,
+    pub public_item_hashes: Vec<[u8; 32]>,
+}
+
+impl AstHashSidecar {
+    pub fn interface_hash_hex(&self) -> String {
+        hex::encode(self.interface_hash)
+    }
 }
 
 impl Parser {
@@ -110,6 +127,9 @@ impl Parser {
             current_package: String::new(),
             module_disambiguator: String::new(),
             impl_trait_records: Vec::new(),
+            expr_hash_base_id: next_expr_id,
+            expr_hash_by_id: Vec::new(),
+            ast_hash_sidecar: None,
         }
     }
 
@@ -127,8 +147,22 @@ impl Parser {
         self.module_disambiguator = value.into();
     }
 
+    pub fn take_ast_hash_sidecar(&mut self) -> Option<AstHashSidecar> {
+        self.ast_hash_sidecar.take()
+    }
+
     fn new_expr(&mut self, kind: ExprKind, span: Span) -> Expr {
         let id = self.next_expr_id;
+        let expr_hash = hash_expr_kind_for_sidecar(&kind);
+        let sidecar_index = id.saturating_sub(self.expr_hash_base_id);
+        if sidecar_index == self.expr_hash_by_id.len() {
+            self.expr_hash_by_id.push(expr_hash);
+        } else if sidecar_index < self.expr_hash_by_id.len() {
+            self.expr_hash_by_id[sidecar_index] = expr_hash;
+        } else {
+            self.expr_hash_by_id.resize(sidecar_index + 1, [0u8; 32]);
+            self.expr_hash_by_id[sidecar_index] = expr_hash;
+        }
         self.next_expr_id += 1;
         Expr { id, kind, span }
     }
@@ -328,11 +362,17 @@ impl Parser {
         self.synthesize_trait_default_impl_methods(&mut items);
         self.validate_trait_impl_records(&items);
         self.validate_type_param_bounds(&items);
-        Some(FileAst {
+        let file = FileAst {
             package,
             imports,
             items,
-        })
+        };
+        self.ast_hash_sidecar = Some(AstHashSidecar {
+            interface_hash: crate::incremental::sidecar_interface_hash(&file),
+            expr_hash_by_id: self.expr_hash_by_id.clone(),
+            public_item_hashes: crate::incremental::sidecar_public_item_hashes(&file),
+        });
+        Some(file)
     }
 
     fn parse_package(&mut self) -> Option<String> {
@@ -3899,4 +3939,536 @@ fn rewrite_gcc_asm_template(
         i += 1;
     }
     out
+}
+
+fn hash_expr_kind_for_sidecar(kind: &ExprKind) -> [u8; 32] {
+    let mut h = Sha256::new();
+    hash_expr_kind_into(&mut h, kind);
+    let bytes: [u8; 32] = h.finalize().into();
+    bytes
+}
+
+fn hash_expr_kind_into(h: &mut Sha256, kind: &ExprKind) {
+    match kind {
+        ExprKind::Bool(v) => {
+            hash_tag(h, "bool");
+            hash_bool(h, *v);
+        }
+        ExprKind::Int(v) => {
+            hash_tag(h, "int");
+            hash_str(h, v);
+        }
+        ExprKind::Float(v) => {
+            hash_tag(h, "float");
+            if let Ok(parsed) = v.parse::<f64>() {
+                hash_tag(h, "bits");
+                h.update(parsed.to_bits().to_le_bytes());
+                h.update([0]);
+            } else {
+                hash_tag(h, "lex");
+                hash_str(h, v);
+            }
+        }
+        ExprKind::Char(v) => {
+            hash_tag(h, "char");
+            hash_u32(h, *v as u32);
+        }
+        ExprKind::String(v) => {
+            hash_tag(h, "string");
+            hash_str(h, v);
+        }
+        ExprKind::Nil => hash_tag(h, "nil"),
+        ExprKind::Ident(v) => {
+            hash_tag(h, "ident");
+            hash_str(h, v);
+        }
+        ExprKind::StructLit { name, fields } => {
+            hash_tag(h, "struct_lit");
+            hash_str(h, name);
+            hash_usize(h, fields.len());
+            for (n, e) in fields {
+                hash_str(h, n);
+                hash_expr_into(h, e);
+            }
+        }
+        ExprKind::ArrayLit(items) => {
+            hash_tag(h, "array");
+            hash_usize(h, items.len());
+            for item in items {
+                hash_expr_into(h, item);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            hash_tag(h, "tuple");
+            hash_usize(h, items.len());
+            for item in items {
+                hash_expr_into(h, item);
+            }
+        }
+        ExprKind::Block(b) => {
+            hash_tag(h, "block");
+            hash_block_into(h, b);
+        }
+        ExprKind::UnsafeBlock(b) => {
+            hash_tag(h, "unsafe_block");
+            hash_block_into(h, b);
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            hash_tag(h, "if");
+            hash_expr_into(h, cond);
+            hash_block_into(h, then_block);
+            match else_block {
+                Some(b) => hash_block_into(h, b),
+                None => hash_tag(h, "noelse"),
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            hash_tag(h, "match");
+            hash_expr_into(h, scrutinee);
+            hash_usize(h, arms.len());
+            for arm in arms {
+                hash_pattern_into(h, &arm.pattern);
+                match &arm.guard {
+                    Some(g) => hash_expr_into(h, g),
+                    None => hash_tag(h, "noguard"),
+                }
+                hash_block_or_expr_into(h, &arm.body);
+            }
+        }
+        ExprKind::Closure { params, body } => {
+            hash_tag(h, "closure");
+            hash_usize(h, params.len());
+            for p in params {
+                hash_str(h, &p.name);
+                match &p.ty {
+                    Some(ty) => hash_type_into(h, ty),
+                    None => hash_tag(h, "noty"),
+                }
+            }
+            hash_block_or_expr_into(h, body);
+        }
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+        } => {
+            hash_tag(h, "call");
+            hash_expr_into(h, callee);
+            hash_usize(h, type_args.len());
+            for ty in type_args {
+                hash_type_into(h, ty);
+            }
+            hash_usize(h, args.len());
+            for arg in args {
+                hash_expr_into(h, arg);
+            }
+        }
+        ExprKind::Field { base, name } => {
+            hash_tag(h, "field");
+            hash_expr_into(h, base);
+            hash_str(h, name);
+        }
+        ExprKind::Index { base, index } => {
+            hash_tag(h, "index");
+            hash_expr_into(h, base);
+            hash_expr_into(h, index);
+        }
+        ExprKind::Unary { op, expr } => {
+            hash_tag(h, "unary");
+            hash_unary_op(h, op);
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Cast { expr, ty } => {
+            hash_tag(h, "cast");
+            hash_expr_into(h, expr);
+            hash_type_into(h, ty);
+        }
+        ExprKind::Binary { op, left, right } => {
+            hash_tag(h, "binary");
+            hash_binary_op(h, op);
+            hash_expr_into(h, left);
+            hash_expr_into(h, right);
+        }
+        ExprKind::Borrow { is_mut, expr } => {
+            hash_tag(h, "borrow");
+            hash_bool(h, *is_mut);
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Deref { expr } => {
+            hash_tag(h, "deref");
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Try { expr } => {
+            hash_tag(h, "try");
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Send { chan, value } => {
+            hash_tag(h, "send");
+            hash_expr_into(h, chan);
+            hash_expr_into(h, value);
+        }
+        ExprKind::Recv { chan } => {
+            hash_tag(h, "recv");
+            hash_expr_into(h, chan);
+        }
+        ExprKind::Close { chan } => {
+            hash_tag(h, "close");
+            hash_expr_into(h, chan);
+        }
+        ExprKind::After { ms } => {
+            hash_tag(h, "after");
+            hash_expr_into(h, ms);
+        }
+    }
+}
+
+fn hash_expr_into(h: &mut Sha256, expr: &Expr) {
+    hash_expr_kind_into(h, &expr.kind);
+}
+
+fn hash_block_into(h: &mut Sha256, block: &Block) {
+    hash_tag(h, "block");
+    hash_usize(h, block.stmts.len());
+    for stmt in &block.stmts {
+        hash_stmt_into(h, stmt);
+    }
+    match &block.tail {
+        Some(t) => hash_expr_into(h, t),
+        None => hash_tag(h, "notail"),
+    }
+}
+
+fn hash_stmt_into(h: &mut Sha256, stmt: &Stmt) {
+    match stmt {
+        Stmt::Let { name, ty, init, .. } => {
+            hash_tag(h, "let");
+            hash_str(h, name);
+            hash_opt_type_into(h, ty);
+            hash_expr_into(h, init);
+        }
+        Stmt::Const { name, ty, init, .. } => {
+            hash_tag(h, "const");
+            hash_str(h, name);
+            hash_opt_type_into(h, ty);
+            hash_expr_into(h, init);
+        }
+        Stmt::Assign {
+            op, target, value, ..
+        } => {
+            hash_tag(h, "assign");
+            hash_assign_op(h, op);
+            hash_expr_into(h, target);
+            hash_expr_into(h, value);
+        }
+        Stmt::Expr { expr, .. } => {
+            hash_tag(h, "expr");
+            hash_expr_into(h, expr);
+        }
+        Stmt::Return { expr, .. } => {
+            hash_tag(h, "return");
+            match expr {
+                Some(e) => hash_expr_into(h, e),
+                None => hash_tag(h, "none"),
+            }
+        }
+        Stmt::Break { label, .. } => {
+            hash_tag(h, "break");
+            hash_opt_str(h, label.as_deref());
+        }
+        Stmt::Continue { label, .. } => {
+            hash_tag(h, "continue");
+            hash_opt_str(h, label.as_deref());
+        }
+        Stmt::While {
+            label, cond, body, ..
+        } => {
+            hash_tag(h, "while");
+            hash_opt_str(h, label.as_deref());
+            hash_expr_into(h, cond);
+            hash_block_into(h, body);
+        }
+        Stmt::Loop { label, body, .. } => {
+            hash_tag(h, "loop");
+            hash_opt_str(h, label.as_deref());
+            hash_block_into(h, body);
+        }
+        Stmt::ForIn {
+            label,
+            name,
+            index,
+            iter,
+            body,
+            ..
+        } => {
+            hash_tag(h, "forin");
+            hash_opt_str(h, label.as_deref());
+            hash_str(h, name);
+            hash_opt_str(h, index.as_deref());
+            hash_expr_into(h, iter);
+            hash_block_into(h, body);
+        }
+        Stmt::ForRange {
+            label,
+            name,
+            index,
+            start,
+            end,
+            inclusive,
+            body,
+            ..
+        } => {
+            hash_tag(h, "forrange");
+            hash_opt_str(h, label.as_deref());
+            hash_str(h, name);
+            hash_opt_str(h, index.as_deref());
+            hash_expr_into(h, start);
+            hash_expr_into(h, end);
+            hash_bool(h, *inclusive);
+            hash_block_into(h, body);
+        }
+        Stmt::Select { arms, .. } => {
+            hash_tag(h, "select");
+            hash_usize(h, arms.len());
+            for arm in arms {
+                hash_select_arm_into(h, arm);
+            }
+        }
+        Stmt::Go { expr, .. } => {
+            hash_tag(h, "go");
+            hash_expr_into(h, expr);
+        }
+        Stmt::Defer { expr, .. } => {
+            hash_tag(h, "defer");
+            hash_expr_into(h, expr);
+        }
+    }
+}
+
+fn hash_select_arm_into(h: &mut Sha256, arm: &SelectArm) {
+    match &arm.kind {
+        SelectArmKind::Send { chan, value } => {
+            hash_tag(h, "send");
+            hash_expr_into(h, chan);
+            hash_expr_into(h, value);
+        }
+        SelectArmKind::Recv { chan, bind } => {
+            hash_tag(h, "recv");
+            hash_expr_into(h, chan);
+            match bind {
+                Some((a, b)) => {
+                    hash_str(h, a);
+                    hash_str(h, b);
+                }
+                None => hash_tag(h, "nobind"),
+            }
+        }
+        SelectArmKind::After { ms } => {
+            hash_tag(h, "after");
+            hash_expr_into(h, ms);
+        }
+        SelectArmKind::Default => hash_tag(h, "default"),
+    }
+    hash_block_or_expr_into(h, &arm.body);
+}
+
+fn hash_block_or_expr_into(h: &mut Sha256, body: &BlockOrExpr) {
+    match body {
+        BlockOrExpr::Block(b) => hash_block_into(h, b),
+        BlockOrExpr::Expr(e) => hash_expr_into(h, e),
+    }
+}
+
+fn hash_pattern_into(h: &mut Sha256, pattern: &Pattern) {
+    match pattern {
+        Pattern::Wildcard => hash_tag(h, "wildcard"),
+        Pattern::Bool(v) => {
+            hash_tag(h, "bool");
+            hash_bool(h, *v);
+        }
+        Pattern::Int(v) => {
+            hash_tag(h, "int");
+            hash_str(h, v);
+        }
+        Pattern::Ident(v) => {
+            hash_tag(h, "ident");
+            hash_str(h, v);
+        }
+        Pattern::Or(items) => {
+            hash_tag(h, "or");
+            hash_usize(h, items.len());
+            for item in items {
+                hash_pattern_into(h, item);
+            }
+        }
+        Pattern::Variant {
+            enum_name,
+            variant,
+            binds,
+        } => {
+            hash_tag(h, "variant");
+            hash_str(h, enum_name);
+            hash_str(h, variant);
+            hash_usize(h, binds.len());
+            for bind in binds {
+                hash_str(h, bind);
+            }
+        }
+    }
+}
+
+fn hash_type_into(h: &mut Sha256, ty: &TypeAst) {
+    hash_tag(h, "type");
+    hash_str(h, &format!("{:?}", ty.kind));
+}
+
+fn hash_opt_type_into(h: &mut Sha256, ty: &Option<TypeAst>) {
+    match ty {
+        Some(v) => hash_type_into(h, v),
+        None => hash_tag(h, "notype"),
+    }
+}
+
+fn hash_assign_op(h: &mut Sha256, op: &AssignOp) {
+    hash_tag(
+        h,
+        match op {
+            AssignOp::Assign => "=",
+            AssignOp::AddAssign => "+=",
+            AssignOp::SubAssign => "-=",
+            AssignOp::MulAssign => "*=",
+            AssignOp::DivAssign => "/=",
+            AssignOp::RemAssign => "%=",
+            AssignOp::BitAndAssign => "&=",
+            AssignOp::BitOrAssign => "|=",
+            AssignOp::BitXorAssign => "^=",
+            AssignOp::ShlAssign => "<<=",
+            AssignOp::ShrAssign => ">>=",
+        },
+    );
+}
+
+fn hash_unary_op(h: &mut Sha256, op: &UnaryOp) {
+    hash_tag(
+        h,
+        match op {
+            UnaryOp::Neg => "-",
+            UnaryOp::Not => "!",
+            UnaryOp::BitNot => "~",
+        },
+    );
+}
+
+fn hash_binary_op(h: &mut Sha256, op: &BinaryOp) {
+    hash_tag(
+        h,
+        match op {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Rem => "%",
+            BinaryOp::Eq => "==",
+            BinaryOp::NotEq => "!=",
+            BinaryOp::Lt => "<",
+            BinaryOp::Lte => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Gte => ">=",
+            BinaryOp::And => "&&",
+            BinaryOp::Or => "||",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
+        },
+    );
+}
+
+fn hash_tag(h: &mut Sha256, tag: &str) {
+    h.update(tag.as_bytes());
+    h.update([0]);
+}
+
+fn hash_str(h: &mut Sha256, value: &str) {
+    h.update(value.len().to_string().as_bytes());
+    h.update(b":");
+    h.update(value.as_bytes());
+    h.update([0]);
+}
+
+fn hash_opt_str(h: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(v) => hash_str(h, v),
+        None => hash_tag(h, "none"),
+    }
+}
+
+fn hash_usize(h: &mut Sha256, value: usize) {
+    h.update(value.to_string().as_bytes());
+    h.update([0]);
+}
+
+fn hash_u32(h: &mut Sha256, value: u32) {
+    h.update(value.to_string().as_bytes());
+    h.update([0]);
+}
+
+fn hash_bool(h: &mut Sha256, value: bool) {
+    h.update(if value { b"1" } else { b"0" });
+    h.update([0]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lexer, Parser};
+
+    #[test]
+    fn sidecar_is_emitted_with_expr_hashes() {
+        let src = "module main\nfn main() -> i32 { return 0 }\n";
+        let tokens = Lexer::new(src).lex_all();
+        let mut parser = Parser::new(tokens);
+        let file = parser.parse_file().expect("parse");
+        assert!(parser.diags.is_empty(), "unexpected diagnostics");
+        let sidecar = parser.take_ast_hash_sidecar().expect("sidecar");
+        assert_ne!(sidecar.interface_hash_hex(), String::new());
+        assert!(!sidecar.public_item_hashes.is_empty());
+        assert_eq!(sidecar.expr_hash_by_id.len(), parser.next_expr_id());
+        assert_eq!(file.package, "main");
+    }
+
+    #[test]
+    fn sidecar_respects_expr_id_base_offset() {
+        let src = "module main\nfn main() -> i32 { return 0 }\n";
+        let tokens = Lexer::new(src).lex_all();
+        let mut parser = Parser::new_with_expr_id(tokens, 100);
+        parser.parse_file().expect("parse");
+        assert!(parser.diags.is_empty(), "unexpected diagnostics");
+        let sidecar = parser.take_ast_hash_sidecar().expect("sidecar");
+        assert_eq!(sidecar.expr_hash_by_id.len(), parser.next_expr_id() - 100);
+    }
+
+    #[test]
+    fn sidecar_float_hash_normalizes_equivalent_literals() {
+        let src_a =
+            "module main\nfn value() -> f64 { return 1.0 }\nfn main() -> i32 { return 0 }\n";
+        let src_b =
+            "module main\nfn value() -> f64 { return 1e0 }\nfn main() -> i32 { return 0 }\n";
+
+        let mut p1 = Parser::new(Lexer::new(src_a).lex_all());
+        p1.parse_file().expect("parse a");
+        assert!(p1.diags.is_empty(), "unexpected diagnostics a");
+        let s1 = p1.take_ast_hash_sidecar().expect("sidecar a");
+
+        let mut p2 = Parser::new(Lexer::new(src_b).lex_all());
+        p2.parse_file().expect("parse b");
+        assert!(p2.diags.is_empty(), "unexpected diagnostics b");
+        let s2 = p2.take_ast_hash_sidecar().expect("sidecar b");
+
+        assert_eq!(s1.expr_hash_by_id.len(), s2.expr_hash_by_id.len());
+        assert_eq!(s1.expr_hash_by_id, s2.expr_hash_by_id);
+    }
 }

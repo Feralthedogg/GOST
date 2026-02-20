@@ -20,9 +20,11 @@ use crate::frontend::diagnostic::{
     Diagnostic, Diagnostics, E_MONOMORPHIZATION_DEPTH_EXCEEDED, format_diagnostic,
 };
 use crate::frontend::lexer::Lexer;
-use crate::frontend::parser::Parser;
+use crate::frontend::parser::{AstHashSidecar, Parser};
 use crate::frontend::symbols::{is_impl_mangled, logical_method_name, mangle_impl_method};
-use crate::incremental::{BuildCtx, ENTRY_PACKAGE, trace as inc_trace, try_load_cached_llvm_fast};
+use crate::incremental::{
+    BuildCtx, ENTRY_PACKAGE, trace as inc_trace, try_load_cached_llvm_fast_with_warnings,
+};
 use crate::pkg::resolve::{self, ModMode};
 use crate::sema::analyze;
 
@@ -35,8 +37,9 @@ pub fn compile_to_llvm(
     offline: bool,
     want_fetch: bool,
 ) -> Result<String, String> {
-    match try_load_cached_llvm_fast(path, mode, offline, want_fetch) {
-        Ok(Some(cached)) => {
+    match try_load_cached_llvm_fast_with_warnings(path, mode, offline, want_fetch) {
+        Ok(Some((cached, warnings))) => {
+            replay_cached_warnings(&warnings);
             inc_trace("compile_to_llvm: served from incremental fast-path LLVM cache");
             return Ok(cached);
         }
@@ -50,11 +53,17 @@ pub fn compile_to_llvm(
     }
     let source = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut next_expr_id = 0;
-    let (file, next_after_main) = parse_source_with_ids(&source, next_expr_id, Some(path))
+    let (file, next_after_main, sidecar) = parse_source_with_ids(&source, next_expr_id, Some(path))
         .map_err(|e| format!("{}:\n{}", path.display(), e))?;
     next_expr_id = next_after_main;
     let mut build_ctx = BuildCtx::new(path, mode, offline, want_fetch);
-    build_ctx.record_source_file(ENTRY_PACKAGE, path, &source, &file);
+    build_ctx.record_source_file_with_hash(
+        ENTRY_PACKAGE,
+        path,
+        &source,
+        &file,
+        sidecar.as_ref().map(|s| s.interface_hash_hex()).as_deref(),
+    );
     let mut imported_items = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut std_funcs = std::collections::HashSet::new();
@@ -103,6 +112,9 @@ pub fn compile_to_llvm(
     }
     match build_ctx.try_load_cached_llvm() {
         Ok(Some(cached)) => {
+            if let Ok(warnings) = build_ctx.try_load_cached_warnings() {
+                replay_cached_warnings(&warnings);
+            }
             inc_trace("compile_to_llvm: served from incremental LLVM cache");
             return Ok(cached);
         }
@@ -135,23 +147,69 @@ pub fn compile_to_llvm(
         crate::mir::passes::verify_mir_strict(func).map_err(|e| e.to_string())?;
         crate::mir::passes::verify_backend_ready_mir(func).map_err(|e| e.to_string())?;
     }
-    let module = crate::codegen::emit_llvm_from_mir(&program, &mir).map_err(|e| match e {
-        crate::codegen::CodegenError::FrontendDiagnostic(msg) => msg,
-        crate::codegen::CodegenError::InternalCompilerError(msg) => {
-            if std::env::var("GOST_DEBUG_INTERNAL").ok().as_deref() == Some("1") {
-                format!("internal compiler error (codegen): {msg}")
-            } else {
-                "internal compiler error (codegen)".to_string()
+    let graph = build_ctx.graph();
+    let codegen_jobs = resolve_codegen_jobs(graph.max_parallel_codegen_width());
+    inc_trace(&format!(
+        "compile_to_llvm: codegen jobs={} (graph width={})",
+        codegen_jobs,
+        graph.max_parallel_codegen_width()
+    ));
+    let module = crate::codegen::emit_llvm_from_mir_with_jobs(&program, &mir, codegen_jobs)
+        .map_err(|e| match e {
+            crate::codegen::CodegenError::FrontendDiagnostic(msg) => msg,
+            crate::codegen::CodegenError::InternalCompilerError(msg) => {
+                if std::env::var("GOST_DEBUG_INTERNAL").ok().as_deref() == Some("1") {
+                    format!("internal compiler error (codegen): {msg}")
+                } else {
+                    "internal compiler error (codegen)".to_string()
+                }
             }
-        }
-    })?;
-    if let Err(err) = build_ctx.store_cached_llvm(&module.text) {
+        })?;
+    let compile_warnings = Vec::<String>::new();
+    if let Err(err) = build_ctx.store_cached_llvm_with_warnings(&module.text, &compile_warnings) {
         inc_trace(&format!(
             "compile_to_llvm: cache store failed (ignored): {}",
             err
         ));
     }
     Ok(module.text)
+}
+
+fn replay_cached_warnings(warnings: &[String]) {
+    for line in warnings {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        eprintln!("{}", text);
+    }
+}
+
+fn resolve_codegen_jobs(graph_parallel_width: usize) -> usize {
+    let mut jobs = graph_parallel_width.max(1);
+    let mut explicit_jobs = false;
+    if let Ok(raw) = std::env::var("GOST_CODEGEN_JOBS")
+        && let Ok(parsed) = raw.trim().parse::<usize>()
+        && parsed > 0
+    {
+        jobs = parsed;
+        explicit_jobs = true;
+    }
+    if std::env::var("GOST_CODEGEN_PARALLEL")
+        .ok()
+        .as_deref()
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        jobs = 1;
+    }
+    if !explicit_jobs {
+        let hw = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        jobs = jobs.min(hw);
+    }
+    jobs.max(1)
 }
 
 fn is_std_entry(path: &Path) -> bool {
@@ -168,7 +226,7 @@ fn parse_source_with_ids(
     source: &str,
     next_expr_id: usize,
     file_path: Option<&Path>,
-) -> Result<(FileAst, usize), String> {
+) -> Result<(FileAst, usize, Option<AstHashSidecar>), String> {
     // Why: Import merge depends on globally unique ExprId values, so parser state is threaded through.
     // Why: Module disambiguator keeps diagnostics and generic naming stable across same-package files.
     let tokens = Lexer::new(source).lex_all();
@@ -180,10 +238,11 @@ fn parse_source_with_ids(
         Some(file) => file,
         None => return Err(render_diags(&parser.diags, source, file_path)),
     };
+    let sidecar = parser.take_ast_hash_sidecar();
     if !parser.diags.is_empty() {
         return Err(render_diags(&parser.diags, source, file_path));
     }
-    Ok((file, parser.next_expr_id()))
+    Ok((file, parser.next_expr_id(), sidecar))
 }
 
 fn load_imports(
@@ -206,7 +265,7 @@ fn load_imports(
         let paths = resolve_import_paths(root, &import.path)?;
         for path in paths {
             let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let (file, next) = parse_source_with_ids(&source, *next_expr_id, Some(&path))
+            let (file, next, sidecar) = parse_source_with_ids(&source, *next_expr_id, Some(&path))
                 .map_err(|e| format!("{}:\n{}", path.display(), e))?;
             if let Some(expected) = import.path.split('/').next_back()
                 && file.package != expected
@@ -217,7 +276,13 @@ fn load_imports(
                 ));
             }
             *next_expr_id = next;
-            build_ctx.record_source_file(&import.path, &path, &source, &file);
+            build_ctx.record_source_file_with_hash(
+                &import.path,
+                &path,
+                &source,
+                &file,
+                sidecar.as_ref().map(|s| s.interface_hash_hex()).as_deref(),
+            );
             let mut imported_items = file.items.clone();
             let nested_imports = file.imports.clone();
             if import.only.is_some() {
@@ -269,7 +334,7 @@ fn load_imports_mod(
             resolve::resolve_import_to_package(ctx, &import.path).map_err(|e| e.to_string())?;
         for path in pkg.files {
             let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let (file, next) = parse_source_with_ids(&source, *next_expr_id, Some(&path))
+            let (file, next, sidecar) = parse_source_with_ids(&source, *next_expr_id, Some(&path))
                 .map_err(|e| format!("{}:\n{}", path.display(), e))?;
             if let Some(expected) = import.path.split('/').next_back()
                 && file.package != expected
@@ -280,7 +345,13 @@ fn load_imports_mod(
                 ));
             }
             *next_expr_id = next;
-            build_ctx.record_source_file(&import.path, &path, &source, &file);
+            build_ctx.record_source_file_with_hash(
+                &import.path,
+                &path,
+                &source,
+                &file,
+                sidecar.as_ref().map(|s| s.interface_hash_hex()).as_deref(),
+            );
             let mut imported_items = file.items.clone();
             if import.only.is_some() {
                 imported_items.retain(|item| import_item_allowed(item, import));
@@ -6049,7 +6120,13 @@ mod tests {
     use crate::pkg::resolve::ModMode;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct TempSource {
         path: PathBuf,
@@ -6123,6 +6200,44 @@ fn main() -> i32 {
         assert!(
             llvm.contains("define i32 @main()"),
             "expected runtime entry wrapper in llvm output"
+        );
+    }
+
+    #[test]
+    fn parallel_codegen_matches_single_thread_output() {
+        let _guard = env_lock().lock().expect("env lock");
+        let src = r#"
+module main
+
+fn add(x: i64, y: i64) -> i64 {
+    return x + y
+}
+
+fn mul(x: i64, y: i64) -> i64 {
+    return x * y
+}
+
+fn main() -> i32 {
+    let a = add(2, 3)
+    let b = mul(a, 4)
+    return b as i32
+}
+"#;
+        let file_serial = TempSource::new(src);
+        let file_parallel = TempSource::new(src);
+        // SAFETY: guarded by process-wide test mutex to avoid concurrent env mutation.
+        unsafe { std::env::set_var("GOST_CODEGEN_JOBS", "1") };
+        let serial = compile_to_llvm(file_serial.path(), ModMode::Readonly, true, false)
+            .expect("single-threaded compile should succeed");
+        // SAFETY: guarded by process-wide test mutex to avoid concurrent env mutation.
+        unsafe { std::env::set_var("GOST_CODEGEN_JOBS", "4") };
+        let parallel = compile_to_llvm(file_parallel.path(), ModMode::Readonly, true, false)
+            .expect("parallel compile should succeed");
+        // SAFETY: guarded by process-wide test mutex to avoid concurrent env mutation.
+        unsafe { std::env::remove_var("GOST_CODEGEN_JOBS") };
+        assert_eq!(
+            serial, parallel,
+            "parallel backend should preserve deterministic LLVM output"
         );
     }
 

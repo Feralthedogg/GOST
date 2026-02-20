@@ -9,16 +9,21 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 use crate::frontend::ast::{
-    FileAst, Item, LayoutAttr, ReprInt, TraitMethod, TypeAst, TypeAstKind, TypeParam,
+    AssignOp, BinaryOp, Block, BlockOrExpr, ClosureParam, Expr, ExprKind, FileAst, Item,
+    LayoutAttr, Pattern, ReprInt, SelectArm, SelectArmKind, Stmt, TraitMethod, TypeAst,
+    TypeAstKind, TypeParam, UnaryOp,
 };
 use crate::pkg::cache::{cache_root, ensure_dir};
 use crate::pkg::resolve::ModMode;
 
 pub const ENTRY_PACKAGE: &str = "__entry__";
 const GRAPH_SCHEMA: u32 = 2;
+static SIDECAR_HASH_DISABLED: AtomicBool = AtomicBool::new(false);
+static INCREMENTAL_CACHE_DISABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildGraphFile {
@@ -53,11 +58,99 @@ pub struct BuildGraph {
     pub lock_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct CachedWarnings {
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct LatestGraphIndex {
     schema: u32,
     entry: String,
     content_graph_hash: String,
+}
+
+impl BuildGraph {
+    pub fn package_codegen_levels(&self) -> Vec<Vec<String>> {
+        if self.packages.is_empty() {
+            return Vec::new();
+        }
+        let known = self
+            .packages
+            .iter()
+            .map(|p| p.package.clone())
+            .collect::<BTreeSet<_>>();
+        let mut indegree = BTreeMap::<String, usize>::new();
+        let mut outgoing = BTreeMap::<String, BTreeSet<String>>::new();
+        for pkg in &self.packages {
+            indegree.entry(pkg.package.clone()).or_insert(0);
+            for dep in pkg.imports.iter().filter(|dep| known.contains(*dep)) {
+                indegree
+                    .entry(pkg.package.clone())
+                    .and_modify(|v| *v += 1)
+                    .or_insert(1);
+                outgoing
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(pkg.package.clone());
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(pkg, deg)| if *deg == 0 { Some(pkg.clone()) } else { None })
+            .collect::<Vec<_>>();
+        ready.sort();
+
+        let mut levels = Vec::<Vec<String>>::new();
+        let mut processed = BTreeSet::<String>::new();
+        while !ready.is_empty() {
+            levels.push(ready.clone());
+            let mut next = BTreeSet::<String>::new();
+            for done in ready {
+                if !processed.insert(done.clone()) {
+                    continue;
+                }
+                if let Some(children) = outgoing.get(&done) {
+                    for child in children {
+                        if let Some(deg) = indegree.get_mut(child)
+                            && *deg > 0
+                        {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                next.insert(child.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            ready = next.into_iter().collect();
+        }
+
+        if processed.len() != known.len() {
+            // Preserve progress even if graph contains cycles.
+            let mut unresolved = known
+                .iter()
+                .filter(|pkg| !processed.contains(*pkg))
+                .cloned()
+                .collect::<Vec<_>>();
+            unresolved.sort();
+            for pkg in unresolved {
+                levels.push(vec![pkg]);
+            }
+        }
+        levels
+    }
+
+    pub fn max_parallel_codegen_width(&self) -> usize {
+        self.package_codegen_levels()
+            .iter()
+            .map(std::vec::Vec::len)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,10 +201,48 @@ impl BuildCtx {
     }
 
     pub fn record_source_file(&mut self, package: &str, path: &Path, source: &str, file: &FileAst) {
+        self.record_source_file_with_hash(package, path, source, file, None)
+    }
+
+    pub fn record_source_file_with_hash(
+        &mut self,
+        package: &str,
+        path: &Path,
+        source: &str,
+        file: &FileAst,
+        interface_hash: Option<&str>,
+    ) {
         let pkg = self.packages.entry(package.to_string()).or_default();
         let path_key = normalize_path(path);
         let content_hash = hash_bytes_sha256(source.as_bytes());
-        let interface_signature = file_interface_signature(file);
+        let canary_enabled = sidecar_canary_enabled();
+        let mut interface_signature = if let Some(hash) = interface_hash {
+            if !hash.is_empty() && !SIDECAR_HASH_DISABLED.load(Ordering::Relaxed) {
+                hash.to_string()
+            } else {
+                file_interface_signature(file)
+            }
+        } else {
+            file_interface_signature(file)
+        };
+        if canary_enabled
+            && let Some(sidecar_hash) = interface_hash
+            && !sidecar_hash.is_empty()
+            && !SIDECAR_HASH_DISABLED.load(Ordering::Relaxed)
+        {
+            let legacy = file_interface_signature(file);
+            if sidecar_hash != legacy {
+                trace(&format!(
+                    "sidecar hash mismatch at {} (sidecar={}, legacy={}); disabling incremental cache for process",
+                    path.display(),
+                    sidecar_hash,
+                    legacy
+                ));
+                SIDECAR_HASH_DISABLED.store(true, Ordering::Relaxed);
+                INCREMENTAL_CACHE_DISABLED.store(true, Ordering::Relaxed);
+                interface_signature = legacy;
+            }
+        }
         pkg.files.insert(
             path_key,
             FileAcc {
@@ -226,6 +357,9 @@ impl BuildCtx {
     }
 
     pub fn try_load_cached_llvm(&mut self) -> Result<Option<String>> {
+        if INCREMENTAL_CACHE_DISABLED.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let cache_dir = self.llvm_cache_dir()?;
         let ll_path = cache_dir.join("module.ll");
         if !ll_path.exists() {
@@ -240,7 +374,26 @@ impl BuildCtx {
         Ok(Some(text))
     }
 
+    pub fn try_load_cached_warnings(&mut self) -> Result<Vec<String>> {
+        if INCREMENTAL_CACHE_DISABLED.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let cache_dir = self.llvm_cache_dir()?;
+        read_cached_warnings(&cache_dir)
+    }
+
     pub fn store_cached_llvm(&mut self, llvm: &str) -> Result<()> {
+        self.store_cached_llvm_with_warnings(llvm, &[])
+    }
+
+    pub fn store_cached_llvm_with_warnings(
+        &mut self,
+        llvm: &str,
+        warnings: &[String],
+    ) -> Result<()> {
+        if INCREMENTAL_CACHE_DISABLED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let cache_dir = self.llvm_cache_dir()?;
         let ll_path = cache_dir.join("module.ll");
         let graph_path = cache_dir.join("graph.json");
@@ -248,6 +401,7 @@ impl BuildCtx {
         let graph = self.graph();
         fs::write(&graph_path, serde_json::to_string_pretty(&graph)?)
             .with_context(|| format!("write {}", graph_path.display()))?;
+        write_cached_warnings(&cache_dir, warnings)?;
         write_latest_graph_index(&self.cache_root, &self.entry_path, &graph)?;
         trace(&format!("llvm cache store: {}", ll_path.display()));
         Ok(())
@@ -289,12 +443,45 @@ pub fn hash_file_sha256(path: &Path) -> Result<String> {
     Ok(hash_bytes_sha256(&bytes))
 }
 
+pub(crate) fn sidecar_interface_hash(file: &FileAst) -> [u8; 32] {
+    hex_to_array32(&file_interface_signature(file))
+}
+
+pub(crate) fn sidecar_public_item_hashes(file: &FileAst) -> Vec<[u8; 32]> {
+    let mut parts = Vec::<String>::new();
+    for item in &file.items {
+        if let Some(sig) = public_item_signature(item) {
+            parts.push(sig);
+        }
+    }
+    parts.sort();
+    parts
+        .into_iter()
+        .map(|sig| hex_to_array32(&hash_bytes_sha256(sig.as_bytes())))
+        .collect()
+}
+
 pub fn try_load_cached_llvm_fast(
     entry_path: &Path,
     mode: ModMode,
     offline: bool,
     want_fetch: bool,
 ) -> Result<Option<String>> {
+    Ok(
+        try_load_cached_llvm_fast_with_warnings(entry_path, mode, offline, want_fetch)?
+            .map(|(llvm, _warnings)| llvm),
+    )
+}
+
+pub fn try_load_cached_llvm_fast_with_warnings(
+    entry_path: &Path,
+    mode: ModMode,
+    offline: bool,
+    want_fetch: bool,
+) -> Result<Option<(String, Vec<String>)>> {
+    if INCREMENTAL_CACHE_DISABLED.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let cache_root = build_cache_root_for_entry(entry_path)
         .or_else(|_| cache_root().map(|p| p.join("build")))
         .unwrap_or_else(|_| std::env::temp_dir().join("gost-cache").join("build"));
@@ -406,7 +593,8 @@ pub fn try_load_cached_llvm_fast(
     trace(&format!("fast llvm cache hit: {}", ll_path.display()));
     let text =
         fs::read_to_string(&ll_path).with_context(|| format!("read {}", ll_path.display()))?;
-    Ok(Some(text))
+    let warnings = read_cached_warnings(&cache_dir)?;
+    Ok(Some((text, warnings)))
 }
 
 pub fn trace_enabled() -> bool {
@@ -421,6 +609,20 @@ pub fn trace(msg: &str) {
     if trace_enabled() {
         eprintln!("[incremental] {}", msg);
     }
+}
+
+fn sidecar_canary_enabled() -> bool {
+    std::env::var("GOST_INCREMENTAL_SIDECAR_CANARY")
+        .ok()
+        .as_deref()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_incremental_killswitch_for_tests() {
+    SIDECAR_HASH_DISABLED.store(false, Ordering::Relaxed);
+    INCREMENTAL_CACHE_DISABLED.store(false, Ordering::Relaxed);
 }
 
 fn project_mod_lock_hashes(entry_path: &Path) -> (Option<String>, Option<String>) {
@@ -441,6 +643,13 @@ fn hash_if_exists(path: &Path) -> Option<String> {
 
 fn compiler_fingerprint() -> String {
     let mut out = format!("gost/{}", env!("CARGO_PKG_VERSION"));
+    if let Some(commit) = option_env!("GOST_GIT_COMMIT") {
+        let commit = commit.trim();
+        if !commit.is_empty() {
+            out.push('#');
+            out.push_str(commit);
+        }
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Ok(meta) = fs::metadata(exe)
         && let Ok(modified) = meta.modified()
@@ -481,6 +690,16 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn hex_to_array32(hex_text: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if let Ok(bytes) = hex::decode(hex_text)
+        && bytes.len() == 32
+    {
+        out.copy_from_slice(&bytes);
+    }
+    out
 }
 
 fn file_interface_signature(file: &FileAst) -> String {
@@ -646,8 +865,13 @@ fn trait_method_signature(method: &TraitMethod) -> String {
         .map(|p| format!("{}:{}", p.name, type_signature(&p.ty)))
         .collect::<Vec<_>>()
         .join(",");
+    let default_body_sig = method
+        .default_body
+        .as_ref()
+        .map(hash_block_signature)
+        .unwrap_or_else(|| "-".to_string());
     format!(
-        "{}{}({})->{}|variadic={}|default={}",
+        "{}{}({})->{}|variadic={}|default={}|default_sig={}",
         method.name,
         tparams,
         params,
@@ -657,8 +881,501 @@ fn trait_method_signature(method: &TraitMethod) -> String {
             "1"
         } else {
             "0"
-        }
+        },
+        default_body_sig
     )
+}
+
+fn hash_block_signature(block: &Block) -> String {
+    let mut h = Sha256::new();
+    hash_block_into(&mut h, block);
+    hex::encode(h.finalize())
+}
+
+fn hash_block_into(h: &mut Sha256, block: &Block) {
+    hash_tag(h, "block");
+    hash_usize(h, block.stmts.len());
+    for stmt in &block.stmts {
+        hash_stmt_into(h, stmt);
+    }
+    match &block.tail {
+        Some(t) => {
+            hash_tag(h, "tail");
+            hash_expr_into(h, t);
+        }
+        None => hash_tag(h, "notail"),
+    }
+}
+
+fn hash_stmt_into(h: &mut Sha256, stmt: &Stmt) {
+    match stmt {
+        Stmt::Let { name, ty, init, .. } => {
+            hash_tag(h, "let");
+            hash_str(h, name);
+            hash_type_opt(h, ty);
+            hash_expr_into(h, init);
+        }
+        Stmt::Const { name, ty, init, .. } => {
+            hash_tag(h, "const");
+            hash_str(h, name);
+            hash_type_opt(h, ty);
+            hash_expr_into(h, init);
+        }
+        Stmt::Assign {
+            op, target, value, ..
+        } => {
+            hash_tag(h, "assign");
+            hash_tag(h, assign_op_label(op));
+            hash_expr_into(h, target);
+            hash_expr_into(h, value);
+        }
+        Stmt::Expr { expr, .. } => {
+            hash_tag(h, "expr");
+            hash_expr_into(h, expr);
+        }
+        Stmt::Return { expr, .. } => {
+            hash_tag(h, "return");
+            match expr {
+                Some(e) => hash_expr_into(h, e),
+                None => hash_tag(h, "none"),
+            }
+        }
+        Stmt::Break { label, .. } => {
+            hash_tag(h, "break");
+            hash_opt_str(h, label.as_deref());
+        }
+        Stmt::Continue { label, .. } => {
+            hash_tag(h, "continue");
+            hash_opt_str(h, label.as_deref());
+        }
+        Stmt::While {
+            label, cond, body, ..
+        } => {
+            hash_tag(h, "while");
+            hash_opt_str(h, label.as_deref());
+            hash_expr_into(h, cond);
+            hash_block_into(h, body);
+        }
+        Stmt::Loop { label, body, .. } => {
+            hash_tag(h, "loop");
+            hash_opt_str(h, label.as_deref());
+            hash_block_into(h, body);
+        }
+        Stmt::ForIn {
+            label,
+            name,
+            index,
+            iter,
+            body,
+            ..
+        } => {
+            hash_tag(h, "forin");
+            hash_opt_str(h, label.as_deref());
+            hash_str(h, name);
+            hash_opt_str(h, index.as_deref());
+            hash_expr_into(h, iter);
+            hash_block_into(h, body);
+        }
+        Stmt::ForRange {
+            label,
+            name,
+            index,
+            start,
+            end,
+            inclusive,
+            body,
+            ..
+        } => {
+            hash_tag(h, "forrange");
+            hash_opt_str(h, label.as_deref());
+            hash_str(h, name);
+            hash_opt_str(h, index.as_deref());
+            hash_expr_into(h, start);
+            hash_expr_into(h, end);
+            hash_bool(h, *inclusive);
+            hash_block_into(h, body);
+        }
+        Stmt::Select { arms, .. } => {
+            hash_tag(h, "select");
+            hash_usize(h, arms.len());
+            for arm in arms {
+                hash_select_arm_into(h, arm);
+            }
+        }
+        Stmt::Go { expr, .. } => {
+            hash_tag(h, "go");
+            hash_expr_into(h, expr);
+        }
+        Stmt::Defer { expr, .. } => {
+            hash_tag(h, "defer");
+            hash_expr_into(h, expr);
+        }
+    }
+}
+
+fn hash_select_arm_into(h: &mut Sha256, arm: &SelectArm) {
+    hash_tag(h, "arm");
+    match &arm.kind {
+        SelectArmKind::Send { chan, value } => {
+            hash_tag(h, "send");
+            hash_expr_into(h, chan);
+            hash_expr_into(h, value);
+        }
+        SelectArmKind::Recv { chan, bind } => {
+            hash_tag(h, "recv");
+            hash_expr_into(h, chan);
+            match bind {
+                Some((a, b)) => {
+                    hash_tag(h, "bind");
+                    hash_str(h, a);
+                    hash_str(h, b);
+                }
+                None => hash_tag(h, "nobind"),
+            }
+        }
+        SelectArmKind::After { ms } => {
+            hash_tag(h, "after");
+            hash_expr_into(h, ms);
+        }
+        SelectArmKind::Default => hash_tag(h, "default"),
+    }
+    hash_block_or_expr_into(h, &arm.body);
+}
+
+fn hash_block_or_expr_into(h: &mut Sha256, body: &BlockOrExpr) {
+    match body {
+        BlockOrExpr::Block(b) => {
+            hash_tag(h, "body_block");
+            hash_block_into(h, b);
+        }
+        BlockOrExpr::Expr(e) => {
+            hash_tag(h, "body_expr");
+            hash_expr_into(h, e);
+        }
+    }
+}
+
+fn hash_expr_into(h: &mut Sha256, expr: &Expr) {
+    match &expr.kind {
+        ExprKind::Bool(v) => {
+            hash_tag(h, "bool");
+            hash_bool(h, *v);
+        }
+        ExprKind::Int(v) => {
+            hash_tag(h, "int");
+            hash_str(h, v);
+        }
+        ExprKind::Float(v) => {
+            hash_tag(h, "float");
+            if let Ok(parsed) = v.parse::<f64>() {
+                hash_tag(h, "bits");
+                h.update(parsed.to_bits().to_le_bytes());
+                h.update([0]);
+            } else {
+                hash_tag(h, "lex");
+                hash_str(h, v);
+            }
+        }
+        ExprKind::Char(v) => {
+            hash_tag(h, "char");
+            hash_u32(h, *v as u32);
+        }
+        ExprKind::String(v) => {
+            hash_tag(h, "string");
+            hash_str(h, v);
+        }
+        ExprKind::Nil => hash_tag(h, "nil"),
+        ExprKind::Ident(v) => {
+            hash_tag(h, "ident");
+            hash_str(h, v);
+        }
+        ExprKind::StructLit { name, fields } => {
+            hash_tag(h, "struct_lit");
+            hash_str(h, name);
+            hash_usize(h, fields.len());
+            for (n, e) in fields {
+                hash_str(h, n);
+                hash_expr_into(h, e);
+            }
+        }
+        ExprKind::ArrayLit(items) => {
+            hash_tag(h, "array_lit");
+            hash_usize(h, items.len());
+            for item in items {
+                hash_expr_into(h, item);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            hash_tag(h, "tuple");
+            hash_usize(h, items.len());
+            for item in items {
+                hash_expr_into(h, item);
+            }
+        }
+        ExprKind::Block(b) => {
+            hash_tag(h, "expr_block");
+            hash_block_into(h, b);
+        }
+        ExprKind::UnsafeBlock(b) => {
+            hash_tag(h, "unsafe_block");
+            hash_block_into(h, b);
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            hash_tag(h, "if");
+            hash_expr_into(h, cond);
+            hash_block_into(h, then_block);
+            match else_block {
+                Some(b) => {
+                    hash_tag(h, "else");
+                    hash_block_into(h, b);
+                }
+                None => hash_tag(h, "noelse"),
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            hash_tag(h, "match");
+            hash_expr_into(h, scrutinee);
+            hash_usize(h, arms.len());
+            for arm in arms {
+                hash_pattern_into(h, &arm.pattern);
+                match &arm.guard {
+                    Some(g) => {
+                        hash_tag(h, "guard");
+                        hash_expr_into(h, g);
+                    }
+                    None => hash_tag(h, "noguard"),
+                }
+                hash_block_or_expr_into(h, &arm.body);
+            }
+        }
+        ExprKind::Closure { params, body } => {
+            hash_tag(h, "closure");
+            hash_usize(h, params.len());
+            for p in params {
+                hash_closure_param_into(h, p);
+            }
+            hash_block_or_expr_into(h, body);
+        }
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+        } => {
+            hash_tag(h, "call");
+            hash_expr_into(h, callee);
+            hash_usize(h, type_args.len());
+            for ty in type_args {
+                hash_type(h, ty);
+            }
+            hash_usize(h, args.len());
+            for a in args {
+                hash_expr_into(h, a);
+            }
+        }
+        ExprKind::Field { base, name } => {
+            hash_tag(h, "field");
+            hash_expr_into(h, base);
+            hash_str(h, name);
+        }
+        ExprKind::Index { base, index } => {
+            hash_tag(h, "index");
+            hash_expr_into(h, base);
+            hash_expr_into(h, index);
+        }
+        ExprKind::Unary { op, expr } => {
+            hash_tag(h, "unary");
+            hash_tag(h, unary_op_label(op));
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Cast { expr, ty } => {
+            hash_tag(h, "cast");
+            hash_expr_into(h, expr);
+            hash_type(h, ty);
+        }
+        ExprKind::Binary { op, left, right } => {
+            hash_tag(h, "binary");
+            hash_tag(h, binary_op_label(op));
+            hash_expr_into(h, left);
+            hash_expr_into(h, right);
+        }
+        ExprKind::Borrow { is_mut, expr } => {
+            hash_tag(h, "borrow");
+            hash_bool(h, *is_mut);
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Deref { expr } => {
+            hash_tag(h, "deref");
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Try { expr } => {
+            hash_tag(h, "try");
+            hash_expr_into(h, expr);
+        }
+        ExprKind::Send { chan, value } => {
+            hash_tag(h, "send");
+            hash_expr_into(h, chan);
+            hash_expr_into(h, value);
+        }
+        ExprKind::Recv { chan } => {
+            hash_tag(h, "recv");
+            hash_expr_into(h, chan);
+        }
+        ExprKind::Close { chan } => {
+            hash_tag(h, "close");
+            hash_expr_into(h, chan);
+        }
+        ExprKind::After { ms } => {
+            hash_tag(h, "after");
+            hash_expr_into(h, ms);
+        }
+    }
+}
+
+fn hash_pattern_into(h: &mut Sha256, pattern: &Pattern) {
+    match pattern {
+        Pattern::Wildcard => hash_tag(h, "wildcard"),
+        Pattern::Bool(v) => {
+            hash_tag(h, "bool");
+            hash_bool(h, *v);
+        }
+        Pattern::Int(v) => {
+            hash_tag(h, "int");
+            hash_str(h, v);
+        }
+        Pattern::Ident(v) => {
+            hash_tag(h, "ident");
+            hash_str(h, v);
+        }
+        Pattern::Or(items) => {
+            hash_tag(h, "or");
+            hash_usize(h, items.len());
+            for p in items {
+                hash_pattern_into(h, p);
+            }
+        }
+        Pattern::Variant {
+            enum_name,
+            variant,
+            binds,
+        } => {
+            hash_tag(h, "variant");
+            hash_str(h, enum_name);
+            hash_str(h, variant);
+            hash_usize(h, binds.len());
+            for b in binds {
+                hash_str(h, b);
+            }
+        }
+    }
+}
+
+fn hash_closure_param_into(h: &mut Sha256, param: &ClosureParam) {
+    hash_tag(h, "closure_param");
+    hash_str(h, &param.name);
+    hash_type_opt(h, &param.ty);
+}
+
+fn hash_type_opt(h: &mut Sha256, ty: &Option<TypeAst>) {
+    match ty {
+        Some(t) => {
+            hash_tag(h, "some");
+            hash_type(h, t);
+        }
+        None => hash_tag(h, "none"),
+    }
+}
+
+fn hash_type(h: &mut Sha256, ty: &TypeAst) {
+    hash_tag(h, "type");
+    hash_str(h, &type_signature(ty));
+}
+
+fn hash_tag(h: &mut Sha256, tag: &str) {
+    h.update(tag.as_bytes());
+    h.update([0]);
+}
+
+fn hash_str(h: &mut Sha256, v: &str) {
+    h.update(v.len().to_string().as_bytes());
+    h.update(b":");
+    h.update(v.as_bytes());
+    h.update([0]);
+}
+
+fn hash_opt_str(h: &mut Sha256, v: Option<&str>) {
+    match v {
+        Some(s) => {
+            hash_tag(h, "some");
+            hash_str(h, s);
+        }
+        None => hash_tag(h, "none"),
+    }
+}
+
+fn hash_usize(h: &mut Sha256, v: usize) {
+    h.update(v.to_string().as_bytes());
+    h.update([0]);
+}
+
+fn hash_u32(h: &mut Sha256, v: u32) {
+    h.update(v.to_string().as_bytes());
+    h.update([0]);
+}
+
+fn hash_bool(h: &mut Sha256, v: bool) {
+    h.update(if v { b"1" } else { b"0" });
+    h.update([0]);
+}
+
+fn assign_op_label(op: &AssignOp) -> &'static str {
+    match op {
+        AssignOp::Assign => "=",
+        AssignOp::AddAssign => "+=",
+        AssignOp::SubAssign => "-=",
+        AssignOp::MulAssign => "*=",
+        AssignOp::DivAssign => "/=",
+        AssignOp::RemAssign => "%=",
+        AssignOp::BitAndAssign => "&=",
+        AssignOp::BitOrAssign => "|=",
+        AssignOp::BitXorAssign => "^=",
+        AssignOp::ShlAssign => "<<=",
+        AssignOp::ShrAssign => ">>=",
+    }
+}
+
+fn unary_op_label(op: &UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "-",
+        UnaryOp::Not => "!",
+        UnaryOp::BitNot => "~",
+    }
+}
+
+fn binary_op_label(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Rem => "%",
+        BinaryOp::Eq => "==",
+        BinaryOp::NotEq => "!=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Lte => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Gte => ">=",
+        BinaryOp::And => "&&",
+        BinaryOp::Or => "||",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::Shl => "<<",
+        BinaryOp::Shr => ">>",
+    }
 }
 
 fn type_params_signature(params: &[TypeParam]) -> String {
@@ -793,6 +1510,49 @@ fn latest_graph_index_path(cache_root: &Path, entry_path: &Path) -> PathBuf {
         .join(format!("{key}.json"))
 }
 
+fn warnings_sidecar_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("warnings.json")
+}
+
+fn read_cached_warnings(cache_dir: &Path) -> Result<Vec<String>> {
+    let warn_path = warnings_sidecar_path(cache_dir);
+    if !warn_path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&warn_path).with_context(|| format!("read {}", warn_path.display()))?;
+    let parsed = serde_json::from_str::<CachedWarnings>(&text)
+        .with_context(|| format!("decode {}", warn_path.display()))?;
+    Ok(parsed.warnings)
+}
+
+fn write_cached_warnings(cache_dir: &Path, warnings: &[String]) -> Result<()> {
+    let warn_path = warnings_sidecar_path(cache_dir);
+    if warnings.is_empty() {
+        let _ = fs::remove_file(&warn_path);
+        return Ok(());
+    }
+    let mut deduped = Vec::<String>::new();
+    let mut seen = BTreeSet::<String>::new();
+    for line in warnings {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+    if deduped.is_empty() {
+        let _ = fs::remove_file(&warn_path);
+        return Ok(());
+    }
+    let payload = CachedWarnings { warnings: deduped };
+    fs::write(&warn_path, serde_json::to_string_pretty(&payload)?)
+        .with_context(|| format!("write {}", warn_path.display()))?;
+    Ok(())
+}
+
 fn write_latest_graph_index(
     cache_root: &Path,
     entry_path: &Path,
@@ -814,7 +1574,11 @@ fn write_latest_graph_index(
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildCtx, ENTRY_PACKAGE, build_cache_root_for_entry, try_load_cached_llvm_fast};
+    use super::{
+        BuildCtx, BuildGraph, BuildGraphPackage, ENTRY_PACKAGE, build_cache_root_for_entry,
+        reset_incremental_killswitch_for_tests, try_load_cached_llvm_fast,
+        try_load_cached_llvm_fast_with_warnings,
+    };
     use crate::frontend::ast::FileAst;
     use crate::frontend::lexer::Lexer;
     use crate::frontend::parser::Parser;
@@ -893,6 +1657,54 @@ mod tests {
 
         let src_a = "module main\npub fn api(x: i64) -> i64 { return x }\n";
         let src_b = "module main\npub fn api(x: i64, y: i64) -> i64 { return x + y }\n";
+
+        let mut a = BuildCtx::new(&path, ModMode::Readonly, true, false);
+        let file_a = parse_file(src_a, &path);
+        a.record_source_file(ENTRY_PACKAGE, &path, src_a, &file_a);
+        let (_, iface_a) = package_hashes(&mut a, ENTRY_PACKAGE);
+
+        let mut b = BuildCtx::new(&path, ModMode::Readonly, true, false);
+        let file_b = parse_file(src_b, &path);
+        b.record_source_file(ENTRY_PACKAGE, &path, src_b, &file_b);
+        let (_, iface_b) = package_hashes(&mut b, ENTRY_PACKAGE);
+
+        assert_ne!(iface_a, iface_b);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interface_hash_ignores_public_item_order_changes() {
+        let root = temp_dir("iface-order");
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("gost.mod"), "module = \"example.com/app\"\n").expect("mod");
+        let path = root.join("main.gs");
+
+        let src_a = "module main\npub fn a(x: i64) -> i64 { return x }\npub fn b(y: i64) -> i64 { return y }\n";
+        let src_b = "module main\npub fn b(y: i64) -> i64 { return y }\npub fn a(x: i64) -> i64 { return x }\n";
+
+        let mut a = BuildCtx::new(&path, ModMode::Readonly, true, false);
+        let file_a = parse_file(src_a, &path);
+        a.record_source_file(ENTRY_PACKAGE, &path, src_a, &file_a);
+        let (_, iface_a) = package_hashes(&mut a, ENTRY_PACKAGE);
+
+        let mut b = BuildCtx::new(&path, ModMode::Readonly, true, false);
+        let file_b = parse_file(src_b, &path);
+        b.record_source_file(ENTRY_PACKAGE, &path, src_b, &file_b);
+        let (_, iface_b) = package_hashes(&mut b, ENTRY_PACKAGE);
+
+        assert_eq!(iface_a, iface_b);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interface_hash_changes_for_trait_default_body_change() {
+        let root = temp_dir("iface-trait-default");
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("gost.mod"), "module = \"example.com/app\"\n").expect("mod");
+        let path = root.join("main.gs");
+
+        let src_a = "module main\n\ntrait Greeter {\n    fn greet() -> i64 {\n        return self.id + 1\n    }\n}\n\ncopy struct User {\n    id: i64\n}\n";
+        let src_b = "module main\n\ntrait Greeter {\n    fn greet() -> i64 {\n        return self.id + 2\n    }\n}\n\ncopy struct User {\n    id: i64\n}\n";
 
         let mut a = BuildCtx::new(&path, ModMode::Readonly, true, false);
         let file_a = parse_file(src_a, &path);
@@ -1010,6 +1822,136 @@ mod tests {
         ctx.record_source_file(ENTRY_PACKAGE, &entry, src, &file);
         let graph = ctx.graph();
         assert!(graph.lock_hash.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_graph_levels_group_independent_packages() {
+        let graph = BuildGraph {
+            schema: 2,
+            entry: "entry".into(),
+            mode: "readonly".into(),
+            offline: true,
+            want_fetch: false,
+            compiler_fingerprint: "test".into(),
+            packages: vec![
+                BuildGraphPackage {
+                    package: "__entry__".into(),
+                    file_hashes: vec![],
+                    files: vec![],
+                    imports: vec!["a".into(), "b".into()],
+                    content_hash: "x".into(),
+                    interface_hash: "x".into(),
+                },
+                BuildGraphPackage {
+                    package: "a".into(),
+                    file_hashes: vec![],
+                    files: vec![],
+                    imports: vec!["c".into()],
+                    content_hash: "x".into(),
+                    interface_hash: "x".into(),
+                },
+                BuildGraphPackage {
+                    package: "b".into(),
+                    file_hashes: vec![],
+                    files: vec![],
+                    imports: vec!["c".into()],
+                    content_hash: "x".into(),
+                    interface_hash: "x".into(),
+                },
+                BuildGraphPackage {
+                    package: "c".into(),
+                    file_hashes: vec![],
+                    files: vec![],
+                    imports: vec![],
+                    content_hash: "x".into(),
+                    interface_hash: "x".into(),
+                },
+            ],
+            content_graph_hash: "x".into(),
+            interface_graph_hash: "x".into(),
+            mod_hash: None,
+            lock_hash: None,
+        };
+        let levels = graph.package_codegen_levels();
+        assert!(
+            !levels.is_empty(),
+            "package_codegen_levels should produce at least one level"
+        );
+        assert_eq!(
+            levels[0],
+            vec!["c".to_string()],
+            "root dependency should be first"
+        );
+        assert!(
+            levels
+                .iter()
+                .any(|lvl| lvl == &vec!["a".to_string(), "b".to_string()]),
+            "independent package siblings should share a level"
+        );
+        assert_eq!(graph.max_parallel_codegen_width(), 2);
+    }
+
+    #[test]
+    fn cached_warnings_roundtrip_for_llvm_cache() {
+        let root = temp_dir("warning-roundtrip");
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("gost.mod"), "module = \"example.com/app\"\n").expect("mod");
+        let entry = root.join("main.gs");
+        let src = "module main\nfn main() -> i32 { return 0 }\n";
+        fs::write(&entry, src).expect("entry");
+        let file = parse_file(src, &entry);
+
+        let warnings = vec![
+            "warning: sample persisted warning".to_string(),
+            "warning: sample persisted warning".to_string(),
+            "warning: another warning".to_string(),
+        ];
+        let mut writer = BuildCtx::new(&entry, ModMode::Readonly, true, false);
+        writer.record_source_file(ENTRY_PACKAGE, &entry, src, &file);
+        writer
+            .store_cached_llvm_with_warnings("; cached llvm module\n", &warnings)
+            .expect("store");
+
+        let mut reader = BuildCtx::new(&entry, ModMode::Readonly, true, false);
+        reader.record_source_file(ENTRY_PACKAGE, &entry, src, &file);
+        let got = reader.try_load_cached_warnings().expect("read warnings");
+        assert_eq!(
+            got,
+            vec![
+                "warning: sample persisted warning".to_string(),
+                "warning: another warning".to_string()
+            ]
+        );
+
+        let fast = try_load_cached_llvm_fast_with_warnings(&entry, ModMode::Readonly, true, false)
+            .expect("fast probe")
+            .expect("cached result");
+        assert_eq!(fast.1, got);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sidecar_canary_mismatch_disables_incremental_cache() {
+        reset_incremental_killswitch_for_tests();
+        let root = temp_dir("sidecar-canary-mismatch");
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("gost.mod"), "module = \"example.com/app\"\n").expect("mod");
+        let entry = root.join("main.gs");
+        let src = "module main\nfn main() -> i32 { return 0 }\n";
+        fs::write(&entry, src).expect("entry");
+        let file = parse_file(src, &entry);
+
+        let mut ctx = BuildCtx::new(&entry, ModMode::Readonly, true, false);
+        let bogus = "0000000000000000000000000000000000000000000000000000000000000000";
+        ctx.record_source_file_with_hash(ENTRY_PACKAGE, &entry, src, &file, Some(bogus));
+
+        ctx.store_cached_llvm("; should not persist while cache disabled\n")
+            .expect("store noop");
+        let loaded = ctx.try_load_cached_llvm().expect("load");
+        assert!(loaded.is_none());
+
+        reset_incremental_killswitch_for_tests();
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -87,12 +87,6 @@ If you need a GCC+LLVM bundle on Windows:
 powershell -ExecutionPolicy Bypass -File scripts/setup-toolchain.ps1
 ```
 
-## Editor Setup
-
-For diagnostics/completion/hover and syntax highlighting, see:
-
-- [Editor Setup](editor-setup.md)
-
 ## Next Steps
 
 - Walk through [Gost by Example](gost-by-example.md)

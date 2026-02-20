@@ -9,6 +9,8 @@ use crate::sema::types::{BuiltinType, Type, TypeDefKind};
 use crate::sema::{ConstValue, GlobalInit, Program};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::mpsc;
+use std::thread;
 
 mod emitter;
 
@@ -54,9 +56,17 @@ impl fmt::Display for CodegenError {
 impl std::error::Error for CodegenError {}
 
 pub fn emit_llvm_from_mir(program: &Program, mir: &MirModule) -> Result<LLVMModule, CodegenError> {
+    emit_llvm_from_mir_with_jobs(program, mir, 1)
+}
+
+pub fn emit_llvm_from_mir_with_jobs(
+    program: &Program,
+    mir: &MirModule,
+    jobs: usize,
+) -> Result<LLVMModule, CodegenError> {
     let mut codegen = Codegen::new(program);
     codegen
-        .emit_module_from_mir(mir)
+        .emit_module_from_mir(mir, jobs.max(1))
         .map_err(CodegenError::internal)?;
     Ok(LLVMModule {
         text: codegen.output,
@@ -80,20 +90,16 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    fn emit_module_from_mir(&mut self, mir: &MirModule) -> Result<(), String> {
+    fn emit_module_from_mir(&mut self, mir: &MirModule, jobs: usize) -> Result<(), String> {
         self.rebuild_function_symbols(mir);
         self.emit_prelude()?;
         self.emit_user_extern_decls()?;
         self.emit_user_global_decls()?;
-        let mut has_main = false;
-        for func in &mir.functions {
-            if func.name == "main" {
-                has_main = true;
-                self.emit_mir_function_named(func, "__gost_user_main")?;
-            } else {
-                self.emit_mir_function(func)?;
-            }
-        }
+        let has_main = if jobs > 1 && mir.functions.len() > 1 {
+            self.emit_mir_functions_parallel(mir, jobs)?
+        } else {
+            self.emit_mir_functions_serial(mir)?
+        };
         if has_main {
             self.output.push_str("define i32 @main() {\n");
             self.output
@@ -449,6 +455,79 @@ impl<'a> Codegen<'a> {
         }
         self.output.push('\n');
         Ok(())
+    }
+
+    fn emit_mir_functions_serial(&mut self, mir: &MirModule) -> Result<bool, String> {
+        let mut has_main = false;
+        for func in &mir.functions {
+            if func.name == "main" {
+                has_main = true;
+                self.emit_mir_function_named(func, "__gost_user_main")?;
+            } else {
+                self.emit_mir_function(func)?;
+            }
+        }
+        Ok(has_main)
+    }
+
+    fn emit_mir_functions_parallel(
+        &mut self,
+        mir: &MirModule,
+        jobs: usize,
+    ) -> Result<bool, String> {
+        let count = mir.functions.len();
+        if count == 0 {
+            return Ok(false);
+        }
+        let workers = jobs.max(1).min(count);
+        let (tx, rx) = mpsc::channel::<(usize, Result<(String, Vec<String>, bool), String>)>();
+        let program = self.program;
+
+        thread::scope(|scope| {
+            for worker_id in 0..workers {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let mut idx = worker_id;
+                    while idx < count {
+                        let func = &mir.functions[idx];
+                        let mut local = Codegen::new(program);
+                        local.rebuild_function_symbols(mir);
+                        let result = if func.name == "main" {
+                            local
+                                .emit_mir_function_named(func, "__gost_user_main")
+                                .map(|_| (local.output, local.globals, true))
+                        } else {
+                            local
+                                .emit_mir_function(func)
+                                .map(|_| (local.output, local.globals, false))
+                        };
+                        let _ = tx.send((idx, result));
+                        idx += workers;
+                    }
+                });
+            }
+        });
+
+        drop(tx);
+        let mut by_index = vec![None::<(String, Vec<String>, bool)>; count];
+        for _ in 0..count {
+            let (idx, result) = rx
+                .recv()
+                .map_err(|e| format!("parallel codegen worker failed: {}", e))?;
+            by_index[idx] = Some(result?);
+        }
+
+        let mut has_main = false;
+        for chunk in by_index {
+            let (text, globals, main_fn) =
+                chunk.ok_or_else(|| "parallel codegen produced incomplete output".to_string())?;
+            has_main |= main_fn;
+            self.output.push_str(&text);
+            for lit in globals {
+                self.globals.push(lit);
+            }
+        }
+        Ok(has_main)
     }
 
     fn mir_param_names(func: &crate::mir::MirFunction, param_count: usize) -> Vec<String> {

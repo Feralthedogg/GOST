@@ -4,6 +4,7 @@
 // Gotchas: Keep help text, parser behavior, and default mode policy in sync.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -1008,6 +1009,7 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
     let bin_cache =
         incremental::ensure_cache_namespace(input_path, "bin").map_err(|e| e.to_string())?;
     let cached_exe = cache_path_with_template_ext(&bin_cache, &link_key, &exe_path);
+    let cached_exe_warnings = warning_sidecar_path(&cached_exe);
     if cached_exe.exists() {
         std::fs::copy(&cached_exe, &exe_path).map_err(|e| {
             format!(
@@ -1017,9 +1019,12 @@ fn link_and_run(input_path: &Path, ll_path: &Path, opt_level: OptLevel) -> Resul
                 e
             )
         })?;
+        replay_cached_warnings_from_path(&cached_exe_warnings);
         inc_trace(&format!("link cache hit: {}", cached_exe.display()));
     } else {
-        run_cmd(&cc, &link_args)?;
+        let output = run_cmd_capture(&cc, &link_args)?;
+        let warnings = collect_warning_lines(&output);
+        persist_warning_lines(&cached_exe_warnings, &warnings);
         if let Some(parent) = cached_exe.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1072,7 +1077,9 @@ fn build_runtime_rust(
     let runtime_cache_root =
         incremental::ensure_cache_namespace(entry_path, "runtime").map_err(|e| e.to_string())?;
     let runtime_cached = runtime_cache_root.join(&runtime_cache_key).join(lib_name);
+    let runtime_warning_sidecar = warning_sidecar_path(&runtime_cached);
     if runtime_cached.exists() {
+        replay_cached_warnings_from_path(&runtime_warning_sidecar);
         inc_trace(&format!("runtime cache hit: {}", runtime_cached.display()));
         return Ok(runtime_cached);
     }
@@ -1112,12 +1119,19 @@ fn build_runtime_rust(
         cmd.env("MACOSX_DEPLOYMENT_TARGET", target);
     }
     cmd.env("CC", cc);
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .map_err(|e| format!("failed to run cargo: {}", e))?;
-    if !status.success() {
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    if !output.status.success() {
         return Err("failed to build Rust runtime (is target installed?)".to_string());
     }
+    let warnings = collect_warning_lines(&output);
 
     let lib_path = if let Some(target) = target {
         runtime_dir
@@ -1150,6 +1164,7 @@ fn build_runtime_rust(
             e
         )
     })?;
+    persist_warning_lines(&runtime_warning_sidecar, &warnings);
     inc_trace(&format!(
         "runtime cache store: {}",
         runtime_cached.display()
@@ -1232,6 +1247,7 @@ fn compile_ll_to_obj(
     let obj_cache =
         incremental::ensure_cache_namespace(entry_path, "obj").map_err(|e| e.to_string())?;
     let cached_obj = obj_cache.join(format!("{}.o", key));
+    let cached_obj_warnings = warning_sidecar_path(&cached_obj);
     if cached_obj.exists() {
         std::fs::copy(&cached_obj, obj_path).map_err(|e| {
             format!(
@@ -1241,10 +1257,11 @@ fn compile_ll_to_obj(
                 e
             )
         })?;
+        replay_cached_warnings_from_path(&cached_obj_warnings);
         inc_trace(&format!("obj cache hit: {}", cached_obj.display()));
         return Ok(());
     }
-    if is_clang(cc) {
+    let tool_output = if is_clang(cc) {
         let mut args = vec![
             "-c".into(),
             ll_path.display().to_string(),
@@ -1259,7 +1276,7 @@ fn compile_ll_to_obj(
         if opt_level.is_optimized() && native {
             args.push("-march=native".into());
         }
-        run_cmd(cc, &args)?;
+        run_cmd_capture(cc, &args)?
     } else {
         let llc = resolve_llc();
         if !command_exists(&llc) {
@@ -1279,8 +1296,10 @@ fn compile_ll_to_obj(
             args.push(triple);
         }
         args.push(ll_path.display().to_string());
-        run_cmd(&llc, &args)?;
-    }
+        run_cmd_capture(&llc, &args)?
+    };
+    let warnings = collect_warning_lines(&tool_output);
+    persist_warning_lines(&cached_obj_warnings, &warnings);
     let _ = std::fs::copy(obj_path, &cached_obj);
     inc_trace(&format!("obj cache store: {}", cached_obj.display()));
     Ok(())
@@ -1835,6 +1854,81 @@ fn run_cmd(cmd: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_cmd_capture(cmd: &str, args: &[String]) -> Result<std::process::Output, String> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run {}: {}", cmd, e))?;
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!("command failed: {} {}", cmd, args.join(" ")))
+    }
+}
+
+fn collect_warning_lines(output: &std::process::Output) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    collect_warning_lines_from_text(&stdout, &stderr)
+}
+
+fn collect_warning_lines_from_text(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    let mut seen = BTreeSet::<String>::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        if !line.to_ascii_lowercase().contains("warning") {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            lines.push(trimmed.to_string());
+        }
+    }
+    lines
+}
+
+fn warning_sidecar_path(cache_path: &Path) -> PathBuf {
+    let mut text = cache_path.to_string_lossy().to_string();
+    text.push_str(".warnings");
+    PathBuf::from(text)
+}
+
+fn persist_warning_lines(path: &Path, warnings: &[String]) {
+    if warnings.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = warnings.join("\n");
+    let _ = std::fs::write(path, payload);
+}
+
+fn replay_cached_warnings_from_path(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        for line in raw.lines() {
+            let text = line.trim();
+            if text.is_empty() {
+                continue;
+            }
+            eprintln!("{}", text);
+        }
+    }
+}
+
 fn tool_in_cc_dir(cc: &str, tool: &str) -> Option<String> {
     let cc_path = Path::new(cc);
     let dir = cc_path.parent()?;
@@ -1858,7 +1952,13 @@ fn tool_in_cc_dir(cc: &str, tool: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_explain_key, rust_target_from_compiler_triple};
+    use super::{
+        collect_warning_lines_from_text, normalize_explain_key, persist_warning_lines,
+        rust_target_from_compiler_triple, warning_sidecar_path,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn rust_target_normalizes_macos_arm64_dumpmachine() {
@@ -1891,5 +1991,38 @@ mod tests {
     #[test]
     fn explain_key_passthrough_keeps_unknown_literal() {
         assert_eq!(normalize_explain_key("E9999"), "E9999");
+    }
+
+    #[test]
+    fn warning_parser_collects_and_deduplicates_warning_lines() {
+        let stdout = "note: hi\nwarning: alpha\nwarning: alpha\n";
+        let stderr = "WARNING: beta\nerror: nope\n";
+        let got = collect_warning_lines_from_text(stdout, stderr);
+        assert_eq!(
+            got,
+            vec!["warning: alpha".to_string(), "WARNING: beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn warning_sidecar_is_written_as_plain_lines() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gost-cli-warning-sidecar-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let cache_path = root.join("artifact.o");
+        let sidecar = warning_sidecar_path(&cache_path);
+        let warnings = vec!["warning: first".to_string(), "warning: second".to_string()];
+        persist_warning_lines(&sidecar, &warnings);
+        let raw = fs::read_to_string(&sidecar).expect("read sidecar");
+        assert!(raw.contains("warning: first"));
+        assert!(raw.contains("warning: second"));
+        let _ = fs::remove_dir_all(PathBuf::from(root));
     }
 }
