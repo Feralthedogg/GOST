@@ -149,6 +149,7 @@ impl<'a> FnEmitter<'a> {
     // Precondition: Inputs satisfy semantic and structural invariants expected by this API.
     // Postcondition: Returns a value/state transition that preserves module invariants.
     // Side effects: May read/write filesystem, caches, diagnostics, globals, or process state.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         fn_name: impl Into<String>,
         fn_sigs: &'a HashMap<String, FunctionSig>,
@@ -1661,9 +1662,9 @@ impl<'a> FnEmitter<'a> {
                 let nomatch_name = self.new_block("match_nomatch");
                 let nomatch_idx = self.add_block(nomatch_name.clone());
                 let mut incoming: Vec<(String, String, Type)> = Vec::new();
-                let mut result_ty: Option<Type> =
-                    (match_result_ty != Type::Builtin(BuiltinType::Unit))
-                        .then_some(match_result_ty.clone());
+                let mut result_ty: Option<Type> = (match_result_ty
+                    != Type::Builtin(BuiltinType::Unit))
+                .then_some(match_result_ty.clone());
                 for (idx, arm) in arms.iter().enumerate() {
                     let is_last = idx + 1 == arms.len();
                     let arm_name = self.new_block("match_arm");
@@ -1743,7 +1744,9 @@ impl<'a> FnEmitter<'a> {
                                             "match integer arm widening requires literal earlier arm values",
                                         );
                                     }
-                                    if self.is_int_type(prev_ty) && Self::is_integer_literal_ir(prev_ir) {
+                                    if self.is_int_type(prev_ty)
+                                        && Self::is_integer_literal_ir(prev_ir)
+                                    {
                                         *prev_ty = value.ty.clone();
                                     }
                                 }

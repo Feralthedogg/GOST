@@ -75,6 +75,8 @@ Default optimization level is `O3`.
 - `GOST_COLOR`: enables ANSI diagnostic coloring
 - `GOST_HOME`: fallback location containing `std/`
 - `GOST_CACHE_DIR`: module cache root override
+- `GOST_PROXY`: module proxy base URL (example: `https://proxy.gost-lang.org`)
+- `GOST_PKG_JOBS`: max parallel dependency materialization workers (default: CPU count)
 
 ## Windows Toolchain Helper
 
@@ -84,8 +86,16 @@ If you need a GCC+LLVM bundle on Windows:
 powershell -ExecutionPolicy Bypass -File scripts/setup-toolchain.ps1
 ```
 
+## Editor Setup
+
+For diagnostics/completion/hover and syntax highlighting, see:
+
+- [Editor Setup](editor-setup.md)
+
 ## Next Steps
 
+- Walk through [Gost by Example](gost-by-example.md)
 - Read [Language Guide](language-guide.md)
 - Check [CLI Reference](cli-reference.md)
+- For C interop, read [FFI Guide](ffi-guide.md)
 - For project dependency workflow, read [Modules and Packages](modules-and-packages.md)

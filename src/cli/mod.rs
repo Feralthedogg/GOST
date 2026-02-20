@@ -517,6 +517,7 @@ fn print_help_global() {
     eprintln!("  gs bindgen native.h -o native.gs --module native");
     eprintln!("  gs lsp");
     eprintln!("  gs explain E1101");
+    eprintln!("  gs explain mono-depth");
     eprintln!("  gs --explain E1101");
 }
 
@@ -693,6 +694,7 @@ fn normalize_explain_key(s: &str) -> String {
         "unknown-variant" | "variant" => "E1103".to_string(),
         "unknown-name" | "undefined-name" | "name" => "E1002".to_string(),
         "unknown-type" | "type" => "E1003".to_string(),
+        "monomorphization-depth" | "mono-depth" | "generic-depth" => "E1201".to_string(),
         "import-not-found" | "import" => "E2001".to_string(),
         "package-empty" | "empty-package" => "E2002".to_string(),
         _ => s.trim().to_string(),
@@ -1633,7 +1635,7 @@ fn tool_in_cc_dir(cc: &str, tool: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::rust_target_from_compiler_triple;
+    use super::{normalize_explain_key, rust_target_from_compiler_triple};
 
     #[test]
     fn rust_target_normalizes_macos_arm64_dumpmachine() {
@@ -1654,5 +1656,17 @@ mod tests {
         let target = rust_target_from_compiler_triple("x86_64-w64-mingw32")
             .expect("target should be inferred");
         assert_eq!(target, "x86_64-pc-windows-gnu");
+    }
+
+    #[test]
+    fn explain_shorthand_maps_monomorphization_depth_code() {
+        assert_eq!(normalize_explain_key("mono-depth"), "E1201");
+        assert_eq!(normalize_explain_key("generic-depth"), "E1201");
+        assert_eq!(normalize_explain_key("monomorphization-depth"), "E1201");
+    }
+
+    #[test]
+    fn explain_key_passthrough_keeps_unknown_literal() {
+        assert_eq!(normalize_explain_key("E9999"), "E9999");
     }
 }

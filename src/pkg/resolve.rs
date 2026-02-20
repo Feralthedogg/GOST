@@ -3,13 +3,14 @@
 // Invariants: Resolution honors mod mode and offline policy without hidden network side effects.
 // Gotchas: Path/module precedence is subtle; keep std/local/external ordering stable.
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 use strsim::jaro_winkler;
 
-use crate::pkg::cache::{CacheLock, cache_root, ensure_dir};
+use crate::pkg::cache::{CacheLock, cache_root, dir_checksum_sha256, ensure_dir};
 use crate::pkg::lockfile::{LockFile, LockedModule};
 use crate::pkg::modfile::{ModFile, Require};
 use crate::pkg::vcs;
@@ -91,6 +92,12 @@ fn module_source_url(mf: &ModFile, module: &str) -> String {
     if let Some(s) = mf.source.iter().find(|s| s.module == module) {
         return s.url.clone();
     }
+    if let Ok(proxy) = std::env::var("GOST_PROXY") {
+        let p = proxy.trim();
+        if !p.is_empty() {
+            return format!("proxy+{}", p.trim_end_matches('/'));
+        }
+    }
     vcs::default_source_url(module)
 }
 
@@ -99,6 +106,151 @@ fn module_replace_path(mf: &ModFile, module: &str, main_root: &Path) -> Option<P
         .iter()
         .find(|r| r.module == module)
         .map(|r| main_root.join(&r.path))
+}
+
+#[derive(Debug)]
+struct ResolveJobResult {
+    resolved: ResolvedModule,
+    lock_entry: Option<LockedModule>,
+    sub_requires: Vec<Require>,
+}
+
+fn read_sub_requires(module_root: &Path) -> anyhow::Result<Vec<Require>> {
+    let sub = module_root.join("gost.mod");
+    if !sub.exists() {
+        return Ok(vec![]);
+    }
+    let submf = ModFile::parse(&read_text(&sub)?)?;
+    Ok(submf.require)
+}
+
+fn resolve_job_count(task_count: usize) -> usize {
+    if task_count == 0 {
+        return 1;
+    }
+    let from_env = std::env::var("GOST_PKG_JOBS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let default = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    from_env.unwrap_or(default).clamp(1, task_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_requirement(
+    req: Require,
+    mf: &ModFile,
+    lock: &LockFile,
+    mode: ModMode,
+    main_root: &Path,
+    cache: &Path,
+    offline: bool,
+    want_fetch: bool,
+) -> anyhow::Result<ResolveJobResult> {
+    if let Some(local_path) = module_replace_path(mf, &req.module, main_root) {
+        let root = local_path
+            .canonicalize()
+            .with_context(|| format!("replace path {}", local_path.display()))?;
+        let sub_requires = read_sub_requires(&root)?;
+        return Ok(ResolveJobResult {
+            resolved: ResolvedModule {
+                module: req.module.clone(),
+                root,
+                source: "local".to_string(),
+                requested: req.version,
+                rev: None,
+                is_local: true,
+            },
+            lock_entry: None,
+            sub_requires,
+        });
+    }
+
+    let source_url = module_source_url(mf, &req.module);
+    if let ModMode::Readonly = mode
+        && lock.get(&req.module).is_none()
+    {
+        bail!("missing {} in gost.lock (readonly mode)", req.module);
+    }
+
+    let (locked_rev, requested) = if let Some(lm) = lock.get(&req.module) {
+        if lm.requested != req.version {
+            match mode {
+                ModMode::Readonly => bail!(
+                    "gost.mod requires {}@{}, but lock has {}",
+                    req.module,
+                    req.version,
+                    lm.requested
+                ),
+                ModMode::Mod => (None, req.version.clone()),
+            }
+        } else {
+            (Some(lm.rev.clone()), lm.requested.clone())
+        }
+    } else {
+        (None, req.version.clone())
+    };
+
+    let allow_fetch = want_fetch && !offline;
+    let (root, rev) = vcs::materialize_module(
+        cache,
+        &req.module,
+        &source_url,
+        &requested,
+        locked_rev.as_deref(),
+        allow_fetch,
+    )?;
+    let checksum = dir_checksum_sha256(&root)
+        .with_context(|| format!("compute checksum for {}", root.display()))?;
+
+    if let ModMode::Readonly = mode {
+        let lm = lock
+            .get(&req.module)
+            .with_context(|| format!("missing {} in gost.lock", req.module))?;
+        let expected = lm.checksum.as_ref().with_context(|| {
+            format!(
+                "missing checksum for {} in gost.lock; run `gs mod tidy` to refresh lock",
+                req.module
+            )
+        })?;
+        if expected != &checksum {
+            bail!(
+                "checksum mismatch for {}@{}: lock {}, computed {}",
+                req.module,
+                lm.requested,
+                expected,
+                checksum
+            );
+        }
+    }
+
+    let lock_entry = match mode {
+        ModMode::Mod => Some(LockedModule {
+            module: req.module.clone(),
+            source: source_url.clone(),
+            requested: requested.clone(),
+            rev: rev.clone(),
+            checksum: Some(checksum),
+            local: None,
+        }),
+        ModMode::Readonly => None,
+    };
+
+    let sub_requires = read_sub_requires(&root)?;
+    Ok(ResolveJobResult {
+        resolved: ResolvedModule {
+            module: req.module,
+            root,
+            source: source_url,
+            requested,
+            rev: Some(rev),
+            is_local: false,
+        },
+        lock_entry,
+        sub_requires,
+    })
 }
 
 pub fn load_ctx(
@@ -131,99 +283,91 @@ pub fn load_ctx(
         q.push_back(r);
     }
 
+    let mut selected_req: HashMap<String, String> = HashMap::new();
     let mut resolved: HashMap<String, ResolvedModule> = HashMap::new();
 
-    while let Some(req) = q.pop_front() {
-        if resolved.contains_key(&req.module) {
-            continue;
+    while !q.is_empty() {
+        let mut drained = Vec::<Require>::new();
+        while let Some(req) = q.pop_front() {
+            drained.push(req);
         }
 
-        if let Some(local_path) = module_replace_path(&mf, &req.module, &main_root) {
-            let root = local_path
-                .canonicalize()
-                .with_context(|| format!("replace path {}", local_path.display()))?;
-            resolved.insert(
-                req.module.clone(),
-                ResolvedModule {
-                    module: req.module.clone(),
-                    root: root.clone(),
-                    source: "local".to_string(),
-                    requested: req.version.clone(),
-                    rev: None,
-                    is_local: true,
-                },
-            );
-            let sub = root.join("gost.mod");
-            if sub.exists() {
-                let submf = ModFile::parse(&read_text(&sub)?)?;
-                for r in submf.require {
-                    q.push_back(r);
+        let mut batch_by_module: HashMap<String, Require> = HashMap::new();
+        for mut req in drained {
+            if let Some(cur) = selected_req.get(&req.module).cloned() {
+                let merged = vcs::merge_requested_versions(&cur, &req.version);
+                if merged != cur {
+                    selected_req.insert(req.module.clone(), merged.clone());
+                    resolved.remove(&req.module);
                 }
-            }
-            continue;
-        }
-
-        let source_url = module_source_url(&mf, &req.module);
-
-        if let ModMode::Readonly = mode
-            && lock.get(&req.module).is_none()
-        {
-            bail!("missing {} in gost.lock (readonly mode)", req.module);
-        }
-
-        let (mut rev, requested) = if let Some(lm) = lock.get(&req.module) {
-            if lm.requested != req.version {
-                match mode {
-                    ModMode::Readonly => bail!(
-                        "gost.mod requires {}@{}, but lock has {}",
-                        req.module,
-                        req.version,
-                        lm.requested
-                    ),
-                    ModMode::Mod => (String::new(), req.version.clone()),
-                }
+                req.version = selected_req
+                    .get(&req.module)
+                    .cloned()
+                    .unwrap_or(merged);
             } else {
-                (lm.rev.clone(), lm.requested.clone())
+                selected_req.insert(req.module.clone(), req.version.clone());
             }
-        } else {
-            (String::new(), req.version.clone())
-        };
 
-        let allow_fetch = want_fetch && !offline;
-        let mirror = vcs::ensure_mirror(&cache, &source_url, allow_fetch)?;
-        if rev.is_empty() {
-            rev = vcs::resolve_rev(&mirror, &requested)?;
+            req.version = selected_req
+                .get(&req.module)
+                .cloned()
+                .unwrap_or(req.version.clone());
+
+            if resolved.contains_key(&req.module) {
+                continue;
+            }
+            batch_by_module.insert(req.module.clone(), req);
         }
 
-        let root = vcs::checkout_module(&cache, &req.module, &rev, &mirror)?;
-
-        if let ModMode::Mod = mode {
-            lock.upsert(LockedModule {
-                module: req.module.clone(),
-                source: source_url.clone(),
-                requested: requested.clone(),
-                rev: rev.clone(),
-                checksum: None,
-                local: None,
-            });
+        let mut batch = batch_by_module.into_values().collect::<Vec<_>>();
+        batch.sort_by(|a, b| a.module.cmp(&b.module));
+        if batch.is_empty() {
+            continue;
         }
 
-        resolved.insert(
-            req.module.clone(),
-            ResolvedModule {
-                module: req.module.clone(),
-                root: root.clone(),
-                source: source_url,
-                requested,
-                rev: Some(rev),
-                is_local: false,
-            },
-        );
+        let mut results = Vec::<ResolveJobResult>::with_capacity(batch.len());
+        let mf_ref = &mf;
+        let lock_ref = &lock;
+        let main_root_ref = &main_root;
+        let cache_ref = &cache;
+        let jobs = resolve_job_count(batch.len());
+        for chunk in batch.chunks(jobs) {
+            thread::scope(|scope| -> anyhow::Result<()> {
+                let mut handles = Vec::with_capacity(chunk.len());
+                for req in chunk.iter().cloned() {
+                    let module = req.module.clone();
+                    handles.push((
+                        module,
+                        scope.spawn(move || {
+                            resolve_one_requirement(
+                                req,
+                                mf_ref,
+                                lock_ref,
+                                mode,
+                                main_root_ref,
+                                cache_ref,
+                                offline,
+                                want_fetch,
+                            )
+                        }),
+                    ));
+                }
+                for (module, h) in handles {
+                    let joined = h
+                        .join()
+                        .map_err(|_| anyhow!("resolver worker panicked for {}", module))?;
+                    results.push(joined?);
+                }
+                Ok(())
+            })?;
+        }
 
-        let sub = root.join("gost.mod");
-        if sub.exists() {
-            let submf = ModFile::parse(&read_text(&sub)?)?;
-            for r in submf.require {
+        for item in results {
+            if let Some(entry) = item.lock_entry {
+                lock.upsert(entry);
+            }
+            resolved.insert(item.resolved.module.clone(), item.resolved);
+            for r in item.sub_requires {
                 q.push_back(r);
             }
         }
@@ -236,7 +380,7 @@ pub fn load_ctx(
 
     Ok(ResolveCtx {
         main_root,
-        main_module: mf.module,
+        main_module: mf.module.clone(),
         std_root,
         modules: resolved,
         lock,

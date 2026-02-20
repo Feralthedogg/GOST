@@ -14,6 +14,7 @@ use crate::pkg::import_scan;
 use crate::pkg::lockfile::LockFile;
 use crate::pkg::modfile::{ModFile, Require};
 use crate::pkg::resolve::{self, ModMode};
+use crate::pkg::vcs;
 
 fn read_text(p: &Path) -> anyhow::Result<String> {
     fs::read_to_string(p).with_context(|| format!("read {}", p.display()))
@@ -419,7 +420,7 @@ fn verify_lock(mf: &ModFile, lock: Option<&LockFile>) -> anyhow::Result<()> {
         let lm = lock
             .get(&r.module)
             .with_context(|| format!("missing {} in gost.lock", r.module))?;
-        if lm.requested != r.version {
+        if lm.requested != r.version && !vcs::is_mvs_compatible(&r.version, &lm.requested) {
             bail!(
                 "gost.lock mismatch for {}: mod requires {}, lock has {}",
                 r.module,

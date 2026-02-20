@@ -6,11 +6,15 @@ The goal is to keep docs aligned with the current compiler/runtime behavior in t
 ## Start Here
 
 - [Getting Started](getting-started.md)
+- [Gost by Example](gost-by-example.md)
 - [CLI Reference](cli-reference.md)
+- [Editor Setup](editor-setup.md)
 - [Language Guide](language-guide.md)
 - [Language Reference](language-reference.md)
 - [Intrinsics Reference](intrinsics-reference.md)
 - [Ownership Cheat Sheet](ownership-cheatsheet.md)
+- [Concurrency and Ownership in Practice](concurrency-ownership-practice.md)
+- [FFI Guide](ffi-guide.md)
 - [Modules and Packages](modules-and-packages.md)
 - [Standard Library Reference](stdlib-reference.md)
 - [Testing Guide](testing-guide.md)

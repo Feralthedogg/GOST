@@ -16,7 +16,9 @@ use crate::frontend::ast::{
     ImportSpec, Item, Param, Pattern, Stmt, TraitMethod, TypeAst, TypeAstKind, TypeParam, UnaryOp,
     Visibility,
 };
-use crate::frontend::diagnostic::{Diagnostic, Diagnostics, format_diagnostic};
+use crate::frontend::diagnostic::{
+    Diagnostic, Diagnostics, E_MONOMORPHIZATION_DEPTH_EXCEEDED, format_diagnostic,
+};
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
 use crate::frontend::symbols::{is_impl_mangled, logical_method_name, mangle_impl_method};
@@ -87,7 +89,8 @@ pub fn compile_to_llvm(
         imports: file.imports.clone(),
         items,
     };
-    lower_high_level_features(&mut merged, &mut next_expr_id)?;
+    lower_high_level_features(&mut merged, &mut next_expr_id)
+        .map_err(|msg| render_compile_stage_error(msg, &source, Some(path)))?;
     let program = match analyze(&merged, &std_funcs) {
         Ok(program) => program,
         Err(diags) => return Err(render_diags(&diags, &source, Some(path))),
@@ -424,6 +427,24 @@ fn render_diags(diags: &Diagnostics, source: &str, file_path: Option<&Path>) -> 
     out
 }
 
+fn render_compile_stage_error(message: String, source: &str, file_path: Option<&Path>) -> String {
+    let mut diag = Diagnostic::new(message.clone(), None);
+    if message.starts_with("generic instantiation depth exceeded for `") {
+        diag = diag
+            .code(E_MONOMORPHIZATION_DEPTH_EXCEEDED)
+            .help(format!(
+                "recursive generic expansion exceeded the compiler limit ({})",
+                MONOMORPHIZATION_TYPE_DEPTH_LIMIT
+            ))
+            .help(
+                "reduce recursive type growth or introduce a non-recursive specialization boundary",
+            );
+    }
+    let mut diags = Diagnostics::default();
+    diags.push_diag(diag);
+    render_diags(&diags, source, file_path)
+}
+
 fn lower_high_level_features(file: &mut FileAst, next_expr_id: &mut usize) -> Result<(), String> {
     // Why: Global init injection must run before monomorphization so generated assignments are rewritten too.
     inject_global_initializer_function(file, next_expr_id);
@@ -649,6 +670,8 @@ fn refresh_expr_ids(expr: &mut Expr, next_expr_id: &mut usize) {
         | ExprKind::Ident(_) => {}
     }
 }
+
+const MONOMORPHIZATION_TYPE_DEPTH_LIMIT: usize = 64;
 
 fn monomorphize_and_rewrite(file: &mut FileAst) -> Result<(), String> {
     // Precondition: Function/type declarations are parsed and sema will run after this rewrite stage.
@@ -5555,6 +5578,13 @@ fn instantiate_generic_function(
     instances: &mut HashMap<String, String>,
     queue: &mut VecDeque<Function>,
 ) -> Result<String, String> {
+    let max_depth = max_type_arg_depth(type_args);
+    if max_depth > MONOMORPHIZATION_TYPE_DEPTH_LIMIT {
+        return Err(format!(
+            "generic instantiation depth exceeded for `{}` (max {}, got {}; possible recursive monomorphization)",
+            name, MONOMORPHIZATION_TYPE_DEPTH_LIMIT, max_depth
+        ));
+    }
     let key = generic_instance_key(name, type_args);
     if let Some(existing) = instances.get(&key) {
         return Ok(existing.clone());
@@ -5848,6 +5878,51 @@ fn generic_instance_key(name: &str, type_args: &[TypeAst]) -> String {
     key
 }
 
+fn max_type_arg_depth(type_args: &[TypeAst]) -> usize {
+    type_args
+        .iter()
+        .map(type_ast_depth)
+        .max()
+        .unwrap_or_default()
+}
+
+fn type_ast_depth(root: &TypeAst) -> usize {
+    let mut max_depth = 0usize;
+    let mut stack: Vec<(&TypeAst, usize)> = vec![(root, 1)];
+    while let Some((ty, depth)) = stack.pop() {
+        if depth > max_depth {
+            max_depth = depth;
+        }
+        match &ty.kind {
+            TypeAstKind::Named(_) | TypeAstKind::Interface => {}
+            TypeAstKind::Ref(inner)
+            | TypeAstKind::MutRef(inner)
+            | TypeAstKind::Own(inner)
+            | TypeAstKind::Alias(inner)
+            | TypeAstKind::Slice(inner)
+            | TypeAstKind::Array(inner, _)
+            | TypeAstKind::Chan(inner)
+            | TypeAstKind::Shared(inner) => stack.push((inner, depth + 1)),
+            TypeAstKind::Map(key, value) | TypeAstKind::Result(key, value) => {
+                stack.push((key, depth + 1));
+                stack.push((value, depth + 1));
+            }
+            TypeAstKind::Tuple(items) => {
+                for item in items {
+                    stack.push((item, depth + 1));
+                }
+            }
+            TypeAstKind::FnPtr { params, ret, .. } | TypeAstKind::Closure { params, ret, .. } => {
+                stack.push((ret, depth + 1));
+                for param in params {
+                    stack.push((param, depth + 1));
+                }
+            }
+        }
+    }
+    max_depth
+}
+
 fn specialized_name(base: &str, key: &str) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
@@ -6096,7 +6171,9 @@ fn main() -> i32 {
         let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect_err("invalid exponent literal should fail at lexing boundary");
         assert!(
-            err.contains("invalid float literal: expected at least one digit after exponent marker"),
+            err.contains(
+                "invalid float literal: expected at least one digit after exponent marker"
+            ),
             "unexpected diagnostic: {err}"
         );
     }
@@ -6780,6 +6857,53 @@ fn main() -> i32 {
         let file = TempSource::new(src);
         compile_to_llvm(file.path(), ModMode::Readonly, true, false)
             .expect("generic inference should use argument call return type");
+    }
+
+    #[test]
+    fn recursive_generic_monomorphization_depth_is_rejected() {
+        let src = r#"
+module main
+
+fn recurse[T](x: T) -> i32 {
+    let y = &x
+    return recurse[ref[T]](y)
+}
+
+fn main() -> i32 {
+    return recurse[i32](0)
+}
+"#;
+        let file = TempSource::new(src);
+        let err = compile_to_llvm(file.path(), ModMode::Readonly, true, false).expect_err(
+            "recursive generic monomorphization should be rejected before stack overflow",
+        );
+        assert!(
+            err.contains("E1201"),
+            "expected diagnostic code E1201, got: {err}"
+        );
+        assert!(
+            err.contains("generic instantiation depth exceeded for `recurse`"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn recursive_generic_with_same_type_args_still_compiles() {
+        let src = r#"
+module main
+
+fn recurse_same[T](x: T) -> T {
+    return recurse_same[T](x)
+}
+
+fn main() -> i32 {
+    let _ = recurse_same[i32](0)
+    return 0
+}
+"#;
+        let file = TempSource::new(src);
+        compile_to_llvm(file.path(), ModMode::Readonly, true, false)
+            .expect("generic recursion with stable type args should compile");
     }
 
     #[test]

@@ -13,7 +13,7 @@ module = "github.com/you/project"
 
 [[require]]
 module = "github.com/org/lib"
-version = "main"
+version = "^1.2"
 
 [[replace]]
 module = "github.com/org/lib"
@@ -27,9 +27,11 @@ url = "https://github.com/org/lib.git"
 Fields:
 
 - `module`: main module path
-- `require`: requested dependencies
+- `require`: requested dependencies (exact ref, branch, tag, or semver range)
 - `replace`: local path override for a module
 - `source`: explicit source URL override
+  - default is git source (for example `https://<module>.git`)
+  - proxy source uses `proxy+<base-url>` (for example `proxy+https://proxy.gost-lang.org`)
 
 ### 1.2 `gost.lock` (JSON)
 
@@ -71,6 +73,8 @@ Default cache root comes from OS project cache location (`directories::ProjectDi
 Override with:
 
 - `GOST_CACHE_DIR`
+- `GOST_PROXY` (routes unresolved module sources through `proxy+<base>`)
+- `GOST_PKG_JOBS` (caps parallel module materialization workers)
 
 Cache includes mirrored VCS data and checked-out module trees.
 
@@ -80,6 +84,27 @@ Cache includes mirrored VCS data and checked-out module trees.
 - `gs mod verify`, `gs mod download`, and `gs mod graph` accept `--online`.
 - For `mod graph`, `--online` is optional and for richer status output; graph remains read-only.
 - `run/build` reject `--online` (online behavior is controlled by module mode and offline flag).
+
+## 4.1 Version Selection
+
+- Semver-style constraints (for example `^1.2`, `~1.4`, `>=1.5,<2.0`) are resolved from git tags.
+- Resolver applies a minimal-version-selection style merge for repeated module requirements:
+  - higher minimum compatible requirement wins
+  - selected requirement is recorded in `gost.lock`
+
+## 4.2 Proxy Backend
+
+When source is `proxy+<base>` (or `GOST_PROXY` is set), resolver uses module-proxy layout:
+
+- version list: `<base>/<module>/@v/list`
+- archive: `<base>/<module>/@v/<version>.zip`
+
+Resolver supports:
+
+- semver range selection against proxy `list`
+- lock-pinned revision reuse in readonly mode
+- cache-first behavior in offline mode
+- proxy archives with a shared leading path prefix (auto-stripped during extraction)
 
 ## 5. Commands
 
@@ -113,6 +138,7 @@ Does not mutate lock in verify mode.
 - Default is cache-only/offline behavior
 - `--online` allows fetch/clone when missing
 - Does not update `gost.lock`
+- Dependency materialization is processed in parallel batches during resolution
 
 ### 5.5 `gs mod graph`
 

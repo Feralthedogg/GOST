@@ -7,6 +7,7 @@ This document is used by `gs explain` / `gs --explain`.
 ```text
 gs explain E1101
 gs --explain E1003
+gs explain mono-depth
 ```
 
 Supported shorthand keys:
@@ -16,6 +17,7 @@ Supported shorthand keys:
 - `variant` -> `E1103`
 - `name` -> `E1002`
 - `type` -> `E1003`
+- `mono-depth` -> `E1201`
 - `import` -> `E2001`
 - `package-empty` -> `E2002`
 
@@ -37,6 +39,7 @@ Supported shorthand keys:
 - `E1103`: unknown enum variant
 - `E1104`: receiver not addressable
 - `E1105`: mutable receiver required
+- `E1201`: recursive generic monomorphization depth exceeded
 - `E2000`: module/resolve pipeline error wrapper
 - `E2001`: import not found
 - `E2002`: package exists but has no `.gs` files
@@ -154,6 +157,20 @@ Typical cause:
 Fix:
 
 - use mutable binding path that permits mutable borrow
+
+## E1201
+
+Recursive generic monomorphization depth exceeded.
+
+Typical cause:
+
+- recursive generic calls grow type arguments indefinitely
+  Example: `T -> ref[T] -> ref[ref[T]] -> ...`
+
+Fix:
+
+- break recursive type growth in generic recursion
+- introduce a non-recursive specialization boundary or explicit runtime indirection
 
 ## E2000
 

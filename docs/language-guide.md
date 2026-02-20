@@ -315,6 +315,8 @@ select {
 }
 ```
 
+Practical ownership/concurrency patterns: [Concurrency and Ownership in Practice](concurrency-ownership-practice.md)
+
 ## 12) FFI and `extern`
 
 ```gs
@@ -323,6 +325,8 @@ extern "C" let errno: i32
 ```
 
 Supported ABI names include `C`, `system`, `stdcall`, `fastcall`, `vectorcall`, `thiscall`, `win64`, `sysv64`, `aapcs`.
+
+End-to-end native linking workflow: [FFI Guide](ffi-guide.md)
 
 ## 13) Useful Syntax Extras
 

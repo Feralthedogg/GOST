@@ -35,6 +35,19 @@ Key API:
 - `sprintf(format: string, args: []string) -> string`
 - argument helpers: `arg_i64`, `arg_i32`, `arg_f64`, `arg_f32`, `arg_bool`
 
+Example:
+
+```gs
+module main
+
+import "std/fmt"
+
+fn main() -> i32 {
+    fmt.println(string_concat("answer=", fmt.arg_i64(42)))
+    return 0
+}
+```
+
 ## std/io
 
 Path: `std/io/io.gs`
@@ -52,6 +65,23 @@ Key API:
 - `read_all(r: Reader) -> Result[string, error]`
 - `copy_all(r: Reader, w: Writer) -> Result[i64, error]`
 - `copy_n(r: Reader, w: Writer, limit: i64) -> Result[i64, error]`
+
+Example:
+
+```gs
+module main
+
+import "std/io"
+
+fn main() -> i32 {
+    let r = io.new_reader(|_n: i32| Result.Ok[string, error](""))
+    match io.read_all(r) {
+        Result.Ok(_text) => { return 0 },
+        Result.Err(_) => { return 1 },
+        _ => { return 1 },
+    }
+}
+```
 
 ## std/bytes
 
@@ -131,6 +161,22 @@ Key API:
 - env/process: `getenv`, `setenv`, `args`, `exit`
 - cwd: `getwd`, `chdir`
 - status helpers: `last_status`, `last_error`, `last_output`
+
+Example:
+
+```gs
+module main
+
+import "std/os"
+
+fn main() -> i32 {
+    match os.write_file("note.txt", "hello\n") {
+        Result.Ok(_) => { return 0 },
+        Result.Err(_) => { return 1 },
+        _ => { return 1 },
+    }
+}
+```
 
 ## std/time
 
@@ -303,6 +349,27 @@ Key API:
 - value conversion: `parse`, `stringify`, `marshal`, `unmarshal`, `valid`
 - formatting: `compact`, `indent`, `marshal_indent`, `html_escape`
 - streaming-like wrappers: `new_decoder`, `decode`, `decoder_use_number`, `decoder_disallow_unknown_fields`, `new_encoder`, `encoder_set_indent`, `encoder_set_escape_html`, `encode`
+
+Example:
+
+```gs
+module main
+
+import "std/encoding/json"
+import "std/fmt"
+
+fn main() -> i32 {
+    let raw = "{\"ok\":true,\"n\":42}"
+    match json.indent(raw, "", "  ") {
+        Result.Ok(pretty) => {
+            fmt.println(pretty)
+            return 0
+        },
+        Result.Err(_) => { return 1 },
+        _ => { return 1 },
+    }
+}
+```
 
 ## std/encoding/toml
 
@@ -522,6 +589,25 @@ Types:
 
 Key API:
 
-- request builders: `new_request`, `new_client`
-- client calls: `do_request`, `get`, `post`
-- simple server helpers: `serve`, `register_handler`, `listen_and_serve`
+- request builders: `new_request`, `default_client`
+- client calls: `do`, `get`, `post`
+
+Example:
+
+```gs
+module main
+
+import "std/fmt"
+import "std/net/http"
+
+fn main() -> i32 {
+    match http.get("https://example.com") {
+        Result.Ok(resp) => {
+            fmt.println(string_concat("status=", fmt.arg_i32(resp.status)))
+            return 0
+        },
+        Result.Err(_) => { return 1 },
+        _ => { return 1 },
+    }
+}
+```

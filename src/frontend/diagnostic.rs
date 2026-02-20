@@ -13,6 +13,7 @@ pub const E_UNKNOWN_METHOD: &str = "E1102";
 pub const E_UNKNOWN_VARIANT: &str = "E1103";
 pub const E1104: &str = "E1104"; // receiver not addressable
 pub const E1105: &str = "E1105"; // need mutable receiver
+pub const E_MONOMORPHIZATION_DEPTH_EXCEEDED: &str = "E1201";
 
 #[derive(Clone, Debug)]
 pub enum HelpMsg {
